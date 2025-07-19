@@ -1,0 +1,60 @@
+namespace vane {
+    VaneClientConfig create_default_config();
+    [Throws=VaneError]
+    VaneClient create_vane_client(VaneClientConfig config);
+    [Throws=VaneError]
+    string parse_json_response(VaneResponse response);
+    [Throws=VaneError]
+    string create_json_body(string json_string);
+};
+
+dictionary VaneClientConfig {
+    string? base_url;
+    record<string, string> default_headers;
+    u64? timeout_seconds;
+    boolean follow_redirects;
+    string? user_agent;
+};
+
+dictionary VaneRequest {
+    string url;
+    string method;
+    record<string, string> headers;
+    record<string, string> query_params;
+    string? body;
+    u64? timeout_seconds;
+    boolean follow_redirects;
+};
+
+dictionary VaneResponse {
+    u16 status_code;
+    record<string, string> headers;
+    string body;
+    boolean is_success;
+    string url;
+};
+
+[Error]
+enum VaneError {
+  "Generic",
+};
+
+interface VaneClient {
+    [Throws=VaneError]
+    VaneResponse execute_request(VaneRequest request);
+
+    [Throws=VaneError]
+    VaneResponse get_request(string url);
+
+    [Throws=VaneError]
+    VaneResponse post_request(string url, string? body);
+
+    [Throws=VaneError]
+    VaneResponse put_request(string url, string? body);
+
+    [Throws=VaneError]
+    VaneResponse delete_request(string url);
+
+    [Throws=VaneError]
+    VaneResponse patch_request(string url, string? body);
+};
