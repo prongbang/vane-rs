@@ -42,7 +42,7 @@ extension VaneClient {
     @available(iOS 13.0, *)
     public func get(_ url: String) async throws -> VaneResponse {
         return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .background).async {
+            Task.detached(priority: .utility) { @Sendable in
                 do {
                     let response = try self.getRequest(url: url)
                     continuation.resume(returning: response)
@@ -54,9 +54,9 @@ extension VaneClient {
     }
 
     @available(iOS 13.0, *)
-    public func post(_ url: String, body: String? = nil) async throws -> VaneResponse {
+    public func post(_ url: String, body: Data? = nil) async throws -> VaneResponse {
         return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .background).async {
+            Task.detached(priority: .utility) { @Sendable in
                 do {
                     let response = try self.postRequest(url: url, body: body)
                     continuation.resume(returning: response)
@@ -68,9 +68,9 @@ extension VaneClient {
     }
 
     @available(iOS 13.0, *)
-    public func put(_ url: String, body: String? = nil) async throws -> VaneResponse {
+    public func put(_ url: String, body: Data? = nil) async throws -> VaneResponse {
         return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .background).async {
+            Task.detached(priority: .utility) { @Sendable in
                 do {
                     let response = try self.putRequest(url: url, body: body)
                     continuation.resume(returning: response)
@@ -84,7 +84,7 @@ extension VaneClient {
     @available(iOS 13.0, *)
     public func delete(_ url: String) async throws -> VaneResponse {
         return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .background).async {
+            Task.detached(priority: .utility) { @Sendable in
                 do {
                     let response = try self.deleteRequest(url: url)
                     continuation.resume(returning: response)
@@ -96,9 +96,9 @@ extension VaneClient {
     }
 
     @available(iOS 13.0, *)
-    public func patch(_ url: String, body: String? = nil) async throws -> VaneResponse {
+    public func patch(_ url: String, body: Data? = nil) async throws -> VaneResponse {
         return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .background).async {
+            Task.detached(priority: .utility) { @Sendable in
                 do {
                     let response = try self.patchRequest(url: url, body: body)
                     continuation.resume(returning: response)
@@ -112,7 +112,7 @@ extension VaneClient {
     @available(iOS 13.0, *)
     public func execute(_ request: VaneRequest) async throws -> VaneResponse {
         return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .background).async {
+            Task.detached(priority: .utility) { @Sendable in
                 do {
                     let response = try self.executeRequest(request: request)
                     continuation.resume(returning: response)
@@ -146,11 +146,11 @@ public class VaneSession {
         return try await client.get(url)
     }
 
-    public func post(_ url: String, body: String? = nil) async throws -> VaneResponse {
+    public func post(_ url: String, body: Data? = nil) async throws -> VaneResponse {
         return try await client.post(url, body: body)
     }
 
-    public func put(_ url: String, body: String? = nil) async throws -> VaneResponse {
+    public func put(_ url: String, body: Data? = nil) async throws -> VaneResponse {
         return try await client.put(url, body: body)
     }
 
@@ -158,7 +158,7 @@ public class VaneSession {
         return try await client.delete(url)
     }
 
-    public func patch(_ url: String, body: String? = nil) async throws -> VaneResponse {
+    public func patch(_ url: String, body: Data? = nil) async throws -> VaneResponse {
         return try await client.patch(url, body: body)
     }
 }
@@ -217,15 +217,13 @@ public class VaneRequestBuilder {
         return self
     }
 
-    public func body(_ body: String) -> VaneRequestBuilder {
+    public func body(_ body: Data) -> VaneRequestBuilder {
         request.body = body
         return self
     }
 
     public func jsonBody<T: Codable>(_ object: T) throws -> VaneRequestBuilder {
-        let jsonData = try JSONEncoder().encode(object)
-        let jsonString = String(data: jsonData, encoding: .utf8) ?? ""
-        request.body = try createJsonBody(json: jsonString)
+        request.body = try JSONEncoder().encode(object)
         request.headers["Content-Type"] = "application/json"
         return self
     }
@@ -251,23 +249,9 @@ public class VaneRequestBuilder {
 
         guard response.isSuccess else {
             throw VaneError.Generic("Request failed with status \(response.statusCode)")
-            // throw VaneError(
-            //     message: "Request failed with status \(response.statusCode)",
-            //     errorType: "http",
-            //     statusCode: response.statusCode
-            // )
         }
 
-        guard let data = response.body.data(using: .utf8) else {
-            throw VaneError.Generic("Invalid response body encoding")
-            // throw VaneError(
-            //     message: "Invalid response body encoding",
-            //     errorType: "decode",
-            //     statusCode: response.statusCode
-            // )
-        }
-
-        return try JSONDecoder().decode(type, from: data)
+        return try JSONDecoder().decode(type, from: response.body)
     }
 
     public func responseString() async throws -> String {
@@ -275,14 +259,12 @@ public class VaneRequestBuilder {
 
         guard response.isSuccess else {
             throw VaneError.Generic("Request failed with status \(response.statusCode)")
-            // throw VaneError(
-            //     message: "Request failed with status \(response.statusCode)",
-            //     errorType: "http",
-            //     statusCode: response.statusCode
-            // )
         }
 
-        return response.body
+        if let string = String(data: response.body, encoding: .utf8) {
+            return string
+        }
+        return ""
     }
 }
 
@@ -330,16 +312,7 @@ extension VaneResponse {
     }
 
     public func json<T: Codable>(_ type: T.Type) throws -> T {
-        guard let data = body.data(using: .utf8) else {
-            throw VaneError.Generic("Invalid response body encoding")
-            // throw VaneError(
-            //     message: "Invalid response body encoding",
-            //     errorType: "decode",
-            //     statusCode: statusCode
-            // )
-        }
-
-        return try JSONDecoder().decode(type, from: data)
+        return try JSONDecoder().decode(type, from: body)
     }
 
     public var prettyJSON: String? {

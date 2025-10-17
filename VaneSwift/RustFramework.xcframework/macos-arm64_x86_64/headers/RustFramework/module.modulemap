@@ -1,0 +1,4 @@
+module vaneFFI {
+    header "vaneFFI.h"
+    export *
+}

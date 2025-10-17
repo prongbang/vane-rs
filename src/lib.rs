@@ -1,20 +1,19 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 
-use once_cell::sync::Lazy;
-use reqwest::{Client, Method, Response, redirect::Policy};
+use reqwest::{
+    Method,
+    blocking::{Client, Response},
+    redirect::Policy,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::runtime::Runtime;
 use url::Url;
 
 uniffi::setup_scaffolding!();
-
-// ---------- Shared Tokio Runtime ----------
-static RUNTIME: Lazy<Arc<Runtime>> =
-    Lazy::new(|| Arc::new(Runtime::new().expect("Failed to create Tokio runtime")));
 
 // ---------- Models ----------
 #[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
@@ -23,7 +22,7 @@ pub struct VaneRequest {
     pub method: String,
     pub headers: HashMap<String, String>,
     pub query_params: HashMap<String, String>,
-    pub body: Option<String>,
+    pub body: Option<Vec<u8>>,
     pub timeout_seconds: Option<u64>,
     pub follow_redirects: bool,
 }
@@ -32,7 +31,7 @@ pub struct VaneRequest {
 pub struct VaneResponse {
     pub status_code: u16,
     pub headers: HashMap<String, String>,
-    pub body: String,
+    pub body: Vec<u8>,
     pub is_success: bool,
     pub url: String,
 }
@@ -109,10 +108,6 @@ impl VaneClient {
     }
 
     pub fn execute(&self, request: VaneRequest) -> Result<VaneResponse, VaneError> {
-        RUNTIME.block_on(async { self.execute_async(request).await })
-    }
-
-    async fn execute_async(&self, request: VaneRequest) -> Result<VaneResponse, VaneError> {
         let url = self.build_url(&request.url)?;
         let method = Method::from_bytes(request.method.as_bytes())
             .map_err(|_| VaneError::Generic(format!("Invalid method: {}", request.method)))?;
@@ -142,8 +137,8 @@ impl VaneClient {
             req_builder = req_builder.timeout(Duration::from_secs(t));
         }
 
-        let response = req_builder.send().await?;
-        self.convert_response(response).await
+        let response = req_builder.send()?;
+        self.convert_response(response)
     }
 
     fn build_url(&self, url: &str) -> Result<Url, VaneError> {
@@ -158,19 +153,20 @@ impl VaneClient {
         }
     }
 
-    async fn convert_response(&self, resp: Response) -> Result<VaneResponse, VaneError> {
+    fn convert_response(&self, resp: Response) -> Result<VaneResponse, VaneError> {
         let status = resp.status().as_u16();
         let ok = resp.status().is_success();
         let url = resp.url().to_string();
 
-        let mut headers = HashMap::new();
+        let mut headers = HashMap::with_capacity(resp.headers().len());
         for (k, v) in resp.headers() {
             headers.insert(k.to_string(), v.to_str().unwrap_or_default().to_string());
         }
 
-        let body = resp
-            .text()
-            .await
+        let mut reader = resp;
+        let mut body = Vec::new();
+        reader
+            .read_to_end(&mut body)
             .map_err(|e| VaneError::Generic(format!("Read body failed: {e}")))?;
 
         Ok(VaneResponse {
@@ -186,7 +182,7 @@ impl VaneClient {
         &self,
         method: &str,
         url: &str,
-        body: Option<String>,
+        body: Option<Vec<u8>>,
     ) -> Result<VaneResponse, VaneError> {
         self.execute(VaneRequest {
             url: url.to_string(),
@@ -224,7 +220,7 @@ impl VaneClient {
     pub fn post_request(
         &self,
         url: String,
-        body: Option<String>,
+        body: Option<Vec<u8>>,
     ) -> Result<VaneResponse, VaneError> {
         self.make_request("POST", &url, body)
     }
@@ -232,7 +228,7 @@ impl VaneClient {
     pub fn put_request(
         &self,
         url: String,
-        body: Option<String>,
+        body: Option<Vec<u8>>,
     ) -> Result<VaneResponse, VaneError> {
         self.make_request("PUT", &url, body)
     }
@@ -244,7 +240,7 @@ impl VaneClient {
     pub fn patch_request(
         &self,
         url: String,
-        body: Option<String>,
+        body: Option<Vec<u8>>,
     ) -> Result<VaneResponse, VaneError> {
         self.make_request("PATCH", &url, body)
     }
@@ -253,15 +249,14 @@ impl VaneClient {
 // ---------- Helpers ----------
 #[uniffi::export]
 pub fn parse_json_response(resp: &VaneResponse) -> Result<String, VaneError> {
-    let parsed: Value = serde_json::from_str(&resp.body)
+    let parsed: Value = serde_json::from_slice(&resp.body)
         .map_err(|e| VaneError::Generic(format!("Parse JSON failed: {e}")))?;
     serde_json::to_string_pretty(&parsed)
         .map_err(|e| VaneError::Generic(format!("Serialize JSON failed: {e}")))
 }
 
 #[uniffi::export]
-pub fn create_json_body(json: String) -> Result<String, VaneError> {
-    let _: Value = serde_json::from_str(&json)
-        .map_err(|e| VaneError::Generic(format!("Invalid JSON: {e}")))?;
-    Ok(json)
+pub fn response_body_utf8(resp: &VaneResponse) -> Result<String, VaneError> {
+    String::from_utf8(resp.body.clone())
+        .map_err(|e| VaneError::Generic(format!("Invalid UTF-8 in response body: {e}")))
 }

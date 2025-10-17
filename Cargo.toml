@@ -4,18 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-reqwest = { version = "0.11", features = ["json", "stream", "multipart"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "blocking"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-uniffi = { version = "0.29.3", features = ["build"] }
+uniffi = "0.29"
 url = "2.4"
-futures = "0.3"
 thiserror = "2.0.12"
-once_cell = "1.21.3"
 
 [lib]
-crate-type = ["cdylib", "staticlib", "lib"]
+crate-type = [
+    # "cdylib",  # android
+    "staticlib", # ios
+    "lib"
+]
 name = "vane"
 
 [build-dependencies]
@@ -23,7 +24,10 @@ uniffi = { version = "0.29", features = ["build"] }
 
 [profile.release]
 opt-level = "z"
-lto = true
+lto = "fat"
 strip = true
 codegen-units = 1
 panic = "abort"
+incremental = false
+debug = false
+overflow-checks = false

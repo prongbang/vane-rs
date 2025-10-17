@@ -168,3 +168,76 @@ class VaneClientTests: XCTestCase {
     }
 }
 ```
+
+## Benchmark
+
+### Vane
+```
+Benchmark summary:
+BenchmarkGET                 5	   584388 ns/op	    374.4 B/op	(total 0.003s)
+BenchmarkPOST                5	   205588 ns/op	     64.0 B/op	(total 0.001s)
+BenchmarkPUT                 5	   188398 ns/op	      0.0 B/op	(total 0.001s)
+BenchmarkPATCH               5	   164008 ns/op	      0.0 B/op	(total 0.001s)
+BenchmarkDELETE              5	   148201 ns/op	      0.0 B/op	(total 0.001s)
+```
+
+### Alamofire
+
+Go-style Vane benchmark summary:
+BenchmarkVaneGET             5	   762796 ns/op	  46822.4 B/op	(total 0.004s)
+BenchmarkVanePOST            5	   197411 ns/op	   1536.0 B/op	(total 0.001s)
+BenchmarkVanePUT             5	   190210 ns/op	   n/a B/op	(total 0.001s)
+BenchmarkVanePATCH           5	   177002 ns/op	  13811.2 B/op	(total 0.001s)
+BenchmarkVaneDELETE          5	   175810 ns/op	   3171.2 B/op	(total 0.001s)
+
+Go-style Alamofire benchmark summary:
+BenchmarkAlamofireGET        5	  4641199 ns/op	 114710.4 B/op	(total 0.023s)
+BenchmarkAlamofirePOST       5	   622797 ns/op	   n/a B/op	(total 0.003s)
+BenchmarkAlamofirePUT        5	   536203 ns/op	    147.2 B/op	(total 0.003s)
+BenchmarkAlamofirePATCH      5	   516796 ns/op	   8083.2 B/op	(total 0.003s)
+BenchmarkAlamofireDELETE     5	   335598 ns/op	   3516.8 B/op	(total 0.002s)
+
+Go-style Vane benchmark summary:
+BenchmarkVaneGET            20	   184351 ns/op	   6085.6 B/op	(total 0.004s)
+BenchmarkVanePOST           20	   185901 ns/op	  25052.0 B/op	(total 0.004s)
+BenchmarkVanePUT            20	   167352 ns/op	    552.0 B/op	(total 0.003s)
+BenchmarkVanePATCH          20	   174099 ns/op	   n/a B/op	(total 0.003s)
+BenchmarkVaneDELETE         20	   169152 ns/op	   1961.6 B/op	(total 0.003s)
+✔ Test benchmarkHTTPMethods() passed after 0.026 seconds.
+
+Go-style Alamofire benchmark summary:
+BenchmarkAlamofireGET       20	   381005 ns/op	   n/a B/op	(total 0.008s)
+BenchmarkAlamofirePOST      20	   594747 ns/op	   n/a B/op	(total 0.012s)
+BenchmarkAlamofirePUT       20	   504297 ns/op	    448.0 B/op	(total 0.010s)
+BenchmarkAlamofirePATCH     20	   499952 ns/op	   1478.4 B/op	(total 0.010s)
+BenchmarkAlamofireDELETE    20	   333846 ns/op	   n/a B/op	(total 0.007s)
+
+Go-style Vane benchmark summary:
+BenchmarkVaneGET            20	   170350 ns/op	   6241.6 B/op	(total 0.003s)
+BenchmarkVanePOST           20	   156647 ns/op	   7536.0 B/op	(total 0.003s)
+BenchmarkVanePUT            20	   139350 ns/op	   9622.4 B/op	(total 0.003s)
+BenchmarkVanePATCH          20	   146401 ns/op	    250.4 B/op	(total 0.003s)
+BenchmarkVaneDELETE         20	   165200 ns/op	     32.8 B/op	(total 0.003s)
+✔ Test benchmarkHTTPMethods() passed after 0.022 seconds.
+
+Go-style Alamofire benchmark summary:
+BenchmarkAlamofireGET       20	   372797 ns/op	   n/a B/op	(total 0.007s)
+BenchmarkAlamofirePOST      20	   621200 ns/op	   n/a B/op	(total 0.012s)
+BenchmarkAlamofirePUT       20	   501955 ns/op	    392.0 B/op	(total 0.010s)
+BenchmarkAlamofirePATCH     20	   540745 ns/op	   1841.6 B/op	(total 0.011s)
+BenchmarkAlamofireDELETE    20	   347149 ns/op	    691.2 B/op	(total 0.007s)
+
+Go-style Vane benchmark summary:
+BenchmarkVaneGET            35	   160371 ns/op	   5481.1 B/op	(total 0.006s)
+BenchmarkVanePOST           35	   166001 ns/op	   4829.7 B/op	(total 0.006s)
+BenchmarkVanePUT            35	   190088 ns/op	   n/a B/op	(total 0.007s)
+BenchmarkVanePATCH          35	   194427 ns/op	   1407.1 B/op	(total 0.007s)
+BenchmarkVaneDELETE         35	   181430 ns/op	    475.9 B/op	(total 0.006s)
+✔ Test benchmarkHTTPMethods() passed after 0.046 seconds.
+
+Go-style Alamofire benchmark summary:
+BenchmarkAlamofireGET       35	   451313 ns/op	   n/a B/op	(total 0.016s)
+BenchmarkAlamofirePOST      35	   689254 ns/op	   n/a B/op	(total 0.024s)
+BenchmarkAlamofirePUT       35	   517886 ns/op	    483.7 B/op	(total 0.018s)
+BenchmarkAlamofirePATCH     35	   516599 ns/op	    514.7 B/op	(total 0.018s)
+BenchmarkAlamofireDELETE    35	   314059 ns/op	    103.8 B/op	(total 0.011s)

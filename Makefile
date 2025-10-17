@@ -16,3 +16,4 @@ new_project:
 
 build_spm:
 	cargo swift package --release
+	find VaneSwift -name "libvane.a" -exec strip -x {} \;

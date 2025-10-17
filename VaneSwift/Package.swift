@@ -16,7 +16,9 @@ let package = Package(
             targets: ["VaneSwift"]
         )
     ],
-    dependencies: [],
+    dependencies: [
+        .package(url: "https://github.com/Alamofire/Alamofire.git", from: "5.8.0")
+    ],
     targets: [
         .binaryTarget(name: "RustFramework", path: "./RustFramework.xcframework"),
         .target(
@@ -28,6 +30,12 @@ let package = Package(
                 .linkedFramework("SystemConfiguration")
             ]
         ),
-        .testTarget(name: "VaneSwiftTests", dependencies: ["VaneSwift"]),
+        .testTarget(
+            name: "VaneSwiftTests",
+            dependencies: [
+                "VaneSwift",
+                .product(name: "Alamofire", package: "Alamofire"),
+            ]
+        ),
     ]
 )
