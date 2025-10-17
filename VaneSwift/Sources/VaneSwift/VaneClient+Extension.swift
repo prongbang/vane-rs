@@ -1,5 +1,37 @@
 import Foundation
-import vane // Generated UniFFI bindings
+
+#if canImport(vaneFFI)
+    import vaneFFI
+#endif
+
+// MARK: - Usage Examples
+
+/*
+// Basic usage
+let session = try VaneSession()
+let response = try await session.get("https://api.example.com/users")
+
+// With configuration
+let config = VaneConfigurationBuilder()
+    .baseURL("https://api.example.com")
+    .defaultHeaders(["Authorization": "Bearer token"])
+    .timeout(30)
+    .build()
+
+let session = try VaneSession(configuration: config)
+
+// Request builder pattern
+let users = try await session.request("/users")
+    .header("Accept", "application/json")
+    .queryParam("page", "1")
+    .responseJSON([User].self)
+
+// POST with JSON
+let newUser = User(name: "John", email: "john@example.com")
+let response = try await session.request("/users", method: .post)
+    .jsonBody(newUser)
+    .execute()
+*/
 
 // MARK: - Swift Extensions and Helpers
 
@@ -8,7 +40,7 @@ extension VaneClient {
     // MARK: - Async/Await Support
 
     @available(iOS 13.0, *)
-    func get(_ url: String) async throws -> VaneResponse {
+    public func get(_ url: String) async throws -> VaneResponse {
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .background).async {
                 do {
@@ -22,7 +54,7 @@ extension VaneClient {
     }
 
     @available(iOS 13.0, *)
-    func post(_ url: String, body: String? = nil) async throws -> VaneResponse {
+    public func post(_ url: String, body: String? = nil) async throws -> VaneResponse {
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .background).async {
                 do {
@@ -36,7 +68,7 @@ extension VaneClient {
     }
 
     @available(iOS 13.0, *)
-    func put(_ url: String, body: String? = nil) async throws -> VaneResponse {
+    public func put(_ url: String, body: String? = nil) async throws -> VaneResponse {
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .background).async {
                 do {
@@ -50,7 +82,7 @@ extension VaneClient {
     }
 
     @available(iOS 13.0, *)
-    func delete(_ url: String) async throws -> VaneResponse {
+    public func delete(_ url: String) async throws -> VaneResponse {
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .background).async {
                 do {
@@ -64,7 +96,7 @@ extension VaneClient {
     }
 
     @available(iOS 13.0, *)
-    func patch(_ url: String, body: String? = nil) async throws -> VaneResponse {
+    public func patch(_ url: String, body: String? = nil) async throws -> VaneResponse {
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .background).async {
                 do {
@@ -78,7 +110,7 @@ extension VaneClient {
     }
 
     @available(iOS 13.0, *)
-    func execute(_ request: VaneRequest) async throws -> VaneResponse {
+    public func execute(_ request: VaneRequest) async throws -> VaneResponse {
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .background).async {
                 do {
@@ -193,7 +225,7 @@ public class VaneRequestBuilder {
     public func jsonBody<T: Codable>(_ object: T) throws -> VaneRequestBuilder {
         let jsonData = try JSONEncoder().encode(object)
         let jsonString = String(data: jsonData, encoding: .utf8) ?? ""
-        request.body = try createJsonBody(jsonString: jsonString)
+        request.body = try createJsonBody(json: jsonString)
         request.headers["Content-Type"] = "application/json"
         return self
     }
@@ -218,19 +250,21 @@ public class VaneRequestBuilder {
         let response = try await execute()
 
         guard response.isSuccess else {
-            throw VaneError(
-                message: "Request failed with status \(response.statusCode)",
-                errorType: "http",
-                statusCode: response.statusCode
-            )
+            throw VaneError.Generic("Request failed with status \(response.statusCode)")
+            // throw VaneError(
+            //     message: "Request failed with status \(response.statusCode)",
+            //     errorType: "http",
+            //     statusCode: response.statusCode
+            // )
         }
 
         guard let data = response.body.data(using: .utf8) else {
-            throw VaneError(
-                message: "Invalid response body encoding",
-                errorType: "decode",
-                statusCode: response.statusCode
-            )
+            throw VaneError.Generic("Invalid response body encoding")
+            // throw VaneError(
+            //     message: "Invalid response body encoding",
+            //     errorType: "decode",
+            //     statusCode: response.statusCode
+            // )
         }
 
         return try JSONDecoder().decode(type, from: data)
@@ -240,11 +274,12 @@ public class VaneRequestBuilder {
         let response = try await execute()
 
         guard response.isSuccess else {
-            throw VaneError(
-                message: "Request failed with status \(response.statusCode)",
-                errorType: "http",
-                statusCode: response.statusCode
-            )
+            throw VaneError.Generic("Request failed with status \(response.statusCode)")
+            // throw VaneError(
+            //     message: "Request failed with status \(response.statusCode)",
+            //     errorType: "http",
+            //     statusCode: response.statusCode
+            // )
         }
 
         return response.body
@@ -296,46 +331,18 @@ extension VaneResponse {
 
     public func json<T: Codable>(_ type: T.Type) throws -> T {
         guard let data = body.data(using: .utf8) else {
-            throw VaneError(
-                message: "Invalid response body encoding",
-                errorType: "decode",
-                statusCode: statusCode
-            )
+            throw VaneError.Generic("Invalid response body encoding")
+            // throw VaneError(
+            //     message: "Invalid response body encoding",
+            //     errorType: "decode",
+            //     statusCode: statusCode
+            // )
         }
 
         return try JSONDecoder().decode(type, from: data)
     }
 
     public var prettyJSON: String? {
-        return try? parseJsonResponse(response: self)
+        return try? parseJsonResponse(resp: self)
     }
 }
-
-// MARK: - Usage Examples
-
-/*
-// Basic usage
-let session = try VaneSession()
-let response = try await session.get("https://api.example.com/users")
-
-// With configuration
-let config = VaneConfigurationBuilder()
-    .baseURL("https://api.example.com")
-    .defaultHeaders(["Authorization": "Bearer token"])
-    .timeout(30)
-    .build()
-
-let session = try VaneSession(configuration: config)
-
-// Request builder pattern
-let users = try await session.request("/users")
-    .header("Accept", "application/json")
-    .queryParam("page", "1")
-    .responseJSON([User].self)
-
-// POST with JSON
-let newUser = User(name: "John", email: "john@example.com")
-let response = try await session.request("/users", method: .post)
-    .jsonBody(newUser)
-    .execute()
-*/
