@@ -89,13 +89,18 @@ pub struct VaneClient {
 impl VaneClient {
     pub fn new(config: VaneClientConfig) -> Result<Self, VaneError> {
         let client = Client::builder()
+            // Connection & Pool
+            .pool_idle_timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(16)
+            // Timeout & UA
             .timeout(Duration::from_secs(config.timeout_seconds.unwrap_or(30)))
             .user_agent(
                 config
                     .user_agent
                     .clone()
-                    .unwrap_or_else(|| "Vane/0.1.0".to_string()),
+                    .unwrap_or_else(|| "Vane/1.1".into()),
             )
+            // Redirect
             .redirect(if config.follow_redirects {
                 Policy::limited(10)
             } else {
