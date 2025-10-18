@@ -1,8 +1,11 @@
-import Alamofire
 import Foundation
 import Testing
 
 @testable import VaneSwift
+
+#if canImport(Alamofire)
+    import Alamofire
+#endif
 
 #if canImport(Darwin)
     import Darwin
@@ -83,6 +86,7 @@ struct VaneSwiftTests {
         let response = try await session.get("\(baseURL)/get")
         print("response[get]: \(response)")
     }
+
     @Test
     func post() async throws {
         let config = VaneConfigurationBuilder()
@@ -98,7 +102,7 @@ struct VaneSwiftTests {
     }
 
     @Test
-    func benchmarkHTTPMethods() async throws {
+    func benchmarkVaneHTTPMethods() async throws {
         let config = VaneConfigurationBuilder()
             .baseURL(baseURL)
             .defaultHeaders(["Authorization": "Bearer token"])
@@ -143,88 +147,90 @@ struct VaneSwiftTests {
 
     @Test
     func benchmarkAlamofireHTTPMethods() async throws {
-        let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 30
-        let session = Session(configuration: configuration)
-        let headers: HTTPHeaders = ["Authorization": "Bearer token"]
+        #if canImport(Alamofire)
+            let configuration = URLSessionConfiguration.default
+            configuration.timeoutIntervalForRequest = 30
+            let session = Session(configuration: configuration)
+            let headers: HTTPHeaders = ["Authorization": "Bearer token"]
 
-        let operations: [(label: String, action: () async throws -> Void)] = [
-            (
-                "GET",
-                {
-                    _ =
-                        try await session
-                        .request("\(baseURL)/get", headers: headers)
-                        .serializingData()
-                        .value
-                }
-            ),
-            (
-                "POST",
-                {
-                    _ =
-                        try await session
-                        .request(
-                            "\(baseURL)/post",
-                            method: .post,
-                            parameters: ["message": "post"],
-                            encoder: JSONParameterEncoder.default,
-                            headers: headers
-                        )
-                        .serializingData()
-                        .value
-                }
-            ),
-            (
-                "PUT",
-                {
-                    _ =
-                        try await session
-                        .request(
-                            "\(baseURL)/put",
-                            method: .put,
-                            parameters: ["message": "put"],
-                            encoder: JSONParameterEncoder.default,
-                            headers: headers
-                        )
-                        .serializingData()
-                        .value
-                }
-            ),
-            (
-                "PATCH",
-                {
-                    _ =
-                        try await session
-                        .request(
-                            "\(baseURL)/patch",
-                            method: .patch,
-                            parameters: ["message": "patch"],
-                            encoder: JSONParameterEncoder.default,
-                            headers: headers
-                        )
-                        .serializingData()
-                        .value
-                }
-            ),
-            (
-                "DELETE",
-                {
-                    _ =
-                        try await session
-                        .request("\(baseURL)/delete", method: .delete, headers: headers)
-                        .serializingData()
-                        .value
-                }
-            ),
-        ]
+            let operations: [(label: String, action: () async throws -> Void)] = [
+                (
+                    "GET",
+                    {
+                        _ =
+                            try await session
+                            .request("\(baseURL)/get", headers: headers)
+                            .serializingData()
+                            .value
+                    }
+                ),
+                (
+                    "POST",
+                    {
+                        _ =
+                            try await session
+                            .request(
+                                "\(baseURL)/post",
+                                method: .post,
+                                parameters: ["message": "post"],
+                                encoder: JSONParameterEncoder.default,
+                                headers: headers
+                            )
+                            .serializingData()
+                            .value
+                    }
+                ),
+                (
+                    "PUT",
+                    {
+                        _ =
+                            try await session
+                            .request(
+                                "\(baseURL)/put",
+                                method: .put,
+                                parameters: ["message": "put"],
+                                encoder: JSONParameterEncoder.default,
+                                headers: headers
+                            )
+                            .serializingData()
+                            .value
+                    }
+                ),
+                (
+                    "PATCH",
+                    {
+                        _ =
+                            try await session
+                            .request(
+                                "\(baseURL)/patch",
+                                method: .patch,
+                                parameters: ["message": "patch"],
+                                encoder: JSONParameterEncoder.default,
+                                headers: headers
+                            )
+                            .serializingData()
+                            .value
+                    }
+                ),
+                (
+                    "DELETE",
+                    {
+                        _ =
+                            try await session
+                            .request("\(baseURL)/delete", method: .delete, headers: headers)
+                            .serializingData()
+                            .value
+                    }
+                ),
+            ]
 
-        try await runBenchmark(
-            summaryName: "Alamofire benchmark",
-            labelPrefix: "Alamofire",
-            iterations: iterations,
-            warmups: warmups,
-            operations: operations
-        )
+            try await runBenchmark(
+                summaryName: "Alamofire benchmark",
+                labelPrefix: "Alamofire",
+                iterations: iterations,
+                warmups: warmups,
+                operations: operations
+            )
+        #endif
     }
 }

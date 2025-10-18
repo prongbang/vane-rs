@@ -2,7 +2,10 @@
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 // Swift Package: VaneSwift
 
+import Foundation
 import PackageDescription
+
+let includeAlamofire = ProcessInfo.processInfo.environment["INCLUDE_ALAMOFIRE"] == "1"
 
 let package = Package(
     name: "VaneSwift",
@@ -16,9 +19,10 @@ let package = Package(
             targets: ["VaneSwift"]
         )
     ],
-    dependencies: [
-        .package(url: "https://github.com/Alamofire/Alamofire.git", from: "5.8.0")
-    ],
+    dependencies: includeAlamofire
+        ? [
+            .package(url: "https://github.com/Alamofire/Alamofire.git", from: "5.8.0")
+        ] : [],
     targets: [
         .binaryTarget(name: "RustFramework", path: "./RustFramework.xcframework"),
         .target(
@@ -32,10 +36,14 @@ let package = Package(
         ),
         .testTarget(
             name: "VaneSwiftTests",
-            dependencies: [
-                "VaneSwift",
-                .product(name: "Alamofire", package: "Alamofire"),
-            ]
+            dependencies: includeAlamofire
+                ? [
+                    "VaneSwift",
+                    .product(name: "Alamofire", package: "Alamofire"),
+                ]
+                : [
+                    "VaneSwift"
+                ]
         ),
     ]
 )
