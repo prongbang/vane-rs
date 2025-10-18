@@ -57,7 +57,7 @@ struct VaneSwiftTests {
             measurements.append((label, elapsed, bytesUsed))
         }
 
-        print("\nGo-style \(summaryName) summary:")
+        print("\n\(summaryName) summary:")
         for (label, elapsed, bytesUsed) in measurements {
             let name = "Benchmark\(labelPrefix)\(label)"
             let paddedName = name.padding(toLength: 24, withPad: " ", startingAt: 0)
