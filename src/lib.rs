@@ -1,3 +1,5 @@
+uniffi::setup_scaffolding!();
+
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
@@ -12,8 +14,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use url::Url;
-
-uniffi::setup_scaffolding!();
 
 // ---------- Models ----------
 #[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
