@@ -1,6 +1,6 @@
 cargo run \
     --bin uniffi-bindgen generate \
-    --library ../VaneKotlin/library/src/main/jniLibs/arm64-v8a/libvane.so \
+    --library src/vane.udl \
     --language kotlin \
     --out-dir ../VaneKotlin/library/src/main/java/ \
     --no-format

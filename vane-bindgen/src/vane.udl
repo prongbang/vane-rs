@@ -1,0 +1,49 @@
+namespace vane;
+
+// ---------- Records ----------
+record VaneRequest {
+    string url;
+    string method;
+    map<string, string> headers;
+    map<string, string> query_params;
+    sequence<u8>? body;
+    u64? timeout_seconds;
+    boolean follow_redirects;
+};
+
+record VaneResponse {
+    u16 status_code;
+    map<string, string> headers;
+    sequence<u8> body;
+    boolean is_success;
+    string url;
+};
+
+record VaneClientConfig {
+    string? base_url;
+    map<string, string> default_headers;
+    u64? timeout_seconds;
+    boolean follow_redirects;
+    string? user_agent;
+};
+
+// ---------- Error ----------
+enum VaneError {
+    Generic,
+};
+
+// ---------- Object ----------
+interface VaneClient {
+    VaneResponse execute_request(VaneRequest request) throws VaneError;
+    VaneResponse get_request(string url) throws VaneError;
+    VaneResponse post_request(string url, sequence<u8>? body) throws VaneError;
+    VaneResponse put_request(string url, sequence<u8>? body) throws VaneError;
+    VaneResponse patch_request(string url, sequence<u8>? body) throws VaneError;
+    VaneResponse delete_request(string url) throws VaneError;
+};
+
+// ---------- Functions ----------
+VaneClientConfig create_default_config();
+VaneClient create_vane_client(VaneClientConfig config) throws VaneError;
+string parse_json_response(VaneResponse resp) throws VaneError;
+string response_body_utf8(VaneResponse resp) throws VaneError;
