@@ -21,8 +21,8 @@ build_swift:
 
 build_kotlin:
 	cargo build --release
-	cd vane-bindgen && sh generate.sh
 	make build_so
+	cd vane-bindgen && sh generate.sh
 
 build_so:
 	cargo ndk build --release \
