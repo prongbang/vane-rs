@@ -173,7 +173,7 @@ class VaneClientTests: XCTestCase {
 
 ### iOS
 
-Vane 1.1 — High Performance Profile
+🦀 Vane 1.0 — High Performance Profile
 
 
 delivers ≈ 4 – 5× faster execution and lower memory usage than Alamofire on iOS
@@ -194,4 +194,28 @@ BenchmarkAlamofirePOST     100	   462700 ns/op	    430.9 B/op	(total 0.046s)
 BenchmarkAlamofirePUT      100	   427270 ns/op	    353.9 B/op	(total 0.043s)
 BenchmarkAlamofirePATCH    100	   467421 ns/op	     69.9 B/op	(total 0.047s)
 BenchmarkAlamofireDELETE   100	   326899 ns/op	    127.4 B/op	(total 0.033s)
+```
+
+## Android
+
+🦀 Vane 1.0 — High Performance Profile (Android)
+
+Vane delivers ≈ 2.5 – 3× faster execution and ≈ 3× lower memory usage than Retrofit2 on Android.
+
+- Vane
+```sh
+BenchmarkVaneGET           100	  1002041 ns/op	  12320.0 B/op	(total 0.100s)
+BenchmarkVanePOST          100	   963228 ns/op	  12483.0 B/op	(total 0.096s)
+BenchmarkVanePUT           100	   785213 ns/op	  13139.0 B/op	(total 0.079s)
+BenchmarkVanePATCH         100	   444038 ns/op	  11500.0 B/op	(total 0.044s)
+BenchmarkVaneDELETE        100	   452196 ns/op	  11500.0 B/op	(total 0.045s)
+```
+
+- Retrofit2
+```sh
+BenchmarkRetrofitGET       100	  2219359 ns/op	  27033.0 B/op	(total 0.222s)
+BenchmarkRetrofitPOST      100	  1417330 ns/op	  38206.0 B/op	(total 0.142s)
+BenchmarkRetrofitPUT       100	  1273835 ns/op	  38944.0 B/op	(total 0.127s)
+BenchmarkRetrofitPATCH     100	  1155910 ns/op	  38370.0 B/op	(total 0.116s)
+BenchmarkRetrofitDELETE    100	  1224208 ns/op	  27279.0 B/op	(total 0.122s)
 ```

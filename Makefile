@@ -30,4 +30,4 @@ build_so:
         --target armv7-linux-androideabi \
         --target i686-linux-android \
         --target x86_64-linux-android \
-        -o VaneKotlin/src/main/jniLibs
+        -o VaneKotlin/library/src/main/jniLibs
