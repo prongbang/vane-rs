@@ -1,0 +1,7 @@
+[bindings.kotlin]
+package_name = "com.inteniquetic.vanekotlin"
+cdylib_name = "vane"
+
+[bindings.swift]
+module_name = "Vane"
+cdylib_name = "vane"

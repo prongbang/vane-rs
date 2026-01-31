@@ -1,33 +1,55 @@
-[package]
-name = "vane"
-version = "0.1.0"
-edition = "2024"
+# [package]
+# name = "vane"
+# version = "0.1.0"
+# edition = "2024"
 
-[dependencies]
-reqwest = { version = "0.11", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+# [dependencies]
+# reqwest = { version = "0.11", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+# serde = { version = "1.0", features = ["derive"] }
+# serde_json = "1.0"
+# uniffi = {version = "0.29", default-features = false}
+# url = "2.4"
+# thiserror = "2.0.12"
+
+# [lib]
+# crate-type = [
+#     "cdylib",  # android
+#     # "staticlib", # ios
+#     "lib"
+# ]
+# name = "vane"
+
+# [build-dependencies]
+# uniffi = { version = "0.29", features = ["build"] }
+
+# [profile.release]
+# opt-level = "z"
+# lto = "fat"
+# strip = true
+# codegen-units = 1
+# panic = "abort"
+# incremental = false
+# debug = false
+# overflow-checks = false
+
+[workspace]
+members = ["vane", "vane-bindgen"]
+resolver = "2"
+
+[workspace.dependencies]
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uniffi = {version = "0.29", default-features = false}
 url = "2.4"
 thiserror = "2.0.12"
-
-[lib]
-crate-type = [
-    "cdylib",  # android
-    # "staticlib", # ios
-    "lib"
-]
-name = "vane"
-
-[build-dependencies]
-uniffi = { version = "0.29", features = ["build"] }
+tokio = { version = "1", features = ["rt", "net", "time"] }
 
 [profile.release]
 opt-level = "z"
-lto = "fat"
-strip = true
+lto = "thin"
 codegen-units = 1
+strip = "symbols"
 panic = "abort"
+debug = 0
 incremental = false
-debug = false
-overflow-checks = false

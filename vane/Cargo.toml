@@ -1,0 +1,22 @@
+[package]
+name = "vane"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+# un comment for dependency_analysis
+#crate-type = ["cdylib"]
+
+[dependencies]
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uniffi = { workspace = true }
+url = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+httpmock = "0.7"
