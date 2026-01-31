@@ -263,32 +263,52 @@ void uniffi_vane_fn_free_vaneclient(void*_Nonnull ptr, RustCallStatus *_Nonnull 
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VANE_FN_METHOD_VANECLIENT_DELETE_REQUEST
 #define UNIFFI_FFIDEF_UNIFFI_VANE_FN_METHOD_VANECLIENT_DELETE_REQUEST
-RustBuffer uniffi_vane_fn_method_vaneclient_delete_request(void*_Nonnull ptr, RustBuffer url, RustCallStatus *_Nonnull out_status
+uint64_t uniffi_vane_fn_method_vaneclient_delete_request(void*_Nonnull ptr, RustBuffer url
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_VANE_FN_METHOD_VANECLIENT_EXECUTE_PREPARED
+#define UNIFFI_FFIDEF_UNIFFI_VANE_FN_METHOD_VANECLIENT_EXECUTE_PREPARED
+uint64_t uniffi_vane_fn_method_vaneclient_execute_prepared(void*_Nonnull ptr, void*_Nonnull request
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VANE_FN_METHOD_VANECLIENT_EXECUTE_REQUEST
 #define UNIFFI_FFIDEF_UNIFFI_VANE_FN_METHOD_VANECLIENT_EXECUTE_REQUEST
-RustBuffer uniffi_vane_fn_method_vaneclient_execute_request(void*_Nonnull ptr, RustBuffer request, RustCallStatus *_Nonnull out_status
+uint64_t uniffi_vane_fn_method_vaneclient_execute_request(void*_Nonnull ptr, RustBuffer request
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VANE_FN_METHOD_VANECLIENT_GET_REQUEST
 #define UNIFFI_FFIDEF_UNIFFI_VANE_FN_METHOD_VANECLIENT_GET_REQUEST
-RustBuffer uniffi_vane_fn_method_vaneclient_get_request(void*_Nonnull ptr, RustBuffer url, RustCallStatus *_Nonnull out_status
+uint64_t uniffi_vane_fn_method_vaneclient_get_request(void*_Nonnull ptr, RustBuffer url
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VANE_FN_METHOD_VANECLIENT_PATCH_REQUEST
 #define UNIFFI_FFIDEF_UNIFFI_VANE_FN_METHOD_VANECLIENT_PATCH_REQUEST
-RustBuffer uniffi_vane_fn_method_vaneclient_patch_request(void*_Nonnull ptr, RustBuffer url, RustBuffer body, RustCallStatus *_Nonnull out_status
+uint64_t uniffi_vane_fn_method_vaneclient_patch_request(void*_Nonnull ptr, RustBuffer url, RustBuffer body
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VANE_FN_METHOD_VANECLIENT_POST_REQUEST
 #define UNIFFI_FFIDEF_UNIFFI_VANE_FN_METHOD_VANECLIENT_POST_REQUEST
-RustBuffer uniffi_vane_fn_method_vaneclient_post_request(void*_Nonnull ptr, RustBuffer url, RustBuffer body, RustCallStatus *_Nonnull out_status
+uint64_t uniffi_vane_fn_method_vaneclient_post_request(void*_Nonnull ptr, RustBuffer url, RustBuffer body
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_VANE_FN_METHOD_VANECLIENT_PREPARE_REQUEST
+#define UNIFFI_FFIDEF_UNIFFI_VANE_FN_METHOD_VANECLIENT_PREPARE_REQUEST
+void*_Nonnull uniffi_vane_fn_method_vaneclient_prepare_request(void*_Nonnull ptr, RustBuffer request, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VANE_FN_METHOD_VANECLIENT_PUT_REQUEST
 #define UNIFFI_FFIDEF_UNIFFI_VANE_FN_METHOD_VANECLIENT_PUT_REQUEST
-RustBuffer uniffi_vane_fn_method_vaneclient_put_request(void*_Nonnull ptr, RustBuffer url, RustBuffer body, RustCallStatus *_Nonnull out_status
+uint64_t uniffi_vane_fn_method_vaneclient_put_request(void*_Nonnull ptr, RustBuffer url, RustBuffer body
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_VANE_FN_CLONE_VANEPREPAREDREQUEST
+#define UNIFFI_FFIDEF_UNIFFI_VANE_FN_CLONE_VANEPREPAREDREQUEST
+void*_Nonnull uniffi_vane_fn_clone_vanepreparedrequest(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_VANE_FN_FREE_VANEPREPAREDREQUEST
+#define UNIFFI_FFIDEF_UNIFFI_VANE_FN_FREE_VANEPREPAREDREQUEST
+void uniffi_vane_fn_free_vanepreparedrequest(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VANE_FN_FUNC_CREATE_DEFAULT_CONFIG
@@ -622,6 +642,12 @@ uint16_t uniffi_vane_checksum_method_vaneclient_delete_request(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_VANE_CHECKSUM_METHOD_VANECLIENT_EXECUTE_PREPARED
+#define UNIFFI_FFIDEF_UNIFFI_VANE_CHECKSUM_METHOD_VANECLIENT_EXECUTE_PREPARED
+uint16_t uniffi_vane_checksum_method_vaneclient_execute_prepared(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_VANE_CHECKSUM_METHOD_VANECLIENT_EXECUTE_REQUEST
 #define UNIFFI_FFIDEF_UNIFFI_VANE_CHECKSUM_METHOD_VANECLIENT_EXECUTE_REQUEST
 uint16_t uniffi_vane_checksum_method_vaneclient_execute_request(void
@@ -643,6 +669,12 @@ uint16_t uniffi_vane_checksum_method_vaneclient_patch_request(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_VANE_CHECKSUM_METHOD_VANECLIENT_POST_REQUEST
 #define UNIFFI_FFIDEF_UNIFFI_VANE_CHECKSUM_METHOD_VANECLIENT_POST_REQUEST
 uint16_t uniffi_vane_checksum_method_vaneclient_post_request(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_VANE_CHECKSUM_METHOD_VANECLIENT_PREPARE_REQUEST
+#define UNIFFI_FFIDEF_UNIFFI_VANE_CHECKSUM_METHOD_VANECLIENT_PREPARE_REQUEST
+uint16_t uniffi_vane_checksum_method_vaneclient_prepare_request(void
     
 );
 #endif

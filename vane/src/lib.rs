@@ -3,13 +3,10 @@ uniffi::setup_scaffolding!();
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use std::error::Error;
 
-use reqwest::{
-    Client,
-    Method,
-    Response,
-    redirect::Policy,
-};
+use bytes::Bytes;
+use reqwest::{Client, Method, Response, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -22,7 +19,7 @@ pub struct VaneRequest {
     pub method: String,
     pub headers: HashMap<String, String>,
     pub query_params: HashMap<String, String>,
-    pub body: Option<Vec<u8>>,
+    pub body: Option<VaneBytes>,
     pub timeout_seconds: Option<u64>,
     pub follow_redirects: bool,
 }
@@ -31,10 +28,71 @@ pub struct VaneRequest {
 pub struct VaneResponse {
     pub status_code: u16,
     pub headers: HashMap<String, String>,
-    pub body: Vec<u8>,
+    pub body: VaneBytes,
     pub is_success: bool,
     pub url: String,
 }
+
+#[derive(Debug, Clone)]
+pub struct VaneBytes(Bytes);
+
+impl VaneBytes {
+    fn into_bytes(self) -> Bytes {
+        self.0
+    }
+
+    #[cfg(test)]
+    fn from_vec(vec: Vec<u8>) -> Self {
+        Self(Bytes::from(vec))
+    }
+}
+
+impl AsRef<[u8]> for VaneBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+impl From<Bytes> for VaneBytes {
+    fn from(bytes: Bytes) -> Self {
+        Self(bytes)
+    }
+}
+
+impl TryFrom<Vec<u8>> for VaneBytes {
+    type Error = uniffi::deps::anyhow::Error;
+
+    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
+        Ok(Self(Bytes::from(value)))
+    }
+}
+
+impl From<VaneBytes> for Vec<u8> {
+    fn from(value: VaneBytes) -> Self {
+        value.0.to_vec()
+    }
+}
+
+impl Serialize for VaneBytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(self.as_ref())
+    }
+}
+
+impl<'de> Deserialize<'de> for VaneBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        Ok(VaneBytes::from(Bytes::from(bytes)))
+    }
+}
+
+uniffi::custom_type!(VaneBytes, Vec<u8>);
 
 #[derive(Debug, Clone, Serialize, Deserialize, uniffi::Record)]
 pub struct VaneClientConfig {
@@ -43,6 +101,16 @@ pub struct VaneClientConfig {
     pub timeout_seconds: Option<u64>,
     pub follow_redirects: bool,
     pub user_agent: Option<String>,
+}
+
+#[derive(uniffi::Object)]
+pub struct VanePreparedRequest {
+    method: Method,
+    url: Url,
+    headers: HashMap<String, String>,
+    timeout_seconds: Option<u64>,
+    body: Option<VaneBytes>,
+    follow_redirects: bool,
 }
 
 impl Default for VaneClientConfig {
@@ -61,40 +129,74 @@ impl Default for VaneClientConfig {
 #[derive(Debug, Clone, Error, uniffi::Error)]
 pub enum VaneError {
     #[error("{0}")]
-    Generic(String),
+    Timeout(String),
+    #[error("{0}")]
+    Connection(String),
+    #[error("{0}")]
+    Decode(String),
+    #[error("{0}")]
+    Tls(String),
+    #[error("{0}")]
+    Http(String),
+    #[error("{0}")]
+    InvalidUrl(String),
+    #[error("{0}")]
+    InvalidMethod(String),
+    #[error("{0}")]
+    Utf8(String),
+    #[error("{0}")]
+    Other(String),
 }
 
 impl From<reqwest::Error> for VaneError {
     fn from(err: reqwest::Error) -> Self {
-        let kind = if err.is_timeout() {
-            "Timeout"
-        } else if err.is_connect() {
-            "Connection"
-        } else if err.is_decode() {
-            "Decode"
-        } else {
-            "Request"
-        };
-        VaneError::Generic(format!("{kind} error: {err}"))
+        if err.is_timeout() {
+            return VaneError::Timeout(err.to_string());
+        }
+        if err.is_connect() {
+            return VaneError::Connection(err.to_string());
+        }
+        if err.is_decode() {
+            return VaneError::Decode(err.to_string());
+        }
+        if err.is_builder() {
+            return VaneError::Other(err.to_string());
+        }
+        if err.is_request() {
+            return VaneError::Http(err.to_string());
+        }
+        if let Some(source) = err.source() {
+            let msg = source.to_string().to_lowercase();
+            if msg.contains("tls") || msg.contains("ssl") || msg.contains("certificate") {
+                return VaneError::Tls(err.to_string());
+            }
+        }
+        VaneError::Other(err.to_string())
     }
 }
 
 // ---------- Client ----------
 #[derive(uniffi::Object)]
 pub struct VaneClient {
-    client: Client,
+    client_follow: Client,
+    client_no_follow: Client,
     config: VaneClientConfig,
-    runtime: tokio::runtime::Runtime,
 }
 
 impl VaneClient {
     pub fn new(config: VaneClientConfig) -> Result<Self, VaneError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| VaneError::Generic(format!("Failed to create runtime: {e}")))?;
+        let client_follow = Self::build_client(&config, true)?;
+        let client_no_follow = Self::build_client(&config, false)?;
 
-        let client = Client::builder()
+        Ok(Self {
+            client_follow,
+            client_no_follow,
+            config,
+        })
+    }
+
+    fn build_client(config: &VaneClientConfig, follow_redirects: bool) -> Result<Client, VaneError> {
+        Client::builder()
             // Connection & Pool
             .pool_idle_timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(16)
@@ -107,52 +209,69 @@ impl VaneClient {
                     .unwrap_or_else(|| "Vane/1.1".into()),
             )
             // Redirect
-            .redirect(if config.follow_redirects {
+            .redirect(if follow_redirects {
                 Policy::limited(10)
             } else {
                 Policy::none()
             })
             .build()
-            .map_err(|e| VaneError::Generic(format!("Failed to create client: {e}")))?;
+            .map_err(|e| VaneError::Other(format!("Failed to create client: {e}")))
+    }
 
-        Ok(Self {
-            client,
-            config,
-            runtime,
+    fn prepare_request_inner(&self, request: VaneRequest) -> Result<VanePreparedRequest, VaneError> {
+        let mut url = self.build_url(&request.url)?;
+        if !request.query_params.is_empty() {
+            let mut pairs = url.query_pairs_mut();
+            for (k, v) in &request.query_params {
+                pairs.append_pair(k, v);
+            }
+        }
+
+        let method = Method::from_bytes(request.method.as_bytes())
+            .map_err(|_| VaneError::InvalidMethod(format!("Invalid method: {}", request.method)))?;
+
+        Ok(VanePreparedRequest {
+            method,
+            url,
+            headers: request.headers,
+            timeout_seconds: request.timeout_seconds,
+            body: request.body,
+            follow_redirects: request.follow_redirects,
         })
     }
 
-    pub fn execute(&self, request: VaneRequest) -> Result<VaneResponse, VaneError> {
-        self.runtime.block_on(self.execute_async(request))
+    async fn execute(&self, request: VaneRequest) -> Result<VaneResponse, VaneError> {
+        let prepared = self.prepare_request_inner(request)?;
+        self.execute_prepared_inner(&prepared).await
     }
 
-    async fn execute_async(&self, request: VaneRequest) -> Result<VaneResponse, VaneError> {
-        let url = self.build_url(&request.url)?;
-        let method = Method::from_bytes(request.method.as_bytes())
-            .map_err(|_| VaneError::Generic(format!("Invalid method: {}", request.method)))?;
+    async fn execute_prepared_inner(
+        &self,
+        prepared: &VanePreparedRequest,
+    ) -> Result<VaneResponse, VaneError> {
+        let client = if prepared.follow_redirects {
+            &self.client_follow
+        } else {
+            &self.client_no_follow
+        };
 
-        let mut req_builder = self.client.request(method, url.clone());
+        let mut req_builder = client.request(prepared.method.clone(), prepared.url.clone());
 
         // headers
         for (k, v) in &self.config.default_headers {
             req_builder = req_builder.header(k, v);
         }
-        for (k, v) in &request.headers {
+        for (k, v) in &prepared.headers {
             req_builder = req_builder.header(k, v);
         }
 
-        // query
-        if !request.query_params.is_empty() {
-            req_builder = req_builder.query(&request.query_params);
-        }
-
         // body
-        if let Some(b) = &request.body {
-            req_builder = req_builder.body(b.clone());
+        if let Some(b) = prepared.body.clone() {
+            req_builder = req_builder.body(b.into_bytes());
         }
 
         // timeout override
-        if let Some(t) = request.timeout_seconds {
+        if let Some(t) = prepared.timeout_seconds {
             req_builder = req_builder.timeout(Duration::from_secs(t));
         }
 
@@ -163,12 +282,12 @@ impl VaneClient {
     fn build_url(&self, url: &str) -> Result<Url, VaneError> {
         if let Some(base) = &self.config.base_url {
             let base_url = Url::parse(base)
-                .map_err(|e| VaneError::Generic(format!("Invalid base URL: {e}")))?;
+                .map_err(|e| VaneError::InvalidUrl(format!("Invalid base URL: {e}")))?;
             base_url
                 .join(url)
-                .map_err(|e| VaneError::Generic(format!("Failed to join URL: {e}")))
+                .map_err(|e| VaneError::InvalidUrl(format!("Failed to join URL: {e}")))
         } else {
-            Url::parse(url).map_err(|e| VaneError::Generic(format!("Invalid URL: {e}")))
+            Url::parse(url).map_err(|e| VaneError::InvalidUrl(format!("Invalid URL: {e}")))
         }
     }
 
@@ -182,7 +301,7 @@ impl VaneClient {
             headers.insert(k.to_string(), v.to_str().unwrap_or_default().to_string());
         }
 
-        let body = resp.bytes().await?.to_vec();
+        let body = VaneBytes::from(resp.bytes().await?);
 
         Ok(VaneResponse {
             status_code: status,
@@ -193,11 +312,11 @@ impl VaneClient {
         })
     }
 
-    fn make_request(
+    async fn make_request(
         &self,
         method: &str,
         url: &str,
-        body: Option<Vec<u8>>,
+        body: Option<VaneBytes>,
     ) -> Result<VaneResponse, VaneError> {
         self.execute(VaneRequest {
             url: url.to_string(),
@@ -208,6 +327,7 @@ impl VaneClient {
             timeout_seconds: None,
             follow_redirects: self.config.follow_redirects,
         })
+        .await
     }
 }
 
@@ -224,50 +344,67 @@ pub fn create_vane_client(config: VaneClientConfig) -> Result<Arc<VaneClient>, V
 
 #[uniffi::export]
 impl VaneClient {
-    pub fn execute_request(&self, request: VaneRequest) -> Result<VaneResponse, VaneError> {
-        self.execute(request)
+    pub fn prepare_request(
+        &self,
+        request: VaneRequest,
+    ) -> Result<Arc<VanePreparedRequest>, VaneError> {
+        Ok(Arc::new(self.prepare_request_inner(request)?))
     }
 
-    pub fn get_request(&self, url: String) -> Result<VaneResponse, VaneError> {
-        self.make_request("GET", &url, None)
+    pub async fn execute_request(
+        &self,
+        request: VaneRequest,
+    ) -> Result<VaneResponse, VaneError> {
+        self.execute(request).await
     }
 
-    pub fn post_request(
+    pub async fn execute_prepared(
+        &self,
+        request: Arc<VanePreparedRequest>,
+    ) -> Result<VaneResponse, VaneError> {
+        self.execute_prepared_inner(&request).await
+    }
+
+    pub async fn get_request(&self, url: String) -> Result<VaneResponse, VaneError> {
+        self.make_request("GET", &url, None).await
+    }
+
+    pub async fn post_request(
         &self,
         url: String,
-        body: Option<Vec<u8>>,
+        body: Option<VaneBytes>,
     ) -> Result<VaneResponse, VaneError> {
-        self.make_request("POST", &url, body)
+        self.make_request("POST", &url, body).await
     }
 
-    pub fn put_request(
+    pub async fn put_request(
         &self,
         url: String,
-        body: Option<Vec<u8>>,
+        body: Option<VaneBytes>,
     ) -> Result<VaneResponse, VaneError> {
-        self.make_request("PUT", &url, body)
+        self.make_request("PUT", &url, body).await
     }
 
-    pub fn delete_request(&self, url: String) -> Result<VaneResponse, VaneError> {
-        self.make_request("DELETE", &url, None)
+    pub async fn delete_request(&self, url: String) -> Result<VaneResponse, VaneError> {
+        self.make_request("DELETE", &url, None).await
     }
 
-    pub fn patch_request(
+    pub async fn patch_request(
         &self,
         url: String,
-        body: Option<Vec<u8>>,
+        body: Option<VaneBytes>,
     ) -> Result<VaneResponse, VaneError> {
-        self.make_request("PATCH", &url, body)
+        self.make_request("PATCH", &url, body).await
     }
 }
 
 // ---------- Helpers ----------
 #[uniffi::export]
 pub fn parse_json_response(resp: &VaneResponse) -> Result<String, VaneError> {
-    let parsed: Value = serde_json::from_slice(&resp.body)
-        .map_err(|e| VaneError::Generic(format!("Parse JSON failed: {e}")))?;
+    let parsed: Value = serde_json::from_slice(resp.body.as_ref())
+        .map_err(|e| VaneError::Decode(format!("Parse JSON failed: {e}")))?;
     serde_json::to_string_pretty(&parsed)
-        .map_err(|e| VaneError::Generic(format!("Serialize JSON failed: {e}")))
+        .map_err(|e| VaneError::Decode(format!("Serialize JSON failed: {e}")))
 }
 
 #[cfg(test)]
@@ -289,8 +426,12 @@ mod tests {
         VaneClient::new(config).expect("client build")
     }
 
-    #[test]
-    fn execute_request_sends_headers_query_and_body() {
+    fn bytes(data: &[u8]) -> VaneBytes {
+        VaneBytes::from_vec(data.to_vec())
+    }
+
+    #[tokio::test]
+    async fn execute_request_sends_headers_query_and_body() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST)
@@ -315,22 +456,198 @@ mod tests {
                 method: "POST".to_string(),
                 headers,
                 query_params,
-                body: Some(b"hello".to_vec()),
+                body: Some(bytes(b"hello")),
                 timeout_seconds: None,
                 follow_redirects: true,
             })
+            .await
             .expect("execute_request");
 
         mock.assert();
         assert_eq!(resp.status_code, 201);
-        assert_eq!(resp.body, b"world");
+        assert_eq!(resp.body.as_ref(), b"world");
         assert_eq!(resp.headers.get("x-resp").map(String::as_str), Some("ok"));
         assert!(resp.is_success);
         assert!(resp.url.contains("/exec"));
     }
 
+    #[tokio::test]
+    async fn execute_prepared_request_works() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/prep")
+                .query_param("q", "1")
+                .header("x-req", "p")
+                .body("data");
+            then.status(200).body("ok");
+        });
+
+        let client = client_with_base(&server);
+        let mut headers = HashMap::new();
+        headers.insert("x-req".to_string(), "p".to_string());
+        let mut query_params = HashMap::new();
+        query_params.insert("q".to_string(), "1".to_string());
+
+        let prepared = client
+            .prepare_request(VaneRequest {
+                url: "/prep".to_string(),
+                method: "POST".to_string(),
+                headers,
+                query_params,
+                body: Some(bytes(b"data")),
+                timeout_seconds: None,
+                follow_redirects: true,
+            })
+            .expect("prepare_request");
+
+        let resp = client
+            .execute_prepared(prepared)
+            .await
+            .expect("execute_prepared");
+
+        mock.assert();
+        assert_eq!(resp.body.as_ref(), b"ok");
+    }
+
+    #[tokio::test]
+    async fn content_types_are_sent_as_requested() {
+        let server = MockServer::start();
+        let client = client_with_base(&server);
+
+        let cases: Vec<(&str, &str, Vec<u8>)> = vec![
+            ("/ct-json", "application/json", br#"{"a":1}"#.to_vec()),
+            ("/ct-bin", "application/octet-stream", b"BIN".to_vec()),
+            ("/ct-text", "text/plain", b"hello".to_vec()),
+            ("/ct-form", "application/x-www-form-urlencoded", b"a=1&b=2".to_vec()),
+            (
+                "/ct-multipart",
+                "multipart/form-data; boundary=----vane",
+                b"------vane\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nv\r\n------vane--\r\n"
+                    .to_vec(),
+            ),
+            ("/ct-html", "text/html", b"<p>hi</p>".to_vec()),
+            ("/ct-xml", "application/xml", b"<a>1</a>".to_vec()),
+        ];
+
+        for (path, content_type, body) in cases {
+            let mock = server.mock(|when, then| {
+                when.method(POST)
+                    .path(path)
+                    .header("content-type", content_type)
+                    .body(String::from_utf8(body.clone()).expect("utf8 body"));
+                then.status(200).body("ok");
+            });
+
+            let mut headers = HashMap::new();
+            headers.insert("content-type".to_string(), content_type.to_string());
+
+            let resp = client
+                .execute_request(VaneRequest {
+                    url: path.to_string(),
+                    method: "POST".to_string(),
+                    headers,
+                query_params: HashMap::new(),
+                body: Some(bytes(&body)),
+                timeout_seconds: None,
+                follow_redirects: true,
+            })
+                .await
+                .expect("execute_request");
+
+            mock.assert();
+            assert_eq!(resp.status_code, 200);
+        }
+    }
+
+    #[tokio::test]
+    async fn request_level_follow_redirects_overrides_default() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/redir");
+            then.status(302).header("Location", "/final");
+        });
+        let final_mock = server.mock(|when, then| {
+            when.method(GET).path("/final");
+            then.status(200).body("final");
+        });
+
+        let mut config = VaneClientConfig::default();
+        config.base_url = Some(server.base_url());
+        config.follow_redirects = true;
+        let client = VaneClient::new(config).expect("client build");
+
+        let resp = client
+            .execute_request(VaneRequest {
+                url: "/redir".to_string(),
+                method: "GET".to_string(),
+                headers: HashMap::new(),
+                query_params: HashMap::new(),
+                body: None,
+                timeout_seconds: None,
+                follow_redirects: false,
+            })
+            .await
+            .expect("execute_request");
+
+        assert_eq!(resp.status_code, 302);
+        assert!(resp.url.contains("/redir"));
+        assert_eq!(final_mock.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_error() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/slow");
+            then.status(200)
+                .delay(Duration::from_millis(1500))
+                .body("ok");
+        });
+
+        let mut config = VaneClientConfig::default();
+        config.base_url = Some(server.base_url());
+        let client = VaneClient::new(config).expect("client build");
+
+        let err = client
+            .execute_request(VaneRequest {
+                url: "/slow".to_string(),
+                method: "GET".to_string(),
+                headers: HashMap::new(),
+                query_params: HashMap::new(),
+                body: None,
+                timeout_seconds: Some(1),
+                follow_redirects: true,
+            })
+            .await
+            .err()
+            .expect("timeout error");
+
+        match err {
+            VaneError::Timeout(_) => {}
+            _ => panic!("expected Timeout"),
+        }
+    }
+
     #[test]
-    fn get_request_works() {
+    fn response_body_utf8_fails_on_invalid_utf8() {
+        let resp = VaneResponse {
+            status_code: 200,
+            headers: HashMap::new(),
+            body: bytes(&[0xff, 0xfe]),
+            is_success: true,
+            url: "http://example.com".to_string(),
+        };
+
+        let err = response_body_utf8(&resp).err().expect("utf8 error");
+        match err {
+            VaneError::Utf8(msg) => assert!(msg.contains("Invalid UTF-8")),
+            _ => panic!("expected Utf8"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_request_works() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(GET).path("/get");
@@ -338,16 +655,19 @@ mod tests {
         });
 
         let client = client_with_base(&server);
-        let resp = client.get_request("/get".to_string()).expect("get_request");
+        let resp = client
+            .get_request("/get".to_string())
+            .await
+            .expect("get_request");
 
         mock.assert();
         assert_eq!(resp.status_code, 200);
-        assert_eq!(resp.body, b"ok");
+        assert_eq!(resp.body.as_ref(), b"ok");
         assert!(resp.is_success);
     }
 
-    #[test]
-    fn post_request_works() {
+    #[tokio::test]
+    async fn post_request_works() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(POST).path("/post").body("ping");
@@ -356,15 +676,16 @@ mod tests {
 
         let client = client_with_base(&server);
         let resp = client
-            .post_request("/post".to_string(), Some(b"ping".to_vec()))
+            .post_request("/post".to_string(), Some(bytes(b"ping")))
+            .await
             .expect("post_request");
 
         mock.assert();
-        assert_eq!(resp.body, b"pong");
+        assert_eq!(resp.body.as_ref(), b"pong");
     }
 
-    #[test]
-    fn put_request_works() {
+    #[tokio::test]
+    async fn put_request_works() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(PUT).path("/put").body("data");
@@ -373,15 +694,16 @@ mod tests {
 
         let client = client_with_base(&server);
         let resp = client
-            .put_request("/put".to_string(), Some(b"data".to_vec()))
+            .put_request("/put".to_string(), Some(bytes(b"data")))
+            .await
             .expect("put_request");
 
         mock.assert();
         assert_eq!(resp.status_code, 204);
     }
 
-    #[test]
-    fn delete_request_works() {
+    #[tokio::test]
+    async fn delete_request_works() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(DELETE).path("/delete");
@@ -391,14 +713,15 @@ mod tests {
         let client = client_with_base(&server);
         let resp = client
             .delete_request("/delete".to_string())
+            .await
             .expect("delete_request");
 
         mock.assert();
         assert_eq!(resp.status_code, 202);
     }
 
-    #[test]
-    fn patch_request_works() {
+    #[tokio::test]
+    async fn patch_request_works() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(PATCH).path("/patch").body("p");
@@ -407,15 +730,16 @@ mod tests {
 
         let client = client_with_base(&server);
         let resp = client
-            .patch_request("/patch".to_string(), Some(b"p".to_vec()))
+            .patch_request("/patch".to_string(), Some(bytes(b"p")))
+            .await
             .expect("patch_request");
 
         mock.assert();
-        assert_eq!(resp.body, b"patched");
+        assert_eq!(resp.body.as_ref(), b"patched");
     }
 
-    #[test]
-    fn default_headers_applied() {
+    #[tokio::test]
+    async fn default_headers_applied() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
             when.method(GET).path("/hdr").header("x-default", "yes");
@@ -423,14 +747,17 @@ mod tests {
         });
 
         let client = client_with_base_and_headers(&server);
-        let resp = client.get_request("/hdr".to_string()).expect("get_request");
+        let resp = client
+            .get_request("/hdr".to_string())
+            .await
+            .expect("get_request");
 
         mock.assert();
         assert_eq!(resp.status_code, 200);
     }
 
-    #[test]
-    fn invalid_method_returns_error() {
+    #[tokio::test]
+    async fn invalid_method_returns_error() {
         let server = MockServer::start();
         let client = client_with_base(&server);
         let err = client
@@ -443,29 +770,33 @@ mod tests {
                 timeout_seconds: None,
                 follow_redirects: true,
             })
+            .await
             .err()
             .expect("invalid method error");
 
         match err {
-            VaneError::Generic(msg) => assert!(msg.contains("Invalid method")),
+            VaneError::InvalidMethod(msg) => assert!(msg.contains("Invalid method")),
+            _ => panic!("expected InvalidMethod"),
         }
     }
 
-    #[test]
-    fn invalid_url_returns_error() {
+    #[tokio::test]
+    async fn invalid_url_returns_error() {
         let client = VaneClient::new(VaneClientConfig::default()).expect("client build");
         let err = client
             .get_request("://invalid".to_string())
+            .await
             .err()
             .expect("invalid url error");
 
         match err {
-            VaneError::Generic(msg) => assert!(msg.contains("Invalid URL")),
+            VaneError::InvalidUrl(msg) => assert!(msg.contains("Invalid URL")),
+            _ => panic!("expected InvalidUrl"),
         }
     }
 
-    #[test]
-    fn redirect_not_followed_when_disabled() {
+    #[tokio::test]
+    async fn redirect_not_followed_when_disabled() {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(GET).path("/redir");
@@ -482,15 +813,18 @@ mod tests {
         config.follow_redirects = false;
         let client = VaneClient::new(config).expect("client build");
 
-        let resp = client.get_request("/redir".to_string()).expect("get_request");
+        let resp = client
+            .get_request("/redir".to_string())
+            .await
+            .expect("get_request");
 
         assert_eq!(resp.status_code, 302);
         assert!(resp.url.contains("/redir"));
         assert_eq!(final_mock.hits(), 0);
     }
 
-    #[test]
-    fn redirect_followed_when_enabled() {
+    #[tokio::test]
+    async fn redirect_followed_when_enabled() {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(GET).path("/redir");
@@ -503,10 +837,13 @@ mod tests {
         });
 
         let client = client_with_base(&server);
-        let resp = client.get_request("/redir".to_string()).expect("get_request");
+        let resp = client
+            .get_request("/redir".to_string())
+            .await
+            .expect("get_request");
 
         assert_eq!(resp.status_code, 200);
-        assert_eq!(resp.body, b"final");
+        assert_eq!(resp.body.as_ref(), b"final");
         assert!(resp.url.contains("/final"));
         assert_eq!(final_mock.hits(), 1);
     }
@@ -516,7 +853,7 @@ mod tests {
         let resp = VaneResponse {
             status_code: 200,
             headers: HashMap::new(),
-            body: br#"{"a":1}"#.to_vec(),
+            body: bytes(br#"{"a":1}"#),
             is_success: true,
             url: "http://example.com".to_string(),
         };
@@ -530,20 +867,21 @@ mod tests {
         let resp = VaneResponse {
             status_code: 200,
             headers: HashMap::new(),
-            body: b"not-json".to_vec(),
+            body: bytes(b"not-json"),
             is_success: true,
             url: "http://example.com".to_string(),
         };
 
         let err = parse_json_response(&resp).err().expect("parse_json_response error");
         match err {
-            VaneError::Generic(msg) => assert!(msg.contains("Parse JSON failed")),
+            VaneError::Decode(msg) => assert!(msg.contains("Parse JSON failed")),
+            _ => panic!("expected Decode"),
         }
     }
 }
 
 #[uniffi::export]
 pub fn response_body_utf8(resp: &VaneResponse) -> Result<String, VaneError> {
-    String::from_utf8(resp.body.clone())
-        .map_err(|e| VaneError::Generic(format!("Invalid UTF-8 in response body: {e}")))
+    String::from_utf8(Vec::<u8>::from(resp.body.clone()))
+        .map_err(|e| VaneError::Utf8(format!("Invalid UTF-8 in response body: {e}")))
 }

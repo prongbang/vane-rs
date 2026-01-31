@@ -517,17 +517,21 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 public protocol VaneClientProtocol: AnyObject, Sendable {
     
-    func deleteRequest(url: String) throws  -> VaneResponse
+    func deleteRequest(url: String) async throws  -> VaneResponse
     
-    func executeRequest(request: VaneRequest) throws  -> VaneResponse
+    func executePrepared(request: VanePreparedRequest) async throws  -> VaneResponse
     
-    func getRequest(url: String) throws  -> VaneResponse
+    func executeRequest(request: VaneRequest) async throws  -> VaneResponse
     
-    func patchRequest(url: String, body: Data?) throws  -> VaneResponse
+    func getRequest(url: String) async throws  -> VaneResponse
     
-    func postRequest(url: String, body: Data?) throws  -> VaneResponse
+    func patchRequest(url: String, body: VaneBytes?) async throws  -> VaneResponse
     
-    func putRequest(url: String, body: Data?) throws  -> VaneResponse
+    func postRequest(url: String, body: VaneBytes?) async throws  -> VaneResponse
+    
+    func prepareRequest(request: VaneRequest) throws  -> VanePreparedRequest
+    
+    func putRequest(url: String, body: VaneBytes?) async throws  -> VaneResponse
     
 }
 open class VaneClient: VaneClientProtocol, @unchecked Sendable {
@@ -582,55 +586,131 @@ open class VaneClient: VaneClientProtocol, @unchecked Sendable {
     
 
     
-open func deleteRequest(url: String)throws  -> VaneResponse  {
-    return try  FfiConverterTypeVaneResponse_lift(try rustCallWithError(FfiConverterTypeVaneError_lift) {
-    uniffi_vane_fn_method_vaneclient_delete_request(self.uniffiClonePointer(),
-        FfiConverterString.lower(url),$0
-    )
-})
+open func deleteRequest(url: String)async throws  -> VaneResponse  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_vane_fn_method_vaneclient_delete_request(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(url)
+                )
+            },
+            pollFunc: ffi_vane_rust_future_poll_rust_buffer,
+            completeFunc: ffi_vane_rust_future_complete_rust_buffer,
+            freeFunc: ffi_vane_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeVaneResponse_lift,
+            errorHandler: FfiConverterTypeVaneError_lift
+        )
 }
     
-open func executeRequest(request: VaneRequest)throws  -> VaneResponse  {
-    return try  FfiConverterTypeVaneResponse_lift(try rustCallWithError(FfiConverterTypeVaneError_lift) {
-    uniffi_vane_fn_method_vaneclient_execute_request(self.uniffiClonePointer(),
+open func executePrepared(request: VanePreparedRequest)async throws  -> VaneResponse  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_vane_fn_method_vaneclient_execute_prepared(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeVanePreparedRequest_lower(request)
+                )
+            },
+            pollFunc: ffi_vane_rust_future_poll_rust_buffer,
+            completeFunc: ffi_vane_rust_future_complete_rust_buffer,
+            freeFunc: ffi_vane_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeVaneResponse_lift,
+            errorHandler: FfiConverterTypeVaneError_lift
+        )
+}
+    
+open func executeRequest(request: VaneRequest)async throws  -> VaneResponse  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_vane_fn_method_vaneclient_execute_request(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeVaneRequest_lower(request)
+                )
+            },
+            pollFunc: ffi_vane_rust_future_poll_rust_buffer,
+            completeFunc: ffi_vane_rust_future_complete_rust_buffer,
+            freeFunc: ffi_vane_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeVaneResponse_lift,
+            errorHandler: FfiConverterTypeVaneError_lift
+        )
+}
+    
+open func getRequest(url: String)async throws  -> VaneResponse  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_vane_fn_method_vaneclient_get_request(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(url)
+                )
+            },
+            pollFunc: ffi_vane_rust_future_poll_rust_buffer,
+            completeFunc: ffi_vane_rust_future_complete_rust_buffer,
+            freeFunc: ffi_vane_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeVaneResponse_lift,
+            errorHandler: FfiConverterTypeVaneError_lift
+        )
+}
+    
+open func patchRequest(url: String, body: VaneBytes?)async throws  -> VaneResponse  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_vane_fn_method_vaneclient_patch_request(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(url),FfiConverterOptionTypeVaneBytes.lower(body)
+                )
+            },
+            pollFunc: ffi_vane_rust_future_poll_rust_buffer,
+            completeFunc: ffi_vane_rust_future_complete_rust_buffer,
+            freeFunc: ffi_vane_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeVaneResponse_lift,
+            errorHandler: FfiConverterTypeVaneError_lift
+        )
+}
+    
+open func postRequest(url: String, body: VaneBytes?)async throws  -> VaneResponse  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_vane_fn_method_vaneclient_post_request(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(url),FfiConverterOptionTypeVaneBytes.lower(body)
+                )
+            },
+            pollFunc: ffi_vane_rust_future_poll_rust_buffer,
+            completeFunc: ffi_vane_rust_future_complete_rust_buffer,
+            freeFunc: ffi_vane_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeVaneResponse_lift,
+            errorHandler: FfiConverterTypeVaneError_lift
+        )
+}
+    
+open func prepareRequest(request: VaneRequest)throws  -> VanePreparedRequest  {
+    return try  FfiConverterTypeVanePreparedRequest_lift(try rustCallWithError(FfiConverterTypeVaneError_lift) {
+    uniffi_vane_fn_method_vaneclient_prepare_request(self.uniffiClonePointer(),
         FfiConverterTypeVaneRequest_lower(request),$0
     )
 })
 }
     
-open func getRequest(url: String)throws  -> VaneResponse  {
-    return try  FfiConverterTypeVaneResponse_lift(try rustCallWithError(FfiConverterTypeVaneError_lift) {
-    uniffi_vane_fn_method_vaneclient_get_request(self.uniffiClonePointer(),
-        FfiConverterString.lower(url),$0
-    )
-})
-}
-    
-open func patchRequest(url: String, body: Data?)throws  -> VaneResponse  {
-    return try  FfiConverterTypeVaneResponse_lift(try rustCallWithError(FfiConverterTypeVaneError_lift) {
-    uniffi_vane_fn_method_vaneclient_patch_request(self.uniffiClonePointer(),
-        FfiConverterString.lower(url),
-        FfiConverterOptionData.lower(body),$0
-    )
-})
-}
-    
-open func postRequest(url: String, body: Data?)throws  -> VaneResponse  {
-    return try  FfiConverterTypeVaneResponse_lift(try rustCallWithError(FfiConverterTypeVaneError_lift) {
-    uniffi_vane_fn_method_vaneclient_post_request(self.uniffiClonePointer(),
-        FfiConverterString.lower(url),
-        FfiConverterOptionData.lower(body),$0
-    )
-})
-}
-    
-open func putRequest(url: String, body: Data?)throws  -> VaneResponse  {
-    return try  FfiConverterTypeVaneResponse_lift(try rustCallWithError(FfiConverterTypeVaneError_lift) {
-    uniffi_vane_fn_method_vaneclient_put_request(self.uniffiClonePointer(),
-        FfiConverterString.lower(url),
-        FfiConverterOptionData.lower(body),$0
-    )
-})
+open func putRequest(url: String, body: VaneBytes?)async throws  -> VaneResponse  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_vane_fn_method_vaneclient_put_request(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(url),FfiConverterOptionTypeVaneBytes.lower(body)
+                )
+            },
+            pollFunc: ffi_vane_rust_future_poll_rust_buffer,
+            completeFunc: ffi_vane_rust_future_complete_rust_buffer,
+            freeFunc: ffi_vane_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeVaneResponse_lift,
+            errorHandler: FfiConverterTypeVaneError_lift
+        )
 }
     
 
@@ -684,6 +764,119 @@ public func FfiConverterTypeVaneClient_lift(_ pointer: UnsafeMutableRawPointer) 
 #endif
 public func FfiConverterTypeVaneClient_lower(_ value: VaneClient) -> UnsafeMutableRawPointer {
     return FfiConverterTypeVaneClient.lower(value)
+}
+
+
+
+
+
+
+public protocol VanePreparedRequestProtocol: AnyObject, Sendable {
+    
+}
+open class VanePreparedRequest: VanePreparedRequestProtocol, @unchecked Sendable {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_vane_fn_clone_vanepreparedrequest(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_vane_fn_free_vanepreparedrequest(pointer, $0) }
+    }
+
+    
+
+    
+
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVanePreparedRequest: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = VanePreparedRequest
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> VanePreparedRequest {
+        return VanePreparedRequest(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: VanePreparedRequest) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VanePreparedRequest {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: VanePreparedRequest, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVanePreparedRequest_lift(_ pointer: UnsafeMutableRawPointer) throws -> VanePreparedRequest {
+    return try FfiConverterTypeVanePreparedRequest.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVanePreparedRequest_lower(_ value: VanePreparedRequest) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeVanePreparedRequest.lower(value)
 }
 
 
@@ -788,13 +981,13 @@ public struct VaneRequest {
     public var method: String
     public var headers: [String: String]
     public var queryParams: [String: String]
-    public var body: Data?
+    public var body: VaneBytes?
     public var timeoutSeconds: UInt64?
     public var followRedirects: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(url: String, method: String, headers: [String: String], queryParams: [String: String], body: Data?, timeoutSeconds: UInt64?, followRedirects: Bool) {
+    public init(url: String, method: String, headers: [String: String], queryParams: [String: String], body: VaneBytes?, timeoutSeconds: UInt64?, followRedirects: Bool) {
         self.url = url
         self.method = method
         self.headers = headers
@@ -860,7 +1053,7 @@ public struct FfiConverterTypeVaneRequest: FfiConverterRustBuffer {
                 method: FfiConverterString.read(from: &buf), 
                 headers: FfiConverterDictionaryStringString.read(from: &buf), 
                 queryParams: FfiConverterDictionaryStringString.read(from: &buf), 
-                body: FfiConverterOptionData.read(from: &buf), 
+                body: FfiConverterOptionTypeVaneBytes.read(from: &buf), 
                 timeoutSeconds: FfiConverterOptionUInt64.read(from: &buf), 
                 followRedirects: FfiConverterBool.read(from: &buf)
         )
@@ -871,7 +1064,7 @@ public struct FfiConverterTypeVaneRequest: FfiConverterRustBuffer {
         FfiConverterString.write(value.method, into: &buf)
         FfiConverterDictionaryStringString.write(value.headers, into: &buf)
         FfiConverterDictionaryStringString.write(value.queryParams, into: &buf)
-        FfiConverterOptionData.write(value.body, into: &buf)
+        FfiConverterOptionTypeVaneBytes.write(value.body, into: &buf)
         FfiConverterOptionUInt64.write(value.timeoutSeconds, into: &buf)
         FfiConverterBool.write(value.followRedirects, into: &buf)
     }
@@ -896,13 +1089,13 @@ public func FfiConverterTypeVaneRequest_lower(_ value: VaneRequest) -> RustBuffe
 public struct VaneResponse {
     public var statusCode: UInt16
     public var headers: [String: String]
-    public var body: Data
+    public var body: VaneBytes
     public var isSuccess: Bool
     public var url: String
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(statusCode: UInt16, headers: [String: String], body: Data, isSuccess: Bool, url: String) {
+    public init(statusCode: UInt16, headers: [String: String], body: VaneBytes, isSuccess: Bool, url: String) {
         self.statusCode = statusCode
         self.headers = headers
         self.body = body
@@ -956,7 +1149,7 @@ public struct FfiConverterTypeVaneResponse: FfiConverterRustBuffer {
             try VaneResponse(
                 statusCode: FfiConverterUInt16.read(from: &buf), 
                 headers: FfiConverterDictionaryStringString.read(from: &buf), 
-                body: FfiConverterData.read(from: &buf), 
+                body: FfiConverterTypeVaneBytes.read(from: &buf), 
                 isSuccess: FfiConverterBool.read(from: &buf), 
                 url: FfiConverterString.read(from: &buf)
         )
@@ -965,7 +1158,7 @@ public struct FfiConverterTypeVaneResponse: FfiConverterRustBuffer {
     public static func write(_ value: VaneResponse, into buf: inout [UInt8]) {
         FfiConverterUInt16.write(value.statusCode, into: &buf)
         FfiConverterDictionaryStringString.write(value.headers, into: &buf)
-        FfiConverterData.write(value.body, into: &buf)
+        FfiConverterTypeVaneBytes.write(value.body, into: &buf)
         FfiConverterBool.write(value.isSuccess, into: &buf)
         FfiConverterString.write(value.url, into: &buf)
     }
@@ -1113,8 +1306,8 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
-    typealias SwiftType = Data?
+fileprivate struct FfiConverterOptionTypeVaneBytes: FfiConverterRustBuffer {
+    typealias SwiftType = VaneBytes?
 
     public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
         guard let value = value else {
@@ -1122,13 +1315,13 @@ fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
             return
         }
         writeInt(&buf, Int8(1))
-        FfiConverterData.write(value, into: &buf)
+        FfiConverterTypeVaneBytes.write(value, into: &buf)
     }
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
-        case 1: return try FfiConverterData.read(from: &buf)
+        case 1: return try FfiConverterTypeVaneBytes.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -1157,6 +1350,96 @@ fileprivate struct FfiConverterDictionaryStringString: FfiConverterRustBuffer {
             dict[key] = value
         }
         return dict
+    }
+}
+
+
+/**
+ * Typealias from the type name used in the UDL file to the builtin type.  This
+ * is needed because the UDL type name is used in function/method signatures.
+ */
+public typealias VaneBytes = Data
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVaneBytes: FfiConverter {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VaneBytes {
+        return try FfiConverterData.read(from: &buf)
+    }
+
+    public static func write(_ value: VaneBytes, into buf: inout [UInt8]) {
+        return FfiConverterData.write(value, into: &buf)
+    }
+
+    public static func lift(_ value: RustBuffer) throws -> VaneBytes {
+        return try FfiConverterData.lift(value)
+    }
+
+    public static func lower(_ value: VaneBytes) -> RustBuffer {
+        return FfiConverterData.lower(value)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVaneBytes_lift(_ value: RustBuffer) throws -> VaneBytes {
+    return try FfiConverterTypeVaneBytes.lift(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVaneBytes_lower(_ value: VaneBytes) -> RustBuffer {
+    return FfiConverterTypeVaneBytes.lower(value)
+}
+
+private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
+private let UNIFFI_RUST_FUTURE_POLL_MAYBE_READY: Int8 = 1
+
+fileprivate let uniffiContinuationHandleMap = UniffiHandleMap<UnsafeContinuation<Int8, Never>>()
+
+fileprivate func uniffiRustCallAsync<F, T>(
+    rustFutureFunc: () -> UInt64,
+    pollFunc: (UInt64, @escaping UniffiRustFutureContinuationCallback, UInt64) -> (),
+    completeFunc: (UInt64, UnsafeMutablePointer<RustCallStatus>) -> F,
+    freeFunc: (UInt64) -> (),
+    liftFunc: (F) throws -> T,
+    errorHandler: ((RustBuffer) throws -> Swift.Error)?
+) async throws -> T {
+    // Make sure to call the ensure init function since future creation doesn't have a
+    // RustCallStatus param, so doesn't use makeRustCall()
+    uniffiEnsureVaneInitialized()
+    let rustFuture = rustFutureFunc()
+    defer {
+        freeFunc(rustFuture)
+    }
+    var pollResult: Int8;
+    repeat {
+        pollResult = await withUnsafeContinuation {
+            pollFunc(
+                rustFuture,
+                uniffiFutureContinuationCallback,
+                uniffiContinuationHandleMap.insert(obj: $0)
+            )
+        }
+    } while pollResult != UNIFFI_RUST_FUTURE_POLL_READY
+
+    return try liftFunc(makeRustCall(
+        { completeFunc(rustFuture, $0) },
+        errorHandler: errorHandler
+    ))
+}
+
+// Callback handlers for an async calls.  These are invoked by Rust when the future is ready.  They
+// lift the return value or error and resume the suspended function.
+fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: Int8) {
+    if let continuation = try? uniffiContinuationHandleMap.remove(handle: handle) {
+        continuation.resume(returning: pollResult)
+    } else {
+        print("uniffiFutureContinuationCallback invalid handle")
     }
 }
 public func createDefaultConfig() -> VaneClientConfig  {
@@ -1214,22 +1497,28 @@ private let initializationResult: InitializationResult = {
     if (uniffi_vane_checksum_func_response_body_utf8() != 21709) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_vane_checksum_method_vaneclient_delete_request() != 44430) {
+    if (uniffi_vane_checksum_method_vaneclient_delete_request() != 41122) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_vane_checksum_method_vaneclient_execute_request() != 51840) {
+    if (uniffi_vane_checksum_method_vaneclient_execute_prepared() != 23108) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_vane_checksum_method_vaneclient_get_request() != 12326) {
+    if (uniffi_vane_checksum_method_vaneclient_execute_request() != 13269) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_vane_checksum_method_vaneclient_patch_request() != 29709) {
+    if (uniffi_vane_checksum_method_vaneclient_get_request() != 21644) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_vane_checksum_method_vaneclient_post_request() != 19674) {
+    if (uniffi_vane_checksum_method_vaneclient_patch_request() != 64341) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_vane_checksum_method_vaneclient_put_request() != 13810) {
+    if (uniffi_vane_checksum_method_vaneclient_post_request() != 41140) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vane_checksum_method_vaneclient_prepare_request() != 37620) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_vane_checksum_method_vaneclient_put_request() != 3220) {
         return InitializationResult.apiChecksumMismatch
     }
 
