@@ -150,6 +150,14 @@ pub enum VaneError {
 
 impl From<reqwest::Error> for VaneError {
     fn from(err: reqwest::Error) -> Self {
+        let msg = err.to_string().to_lowercase();
+        if msg.contains("tls")
+            || msg.contains("ssl")
+            || msg.contains("handshake")
+            || msg.contains("certificate")
+        {
+            return VaneError::Tls(err.to_string());
+        }
         if err.is_timeout() {
             return VaneError::Timeout(err.to_string());
         }
@@ -167,7 +175,11 @@ impl From<reqwest::Error> for VaneError {
         }
         if let Some(source) = err.source() {
             let msg = source.to_string().to_lowercase();
-            if msg.contains("tls") || msg.contains("ssl") || msg.contains("certificate") {
+            if msg.contains("tls")
+                || msg.contains("ssl")
+                || msg.contains("handshake")
+                || msg.contains("certificate")
+            {
                 return VaneError::Tls(err.to_string());
             }
         }

@@ -49,6 +49,9 @@ dependency_analysis:
 test:
 	cargo test -p vane
 
+test_integration:
+	cargo test -p vane load_soak_smoke -- --ignored
+
 build_android:
 	cargo ndk -t armeabi-v7a -t arm64-v8a -t x86 -t x86_64 \
 	  -o ./output/android \
