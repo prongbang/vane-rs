@@ -17,7 +17,7 @@ new_project:
 
 build_swift:
 	cargo swift package --release
-	find VaneSwift -name "libvane.a" -exec strip -x {} \;
+	find VaneSwift -name "libvane.a" -exec strip -S -x {} \;
 
 build_kotlin:
 	cargo build --release
