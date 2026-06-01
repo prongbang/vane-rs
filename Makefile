@@ -16,8 +16,11 @@ new_project:
 	cargo swift init
 
 build_swift:
-	cargo swift package --release
-	find VaneSwift -name "libvane.a" -exec strip -S -x {} \;
+	IPHONEOS_DEPLOYMENT_TARGET=13.0 cargo swift package --release --accept-all --name VaneSwift
+	rm -rf ../VaneSwift/RustFramework.xcframework
+	cp -R VaneSwift/RustFramework.xcframework ../VaneSwift/RustFramework.xcframework
+	find ../VaneSwift -name "libvane.a" -exec strip -S -x {} \;
+	rm -rf VaneSwift
 
 build_kotlin:
 	cargo build --release
@@ -30,4 +33,4 @@ build_so:
         --target armv7-linux-androideabi \
         --target i686-linux-android \
         --target x86_64-linux-android \
-        -o VaneKotlin/library/src/main/jniLibs
+        -o ../VaneKotlin/library/src/main/jniLibs
