@@ -20,6 +20,7 @@ build_swift:
 	rm -rf ../VaneSwift/RustFramework.xcframework
 	cp -R VaneSwift/RustFramework.xcframework ../VaneSwift/RustFramework.xcframework
 	find ../VaneSwift/RustFramework.xcframework -name "libvane.a" -exec xcrun strip -S -x {} \; 2>/dev/null
+	$(MAKE) strip_swift_archives XCFRAMEWORK=../VaneSwift/RustFramework.xcframework
 	rm -rf VaneSwift
 
 build_swift_small:
@@ -27,7 +28,11 @@ build_swift_small:
 	rm -rf ../VaneSwift/RustFramework.small.xcframework
 	cp -R VaneSwift/RustFramework.xcframework ../VaneSwift/RustFramework.small.xcframework
 	find ../VaneSwift/RustFramework.small.xcframework -name "libvane.a" -exec xcrun strip -S -x {} \; 2>/dev/null
+	$(MAKE) strip_swift_archives XCFRAMEWORK=../VaneSwift/RustFramework.small.xcframework
 	rm -rf VaneSwift
+
+strip_swift_archives:
+	bash scripts/strip-swift-archives.sh "$(XCFRAMEWORK)"
 
 build_kotlin:
 	cargo build --release
