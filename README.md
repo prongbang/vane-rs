@@ -7,29 +7,23 @@ iOS (Alamofire-style) and Android (Retrofit2-style).
 
 ## Protocol Strategy
 
-The current Rust core supports HTTP/3 through Cloudflare `quiche`, plus
-HTTP/2 and HTTP/1.1 through a `hyper`/`hyper-util`/`hyper-rustls` TCP fallback backend. The default
-protocol mode is `HTTP/3 -> HTTP/2 -> HTTP/1.1`.
+The current Rust core supports HTTP/3 through Cloudflare `quiche` only. The
+HTTP/1.1 and HTTP/2 fallback backend was removed to keep the binary small, and
+the default protocol mode is `Http3Only`.
 
-A smaller Swift-only artifact can be built with `make build_swift_small`. That
-profile is intended for HTTP/3-only apps that need minimum static archive size:
-it disables the HTTP/1.1/HTTP/2 fallback backend and supports certificate DER
-pins (`sha256-cert/<base64>`) without SPKI pin parsing (`sha256/<base64>`).
+A smaller Swift-only artifact can still be built with `make build_swift_small`.
+That profile additionally disables SPKI pin parsing (`sha256/<base64>`) and
+keeps certificate DER pins (`sha256-cert/<base64>`).
 
 HTTP/1.0 and dynamic DNS callback resolvers are explicitly unsupported in the
 first production candidate. Static custom DNS overrides are available for
 routing a hostname to a specific IP while preserving the original hostname for
-SNI, authority, and certificate verification. HTTP, HTTPS endpoint, SOCKS5, and
-SOCKS5h proxy support is available for the HTTP/1.1 and HTTP/2 TCP fallback
-backend; HTTPS origins use CONNECT or SOCKS tunnels before origin TLS. HTTP/3
-over QUIC does not use the proxy path, so proxy-enabled default mode falls back
-to the TCP backend. HTTP/3 proxying is not supported yet because it requires a
-MASQUE/CONNECT-UDP transport path. Certificate pinning is available as opt-in
-host-scoped pins for the HTTP/3 backend. The TCP fallback refuses pinned hosts
-until TCP/TLS pin verification is implemented, so fallback cannot silently
-bypass pins. Optional retry policy, HTTP/3 connection pooling, and in-memory
-cookies are available behind explicit configuration. Remaining production work
-is tracked in the repository root `PLAN.md`.
+SNI, authority, and certificate verification. HTTP/3 proxying is not supported
+yet because it requires a MASQUE/CONNECT-UDP transport path. Certificate
+pinning is available as opt-in host-scoped pins for the HTTP/3 backend.
+Optional retry policy, HTTP/3 connection pooling, and in-memory cookies are
+available behind explicit configuration. Remaining production work is tracked
+in the repository root `PLAN.md`.
 
 ---
 
@@ -75,10 +69,12 @@ arguments:
   -Pandroid.testInstrumentationRunnerArguments.VANE_TEST_BASE_URL=https://<http3-enabled-host>
 ```
 
-`https://httpbin.org` is useful for validating the default fallback path in
-some environments, but in the current release verification environment it does
-not complete Vane's HTTP/3-only QUIC handshake. Use a confirmed HTTP/3 endpoint
-for HTTP/3-only validation.
+`https://httpbin.org` does not complete Vane's HTTP/3-only QUIC handshake in the
+current release verification environment. Use a confirmed HTTP/3 endpoint for
+live validation.
+
+The release profile is tuned for binary size (`opt-level = "z"`, LTO, one
+codegen unit, stripped symbols, panic abort).
 
 ---
 
@@ -87,11 +83,10 @@ for HTTP/3-only validation.
 | Rust Core |
 |-----------|
 | • [quiche](https://github.com/cloudflare/quiche) HTTP/3 backend
-| • [hyper](https://github.com/hyperium/hyper), hyper-util, and hyper-rustls HTTP/2 and HTTP/1.1 fallback backend
 | • [UniFFI](https://github.com/mozilla/uniffi-rs) bindings
 | • GET, POST, PUT, DELETE, PATCH
 | • Headers, query params, timeouts, static DNS overrides
-| • HTTP proxy support for HTTP/1.1 and HTTP/2 fallback
+| • Text, JSON, bytes, and URL-encoded form request helpers in Swift/Kotlin
 | • Optional host-scoped certificate pinning
 | • Optional retry policy and HTTP/3 connection pooling
 | • Optional in-memory cookie jar
@@ -119,7 +114,6 @@ let config = VaneConfigurationBuilder()
     .baseURL("https://api.example.com")
     .defaultHeaders(["Authorization": "Bearer token"])
     .dnsOverride(host: "api.example.com", ipAddress: "203.0.113.10")
-    .proxy("http://proxy.example.com:8080", authorization: "Basic <base64>")
     .certificatePin(host: "api.example.com", pins: [
         "sha256/<base64-spki-sha256>",
         "sha256/<backup-base64-spki-sha256>"
@@ -128,7 +122,7 @@ let config = VaneConfigurationBuilder()
     .connectionPooling(enabled: true, maxIdleConnections: 4, idleTimeoutSeconds: 30)
     .retry(maxAttempts: 3, initialDelayMillis: 100, maxDelayMillis: 1_000)
     .bodyLimits(maxRequestBodyBytes: 64 * 1024 * 1024, maxResponseBodyBytes: 64 * 1024 * 1024)
-    .http3ThenHttp2ThenHttp1()
+    .http3Only()
     .timeout(30)
     .build()
 
@@ -157,6 +151,14 @@ let list = try await session.request("/users")
     .header("Accept", "application/json")
     .queryParam("page", "1")
     .responseJSON([User].self)
+
+let created = try await session.request("/users", method: .post)
+    .textBody("name=Tom")
+    .validateStatus()
+
+let login = try await session.request("/login", method: .post)
+    .formBody(["email": "tom@example.com", "password": "secret"])
+    .responseString()
 ```
 
 ---
@@ -184,7 +186,6 @@ val config = VaneConfigurationBuilder()
     .baseUrl("https://api.example.com")
     .defaultHeaders(mapOf("Authorization" to "Bearer token"))
     .dnsOverride("api.example.com", "203.0.113.10")
-    .proxy("http://proxy.example.com:8080", authorization = "Basic <base64>")
     .certificatePin(
         "api.example.com",
         listOf(
@@ -196,7 +197,7 @@ val config = VaneConfigurationBuilder()
     .connectionPooling(enabled = true, maxIdleConnections = 4u, idleTimeoutSeconds = 30u)
     .retry(maxAttempts = 3u, initialDelayMillis = 100u, maxDelayMillis = 1_000u)
     .bodyLimits(maxRequestBodyBytes = 64u * 1024u * 1024u, maxResponseBodyBytes = 64u * 1024u * 1024u)
-    .http3ThenHttp2ThenHttp1()
+    .http3Only()
     .timeout(30u)
     .build()
 
@@ -221,6 +222,14 @@ class UserViewModel : ViewModel() {
                 .header("Accept", "application/json")
                 .queryParam("page", "1")
                 .responseJson<List<User>>()
+
+            val created = session.request("/users", HttpMethod.POST)
+                .textBody("name=Tom")
+                .validateStatus()
+
+            val login = session.request("/login", HttpMethod.POST)
+                .formBody(mapOf("email" to "tom@example.com", "password" to "secret"))
+                .responseString()
             // update UI
         } catch (e: VaneHttpException) {
             // handle error
@@ -244,31 +253,20 @@ Vane retries transient transport failures and HTTP status `408`, `425`, `429`,
 
 Connection pooling defaults to disabled. When enabled, Vane keeps idle HTTP/3
 connections by origin, DNS override, protocol mode, and certificate pin set.
-The HTTP/1.1 and HTTP/2 fallback backend uses hyper-util's internal pooling.
 
-Proxy support is explicit and opt-in. Configure `proxyUrl` with an
-`http://host:port`, `https://host:port`, `socks5://host:port`, or
-`socks5h://host:port` proxy URL. Plain HTTP requests are forwarded through HTTP
-or HTTPS proxy endpoints; HTTPS origins use CONNECT before TLS/ALPN negotiation
-with the origin. SOCKS5 proxies create a TCP tunnel to the origin, and
-`socks5h` asks the proxy to resolve the target hostname. `proxyAuthorization`
-accepts a full HTTP proxy header value such as `Basic <base64>`; SOCKS5
-username/password auth can be supplied as URL userinfo. Proxy support is limited
-to the HTTP/1.1/HTTP/2 TCP fallback backend. HTTP/3 proxying is not supported
-yet because QUIC proxying requires a MASQUE/CONNECT-UDP transport path. The
-Rust test suite includes local proxy coverage for HTTP forwarding, HTTPS
-CONNECT, and SOCKS5 tunnels. Real proxy smoke tests can be run by setting
-`VANE_TEST_PROXY_URL`, optional `VANE_TEST_PROXY_AUTHORIZATION`, and
-`VANE_TEST_BASE_URL`.
+Proxy configuration remains in the public config shape for source
+compatibility, but this build does not support proxies. Any request with
+`proxyUrl` set fails clearly because HTTP/3 proxying requires a future
+MASQUE/CONNECT-UDP transport path.
 
 Protocol modes:
 
-- `Http3ThenHttp2ThenHttp1`: default. Try HTTP/3 first, then fall back to
-  HTTP/2 or HTTP/1.1 over TCP/TLS.
-- `Http3Only`: force HTTP/3 over QUIC.
-- `Http2ThenHttp1`: use the TCP/TLS backend with ALPN for HTTP/2 or HTTP/1.1.
-- `Http2Only`: force HTTP/2 through the TCP/TLS backend.
-- `Http1Only`: force HTTP/1.1 through the TCP/TLS backend.
+- `Http3Only`: default. Use HTTP/3 over QUIC.
+- `Http3ThenHttp2ThenHttp1`: kept for source compatibility; this build still
+  uses HTTP/3 only.
+- `Http2ThenHttp1`, `Http2Only`, and `Http1Only`: kept for source
+  compatibility; requests fail because HTTP/1.1 and HTTP/2 fallback were
+  removed.
 
 Cookies default to disabled. When enabled, Vane keeps an in-memory cookie jar
 inside each `VaneClient`/`VaneSession`. The jar handles common `Set-Cookie`
