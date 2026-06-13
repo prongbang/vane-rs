@@ -976,8 +976,6 @@ dependencies = [
  "boring",
  "getrandom",
  "quiche",
- "serde",
- "serde_json",
  "sha2",
  "thiserror",
  "uniffi",

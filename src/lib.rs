@@ -14,7 +14,6 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 #[cfg(feature = "spki-pinning")]
 use boring::x509::X509;
 use quiche::h3::NameValue;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -264,8 +263,7 @@ fn percent_encode_query(value: &str) -> String {
 }
 
 // ---------- Models ----------
-#[derive(Debug, Clone, Deserialize, Serialize, uniffi::Record)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct VaneRequest {
     pub url: String,
     pub method: String,
@@ -276,8 +274,7 @@ pub struct VaneRequest {
     pub follow_redirects: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, uniffi::Record)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct VaneResponse {
     pub status_code: u16,
     pub headers: HashMap<String, String>,
@@ -286,24 +283,18 @@ pub struct VaneResponse {
     pub url: String,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize, uniffi::Enum)]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum VaneProtocolMode {
     /// Kept for source compatibility; this build uses HTTP/3 only.
-    #[serde(rename = "http3ThenHttp2ThenHttp1")]
     Http3ThenHttp2ThenHttp1,
-    #[serde(rename = "http3Only")]
     Http3Only,
     /// Kept for source compatibility; HTTP/2 and HTTP/1.1 are unsupported.
-    #[serde(rename = "http2ThenHttp1")]
     Http2ThenHttp1,
-    #[serde(rename = "http2Only")]
     Http2Only,
-    #[serde(rename = "http1Only")]
     Http1Only,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, uniffi::Record)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct VaneClientConfig {
     pub base_url: Option<String>,
     pub default_headers: HashMap<String, String>,
@@ -1502,8 +1493,88 @@ pub fn response_body_utf8(resp: &VaneResponse) -> Result<String, VaneError> {
 
 // ---------- Stable C ABI for Dart FFI ----------
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VaneFfiString {
+    pub data: *const u8,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VaneFfiStringPair {
+    pub key: VaneFfiString,
+    pub value: VaneFfiString,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VaneFfiStringList {
+    pub values: *const VaneFfiString,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VaneFfiStringListPair {
+    pub key: VaneFfiString,
+    pub values: VaneFfiStringList,
+}
+
+#[repr(C)]
+pub struct VaneFfiClientConfig {
+    pub base_url: VaneFfiString,
+    pub default_headers: *const VaneFfiStringPair,
+    pub default_headers_len: usize,
+    pub dns_overrides: *const VaneFfiStringPair,
+    pub dns_overrides_len: usize,
+    pub certificate_pins: *const VaneFfiStringListPair,
+    pub certificate_pins_len: usize,
+    pub cookies_enabled: bool,
+    pub connection_pool_enabled: bool,
+    pub max_idle_connections: u64,
+    pub connection_idle_timeout_seconds: u64,
+    pub retry_max_attempts: u64,
+    pub retry_initial_delay_millis: u64,
+    pub retry_max_delay_millis: u64,
+    pub retry_unsafe_methods: bool,
+    pub max_request_body_bytes: u64,
+    pub max_response_body_bytes: u64,
+    pub timeout_seconds: i64,
+    pub follow_redirects: bool,
+    pub user_agent: VaneFfiString,
+    pub protocol_mode: u8,
+    pub proxy_url: VaneFfiString,
+    pub proxy_authorization: VaneFfiString,
+}
+
+#[repr(C)]
+pub struct VaneFfiRequest {
+    pub url: VaneFfiString,
+    pub method: VaneFfiString,
+    pub headers: *const VaneFfiStringPair,
+    pub headers_len: usize,
+    pub query_params: *const VaneFfiStringPair,
+    pub query_params_len: usize,
+    pub timeout_seconds: i64,
+    pub follow_redirects: bool,
+}
+
+#[repr(C)]
 pub struct VaneFfiBuffer {
     pub data: *mut u8,
+    pub len: usize,
+    pub cap: usize,
+}
+
+#[repr(C)]
+pub struct VaneFfiHeader {
+    pub key: VaneFfiBuffer,
+    pub value: VaneFfiBuffer,
+}
+
+#[repr(C)]
+pub struct VaneFfiHeaderArray {
+    pub data: *mut VaneFfiHeader,
     pub len: usize,
     pub cap: usize,
 }
@@ -1512,7 +1583,7 @@ pub struct VaneFfiBuffer {
 pub struct VaneFfiResponse {
     pub status_code: u16,
     pub is_success: bool,
-    pub headers_json: VaneFfiBuffer,
+    pub headers: VaneFfiHeaderArray,
     pub body: VaneFfiBuffer,
     pub url: VaneFfiBuffer,
     pub error: VaneFfiBuffer,
@@ -1524,12 +1595,11 @@ static FFI_NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vane_ffi_client_create(
-    config_json_data: *const u8,
-    config_json_len: usize,
+    config: *const VaneFfiClientConfig,
     out_error: *mut VaneFfiBuffer,
 ) -> u64 {
     ffi_clear_error(out_error);
-    match std::panic::catch_unwind(|| ffi_create_client(config_json_data, config_json_len)) {
+    match std::panic::catch_unwind(|| ffi_create_client(config)) {
         Ok(Ok(handle)) => handle,
         Ok(Err(error)) => {
             ffi_set_error(out_error, error);
@@ -1558,20 +1628,11 @@ pub extern "C" fn vane_ffi_client_close(handle: u64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn vane_ffi_execute(
     handle: u64,
-    request_json_data: *const u8,
-    request_json_len: usize,
+    request: *const VaneFfiRequest,
     body_data: *const u8,
     body_len: usize,
 ) -> *mut VaneFfiResponse {
-    let result = std::panic::catch_unwind(|| {
-        ffi_execute(
-            handle,
-            request_json_data,
-            request_json_len,
-            body_data,
-            body_len,
-        )
-    });
+    let result = std::panic::catch_unwind(|| ffi_execute(handle, request, body_data, body_len));
     let response = match result {
         Ok(Ok(response)) => ffi_response_from_vane(response),
         Ok(Err(error)) => ffi_error_response(error),
@@ -1591,7 +1652,7 @@ pub unsafe extern "C" fn vane_ffi_response_free(response: *mut VaneFfiResponse) 
     }
     unsafe {
         let response = Box::from_raw(response);
-        ffi_buffer_free(response.headers_json);
+        ffi_header_array_free(response.headers);
         ffi_buffer_free(response.body);
         ffi_buffer_free(response.url);
         ffi_buffer_free(response.error);
@@ -1603,14 +1664,8 @@ pub extern "C" fn vane_ffi_buffer_free(buffer: VaneFfiBuffer) {
     ffi_buffer_free(buffer);
 }
 
-fn ffi_create_client(config_json_data: *const u8, config_json_len: usize) -> Result<u64, String> {
-    let config_json = ffi_str(config_json_data, config_json_len)?;
-    let config = if config_json.is_empty() {
-        VaneClientConfig::default()
-    } else {
-        serde_json::from_str::<VaneClientConfig>(config_json)
-            .map_err(|error| format!("Invalid Vane config JSON: {error}"))?
-    };
+fn ffi_create_client(config: *const VaneFfiClientConfig) -> Result<u64, String> {
+    let config = ffi_config(config)?;
     let client = Arc::new(VaneClient::new(config).map_err(|error| error.to_string())?);
     let handle = FFI_NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     FFI_CLIENTS
@@ -1622,8 +1677,7 @@ fn ffi_create_client(config_json_data: *const u8, config_json_len: usize) -> Res
 
 fn ffi_execute(
     handle: u64,
-    request_json_data: *const u8,
-    request_json_len: usize,
+    request: *const VaneFfiRequest,
     body_data: *const u8,
     body_len: usize,
 ) -> Result<VaneResponse, String> {
@@ -1636,9 +1690,7 @@ fn ffi_execute(
             .cloned()
             .ok_or_else(|| format!("No Vane client exists for handle {handle}"))?
     };
-    let request_json = ffi_str(request_json_data, request_json_len)?;
-    let mut request = serde_json::from_str::<VaneRequest>(request_json)
-        .map_err(|error| format!("Invalid Vane request JSON: {error}"))?;
+    let mut request = ffi_request(request)?;
     if body_len > 0 {
         request.body = Some(ffi_bytes(body_data, body_len)?.to_vec());
     } else {
@@ -1648,11 +1700,10 @@ fn ffi_execute(
 }
 
 fn ffi_response_from_vane(response: VaneResponse) -> VaneFfiResponse {
-    let headers_json = serde_json::to_vec(&response.headers).unwrap_or_else(|_| b"{}".to_vec());
     VaneFfiResponse {
         status_code: response.status_code,
         is_success: response.is_success,
-        headers_json: ffi_buffer_from_vec(headers_json),
+        headers: ffi_header_array_from_map(response.headers),
         body: ffi_buffer_from_vec(response.body),
         url: ffi_buffer_from_vec(response.url.into_bytes()),
         error: ffi_buffer_from_vec(Vec::new()),
@@ -1663,10 +1714,215 @@ fn ffi_error_response(error: String) -> VaneFfiResponse {
     VaneFfiResponse {
         status_code: 0,
         is_success: false,
-        headers_json: ffi_buffer_from_vec(b"{}".to_vec()),
+        headers: ffi_header_array_empty(),
         body: ffi_buffer_from_vec(Vec::new()),
         url: ffi_buffer_from_vec(Vec::new()),
         error: ffi_buffer_from_vec(error.into_bytes()),
+    }
+}
+
+fn ffi_config(config: *const VaneFfiClientConfig) -> Result<VaneClientConfig, String> {
+    if config.is_null() {
+        return Ok(VaneClientConfig::default());
+    }
+    let config = unsafe { &*config };
+    Ok(VaneClientConfig {
+        base_url: ffi_optional_string(config.base_url, "base_url")?,
+        default_headers: ffi_string_pair_map(
+            config.default_headers,
+            config.default_headers_len,
+            "default_headers",
+        )?,
+        dns_overrides: ffi_string_pair_map(
+            config.dns_overrides,
+            config.dns_overrides_len,
+            "dns_overrides",
+        )?,
+        certificate_pins: ffi_string_list_pair_map(
+            config.certificate_pins,
+            config.certificate_pins_len,
+            "certificate_pins",
+        )?,
+        cookies_enabled: config.cookies_enabled,
+        connection_pool_enabled: config.connection_pool_enabled,
+        max_idle_connections: config.max_idle_connections,
+        connection_idle_timeout_seconds: config.connection_idle_timeout_seconds,
+        retry_max_attempts: config.retry_max_attempts,
+        retry_initial_delay_millis: config.retry_initial_delay_millis,
+        retry_max_delay_millis: config.retry_max_delay_millis,
+        retry_unsafe_methods: config.retry_unsafe_methods,
+        max_request_body_bytes: config.max_request_body_bytes,
+        max_response_body_bytes: config.max_response_body_bytes,
+        timeout_seconds: ffi_optional_u64(config.timeout_seconds, "timeout_seconds")?,
+        follow_redirects: config.follow_redirects,
+        user_agent: ffi_optional_string(config.user_agent, "user_agent")?,
+        protocol_mode: ffi_protocol_mode(config.protocol_mode)?,
+        proxy_url: ffi_optional_string(config.proxy_url, "proxy_url")?,
+        proxy_authorization: ffi_optional_string(
+            config.proxy_authorization,
+            "proxy_authorization",
+        )?,
+    })
+}
+
+fn ffi_request(request: *const VaneFfiRequest) -> Result<VaneRequest, String> {
+    if request.is_null() {
+        return Err("Vane FFI request pointer is null".to_string());
+    }
+    let request = unsafe { &*request };
+    Ok(VaneRequest {
+        url: ffi_required_string(request.url, "url")?,
+        method: ffi_required_string(request.method, "method")?,
+        headers: ffi_string_pair_map(request.headers, request.headers_len, "headers")?,
+        query_params: ffi_string_pair_map(
+            request.query_params,
+            request.query_params_len,
+            "query_params",
+        )?,
+        body: None,
+        timeout_seconds: ffi_optional_u64(request.timeout_seconds, "timeout_seconds")?,
+        follow_redirects: request.follow_redirects,
+    })
+}
+
+fn ffi_protocol_mode(value: u8) -> Result<VaneProtocolMode, String> {
+    match value {
+        0 => Ok(VaneProtocolMode::Http3ThenHttp2ThenHttp1),
+        1 => Ok(VaneProtocolMode::Http3Only),
+        2 => Ok(VaneProtocolMode::Http2ThenHttp1),
+        3 => Ok(VaneProtocolMode::Http2Only),
+        4 => Ok(VaneProtocolMode::Http1Only),
+        _ => Err(format!("Invalid Vane protocol mode: {value}")),
+    }
+}
+
+fn ffi_optional_u64(value: i64, field: &str) -> Result<Option<u64>, String> {
+    if value < 0 {
+        return Ok(None);
+    }
+    u64::try_from(value)
+        .map(Some)
+        .map_err(|_| format!("{field} is too large"))
+}
+
+fn ffi_required_string(input: VaneFfiString, field: &str) -> Result<String, String> {
+    let value = ffi_string(input, field)?;
+    if value.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    Ok(value.to_string())
+}
+
+fn ffi_optional_string(input: VaneFfiString, field: &str) -> Result<Option<String>, String> {
+    let value = ffi_string(input, field)?;
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value.to_string()))
+    }
+}
+
+fn ffi_string(input: VaneFfiString, field: &str) -> Result<&str, String> {
+    let bytes = ffi_bytes(input.data, input.len)?;
+    std::str::from_utf8(bytes).map_err(|error| format!("Invalid UTF-8 in {field}: {error}"))
+}
+
+fn ffi_string_pair_map(
+    pairs: *const VaneFfiStringPair,
+    len: usize,
+    field: &str,
+) -> Result<HashMap<String, String>, String> {
+    if len == 0 {
+        return Ok(HashMap::new());
+    }
+    if pairs.is_null() {
+        return Err(format!("{field} pointer is null"));
+    }
+    let pairs = unsafe { std::slice::from_raw_parts(pairs, len) };
+    let mut map = HashMap::with_capacity(len);
+    for pair in pairs {
+        map.insert(
+            ffi_string(pair.key, field)?.to_string(),
+            ffi_string(pair.value, field)?.to_string(),
+        );
+    }
+    Ok(map)
+}
+
+fn ffi_string_list_pair_map(
+    pairs: *const VaneFfiStringListPair,
+    len: usize,
+    field: &str,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    if len == 0 {
+        return Ok(HashMap::new());
+    }
+    if pairs.is_null() {
+        return Err(format!("{field} pointer is null"));
+    }
+    let pairs = unsafe { std::slice::from_raw_parts(pairs, len) };
+    let mut map = HashMap::with_capacity(len);
+    for pair in pairs {
+        map.insert(
+            ffi_string(pair.key, field)?.to_string(),
+            ffi_string_list(pair.values, field)?,
+        );
+    }
+    Ok(map)
+}
+
+fn ffi_string_list(list: VaneFfiStringList, field: &str) -> Result<Vec<String>, String> {
+    if list.len == 0 {
+        return Ok(Vec::new());
+    }
+    if list.values.is_null() {
+        return Err(format!("{field} list pointer is null"));
+    }
+    let values = unsafe { std::slice::from_raw_parts(list.values, list.len) };
+    values
+        .iter()
+        .map(|value| ffi_string(*value, field).map(ToString::to_string))
+        .collect()
+}
+
+fn ffi_header_array_empty() -> VaneFfiHeaderArray {
+    VaneFfiHeaderArray {
+        data: ptr::null_mut(),
+        len: 0,
+        cap: 0,
+    }
+}
+
+fn ffi_header_array_from_map(headers: HashMap<String, String>) -> VaneFfiHeaderArray {
+    let mut headers: Vec<VaneFfiHeader> = headers
+        .into_iter()
+        .map(|(key, value)| VaneFfiHeader {
+            key: ffi_buffer_from_vec(key.into_bytes()),
+            value: ffi_buffer_from_vec(value.into_bytes()),
+        })
+        .collect();
+    if headers.is_empty() {
+        return ffi_header_array_empty();
+    }
+    let array = VaneFfiHeaderArray {
+        data: headers.as_mut_ptr(),
+        len: headers.len(),
+        cap: headers.capacity(),
+    };
+    std::mem::forget(headers);
+    array
+}
+
+fn ffi_header_array_free(headers: VaneFfiHeaderArray) {
+    if headers.data.is_null() || headers.cap == 0 {
+        return;
+    }
+    unsafe {
+        let headers = Vec::from_raw_parts(headers.data, headers.len, headers.cap);
+        for header in headers {
+            ffi_buffer_free(header.key);
+            ffi_buffer_free(header.value);
+        }
     }
 }
 
@@ -1714,14 +1970,6 @@ fn ffi_set_error(out_error: *mut VaneFfiBuffer, error: String) {
             *out_error = ffi_buffer_from_vec(error.into_bytes());
         }
     }
-}
-
-fn ffi_str<'a>(data: *const u8, len: usize) -> Result<&'a str, String> {
-    if len == 0 {
-        return Ok("");
-    }
-    let bytes = ffi_bytes(data, len)?;
-    std::str::from_utf8(bytes).map_err(|error| format!("Invalid UTF-8: {error}"))
 }
 
 fn ffi_bytes<'a>(data: *const u8, len: usize) -> Result<&'a [u8], String> {
