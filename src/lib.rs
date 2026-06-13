@@ -1,13 +1,15 @@
 uniffi::setup_scaffolding!();
 
 use std::collections::HashMap;
+use std::fs::{self, File};
 use std::io;
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -20,6 +22,22 @@ use thiserror::Error;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const DEFAULT_MAX_REQUEST_BODY_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_MAX_RESPONSE_BODY_BYTES: u64 = 64 * 1024 * 1024;
+
+static CANCEL_TOKENS: LazyLock<Mutex<HashMap<u64, Arc<AtomicBool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_CANCEL_TOKEN_ID: AtomicU64 = AtomicU64::new(1);
+static PROGRESS_STATES: LazyLock<Mutex<HashMap<u64, VaneProgressState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_PROGRESS_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Default)]
+struct VaneProgressState {
+    upload_sent: u64,
+    upload_total: u64,
+    download_received: u64,
+    download_total: u64,
+    done: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Url {
@@ -270,6 +288,10 @@ pub struct VaneRequest {
     pub headers: HashMap<String, String>,
     pub query_params: HashMap<String, String>,
     pub body: Option<Vec<u8>>,
+    pub body_file_path: Option<String>,
+    pub response_body_path: Option<String>,
+    pub cancel_token_id: Option<u64>,
+    pub progress_id: Option<u64>,
     pub timeout_seconds: Option<u64>,
     pub follow_redirects: bool,
 }
@@ -279,8 +301,18 @@ pub struct VaneResponse {
     pub status_code: u16,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
+    pub body_file_path: Option<String>,
     pub is_success: bool,
     pub url: String,
+}
+
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct VaneProgressSnapshot {
+    pub upload_sent: u64,
+    pub upload_total: u64,
+    pub download_received: u64,
+    pub download_total: u64,
+    pub done: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
@@ -301,6 +333,7 @@ pub struct VaneClientConfig {
     pub dns_overrides: HashMap<String, String>,
     pub certificate_pins: HashMap<String, Vec<String>>,
     pub cookies_enabled: bool,
+    pub cookie_persistence_path: Option<String>,
     pub connection_pool_enabled: bool,
     pub max_idle_connections: u64,
     pub connection_idle_timeout_seconds: u64,
@@ -326,6 +359,7 @@ impl Default for VaneClientConfig {
             dns_overrides: HashMap::new(),
             certificate_pins: HashMap::new(),
             cookies_enabled: false,
+            cookie_persistence_path: None,
             connection_pool_enabled: false,
             max_idle_connections: 4,
             connection_idle_timeout_seconds: 30,
@@ -383,14 +417,22 @@ pub struct VaneClient {
     config: VaneClientConfig,
     pool: Mutex<Vec<PooledHttp3Connection>>,
     cookie_jar: Mutex<Vec<StoredCookie>>,
+    certificate_pins: Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl VaneClient {
     pub fn new(config: VaneClientConfig) -> Result<Self, VaneError> {
+        let cookie_jar = if config.cookies_enabled {
+            load_cookie_jar(config.cookie_persistence_path.as_deref())?
+        } else {
+            Vec::new()
+        };
+        let certificate_pins = config.certificate_pins.clone();
         Ok(Self {
             config,
             pool: Mutex::new(Vec::new()),
-            cookie_jar: Mutex::new(Vec::new()),
+            cookie_jar: Mutex::new(cookie_jar),
+            certificate_pins: Mutex::new(certificate_pins),
         })
     }
 
@@ -503,9 +545,11 @@ impl VaneClient {
             None
         };
         let headers = build_h3_headers(url, request, &self.config, cookie_header.as_deref())?;
-        let request_body = request.body.clone().unwrap_or_default();
+        let request_body = load_request_body(request)?;
         validate_request_body_limit(&request_body, self.config.max_request_body_bytes)?;
-        let pool_key = PoolKey::new(url, &self.config);
+        progress_init(request.progress_id, request_body.len() as u64);
+        let certificate_pins = self.certificate_pins_snapshot()?;
+        let pool_key = PoolKey::new(url, &self.config, &certificate_pins);
         let mut transport = match if self.config.connection_pool_enabled {
             self.take_pooled_connection(&pool_key, timeout)?
         } else {
@@ -513,7 +557,13 @@ impl VaneClient {
         } {
             Some(connection) => connection,
             None => self
-                .connect_http3(host, peer_addr, timeout, pool_key.clone())
+                .connect_http3(
+                    host,
+                    peer_addr,
+                    timeout,
+                    pool_key.clone(),
+                    &certificate_pins,
+                )
                 .inspect_err(|_| {
                     self.drop_closed_connections();
                 })?,
@@ -521,17 +571,23 @@ impl VaneClient {
 
         let result = perform_http3_request(
             &mut transport,
-            &headers,
-            &request_body,
-            timeout,
-            url,
-            self.config.max_response_body_bytes,
+            H3RequestOptions {
+                headers: &headers,
+                request_body: &request_body,
+                timeout,
+                url,
+                max_response_body_bytes: self.config.max_response_body_bytes,
+                response_body_path: request.response_body_path.as_deref(),
+                cancel_token_id: request.cancel_token_id,
+                progress_id: request.progress_id,
+            },
         );
         match result {
             Ok(response) => {
                 if self.config.cookies_enabled {
                     self.store_response_cookies(url, &response.set_cookie_headers)?;
                 }
+                progress_done(request.progress_id);
 
                 let public_response = response.into_public_response();
                 if self.config.connection_pool_enabled && !transport.conn.is_closed() {
@@ -544,6 +600,7 @@ impl VaneClient {
                 Ok(public_response)
             }
             Err(err) => {
+                progress_done(request.progress_id);
                 transport.conn.close(true, 0x01, b"request failed").ok();
                 flush_quic_packets(&transport.socket, &mut transport.conn).ok();
                 Err(err)
@@ -557,6 +614,7 @@ impl VaneClient {
         peer_addr: SocketAddr,
         timeout: Duration,
         key: PoolKey,
+        certificate_pins: &HashMap<String, Vec<String>>,
     ) -> Result<PooledHttp3Connection, VaneError> {
         let bind_addr = match peer_addr {
             SocketAddr::V4(_) => "0.0.0.0:0",
@@ -596,7 +654,7 @@ impl VaneClient {
             read_quic_packets(&socket, &mut conn, local_addr, peer_addr)?;
 
             if conn.is_established() {
-                verify_certificate_pins(host, conn.peer_cert(), &self.config)?;
+                verify_certificate_pins(host, conn.peer_cert(), certificate_pins)?;
                 let http3 = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
                 return Ok(PooledHttp3Connection {
                     key,
@@ -682,12 +740,69 @@ impl VaneClient {
         }
     }
 
+    fn clear_connection_pool(&self) -> Result<(), VaneError> {
+        let mut pool = self
+            .pool
+            .lock()
+            .map_err(|_| VaneError::Generic("Connection pool lock was poisoned".to_string()))?;
+        for conn in pool.iter_mut() {
+            conn.conn
+                .close(true, 0x00, b"certificate pins changed")
+                .ok();
+            flush_quic_packets(&conn.socket, &mut conn.conn).ok();
+        }
+        pool.clear();
+        Ok(())
+    }
+
+    fn certificate_pins_snapshot(&self) -> Result<HashMap<String, Vec<String>>, VaneError> {
+        self.certificate_pins
+            .lock()
+            .map(|pins| pins.clone())
+            .map_err(|_| VaneError::Generic("Certificate pin lock was poisoned".to_string()))
+    }
+
+    fn set_certificate_pins_internal(
+        &self,
+        host: String,
+        pins: Vec<String>,
+    ) -> Result<(), VaneError> {
+        validate_certificate_pin_host(&host)?;
+        validate_certificate_pins(&pins)?;
+        {
+            let mut configured = self
+                .certificate_pins
+                .lock()
+                .map_err(|_| VaneError::Generic("Certificate pin lock was poisoned".to_string()))?;
+            if pins.is_empty() {
+                configured.remove(&host);
+            } else {
+                configured.insert(host, pins);
+            }
+        }
+        self.clear_connection_pool()
+    }
+
+    fn add_certificate_pin_internal(&self, host: String, pin: String) -> Result<(), VaneError> {
+        self.set_certificate_pins_internal(host.clone(), {
+            let mut pins = self
+                .certificate_pins
+                .lock()
+                .map_err(|_| VaneError::Generic("Certificate pin lock was poisoned".to_string()))?
+                .get(&host)
+                .cloned()
+                .unwrap_or_default();
+            pins.push(pin);
+            pins
+        })
+    }
+
     fn cookie_header(&self, url: &Url) -> Result<String, VaneError> {
         let mut jar = self
             .cookie_jar
             .lock()
             .map_err(|_| VaneError::Generic("Cookie jar lock was poisoned".to_string()))?;
-        let now = Instant::now();
+        let now = now_epoch_seconds();
         jar.retain(|cookie| !cookie.is_expired(now));
 
         Ok(jar
@@ -714,11 +829,12 @@ impl VaneClient {
         for header in set_cookie_headers {
             if let Some(cookie) = StoredCookie::parse(url, header) {
                 jar.retain(|existing| !existing.same_key(&cookie));
-                if !cookie.is_expired(Instant::now()) {
+                if !cookie.is_expired(now_epoch_seconds()) {
                     jar.push(cookie);
                 }
             }
         }
+        persist_cookie_jar(self.config.cookie_persistence_path.as_deref(), &jar)?;
 
         Ok(())
     }
@@ -735,6 +851,10 @@ impl VaneClient {
             headers: HashMap::new(),
             query_params: HashMap::new(),
             body,
+            body_file_path: None,
+            response_body_path: None,
+            cancel_token_id: None,
+            progress_id: None,
             timeout_seconds: None,
             follow_redirects: self.config.follow_redirects,
         })
@@ -752,13 +872,13 @@ struct PoolKey {
 }
 
 impl PoolKey {
-    fn new(url: &Url, config: &VaneClientConfig) -> Self {
+    fn new(
+        url: &Url,
+        config: &VaneClientConfig,
+        certificate_pin_map: &HashMap<String, Vec<String>>,
+    ) -> Self {
         let host = url.host_str().unwrap_or_default().to_string();
-        let mut certificate_pins = config
-            .certificate_pins
-            .get(&host)
-            .cloned()
-            .unwrap_or_default();
+        let mut certificate_pins = certificate_pin_map.get(&host).cloned().unwrap_or_default();
         certificate_pins.sort();
 
         Self {
@@ -787,6 +907,7 @@ struct Http3ResponseParts {
     headers: HashMap<String, String>,
     set_cookie_headers: Vec<String>,
     body: Vec<u8>,
+    body_file_path: Option<String>,
     url: String,
 }
 
@@ -796,6 +917,7 @@ impl Http3ResponseParts {
             status_code: self.status_code,
             headers: self.headers,
             body: self.body,
+            body_file_path: self.body_file_path,
             is_success: (200..=299).contains(&self.status_code),
             url: self.url,
         }
@@ -810,7 +932,7 @@ struct StoredCookie {
     host_only: bool,
     path: String,
     secure: bool,
-    expires_at: Option<Instant>,
+    expires_at_epoch_seconds: Option<u64>,
 }
 
 impl StoredCookie {
@@ -831,7 +953,7 @@ impl StoredCookie {
             host_only: true,
             path: default_cookie_path(url),
             secure: false,
-            expires_at: None,
+            expires_at_epoch_seconds: None,
         };
 
         for attr in parts {
@@ -854,10 +976,10 @@ impl StoredCookie {
                 "secure" => cookie.secure = true,
                 "max-age" => {
                     if let Ok(seconds) = value.trim().parse::<i64>() {
-                        cookie.expires_at = if seconds <= 0 {
-                            Some(Instant::now())
+                        cookie.expires_at_epoch_seconds = if seconds <= 0 {
+                            Some(now_epoch_seconds())
                         } else {
-                            Some(Instant::now() + Duration::from_secs(seconds as u64))
+                            Some(now_epoch_seconds().saturating_add(seconds as u64))
                         };
                     }
                 }
@@ -868,7 +990,7 @@ impl StoredCookie {
         Some(cookie)
     }
 
-    fn matches(&self, url: &Url, now: Instant) -> bool {
+    fn matches(&self, url: &Url, now: u64) -> bool {
         let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
             return false;
         };
@@ -893,25 +1015,118 @@ impl StoredCookie {
         self.name == other.name && self.domain == other.domain && self.path == other.path
     }
 
-    fn is_expired(&self, now: Instant) -> bool {
-        self.expires_at.is_some_and(|expires_at| now >= expires_at)
+    fn is_expired(&self, now: u64) -> bool {
+        self.expires_at_epoch_seconds
+            .is_some_and(|expires_at| now >= expires_at)
     }
+}
+
+fn now_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn load_cookie_jar(path: Option<&str>) -> Result<Vec<StoredCookie>, VaneError> {
+    let Some(path) = path.filter(|path| !path.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(VaneError::Generic(format!(
+                "Failed to read cookie persistence file {path}: {err}"
+            )));
+        }
+    };
+    let now = now_epoch_seconds();
+    Ok(content
+        .lines()
+        .filter_map(parse_persisted_cookie)
+        .filter(|cookie| !cookie.is_expired(now))
+        .collect())
+}
+
+fn persist_cookie_jar(path: Option<&str>, jar: &[StoredCookie]) -> Result<(), VaneError> {
+    let Some(path) = path.filter(|path| !path.is_empty()) else {
+        return Ok(());
+    };
+    let now = now_epoch_seconds();
+    let mut content = String::new();
+    for cookie in jar.iter().filter(|cookie| !cookie.is_expired(now)) {
+        content.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            BASE64.encode(cookie.name.as_bytes()),
+            BASE64.encode(cookie.value.as_bytes()),
+            BASE64.encode(cookie.domain.as_bytes()),
+            u8::from(cookie.host_only),
+            BASE64.encode(cookie.path.as_bytes()),
+            u8::from(cookie.secure),
+            cookie
+                .expires_at_epoch_seconds
+                .map(|value| value.to_string())
+                .unwrap_or_default()
+        ));
+    }
+    if let Some(parent) = std::path::Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            VaneError::Generic(format!("Failed to create cookie directory: {err}"))
+        })?;
+    }
+    fs::write(path, content).map_err(|err| {
+        VaneError::Generic(format!(
+            "Failed to write cookie persistence file {path}: {err}"
+        ))
+    })
+}
+
+fn parse_persisted_cookie(line: &str) -> Option<StoredCookie> {
+    let mut parts = line.split('\t');
+    Some(StoredCookie {
+        name: decode_cookie_field(parts.next()?)?,
+        value: decode_cookie_field(parts.next()?)?,
+        domain: decode_cookie_field(parts.next()?)?,
+        host_only: parts.next()? == "1",
+        path: decode_cookie_field(parts.next()?)?,
+        secure: parts.next()? == "1",
+        expires_at_epoch_seconds: match parts.next().unwrap_or_default() {
+            "" => None,
+            value => value.parse::<u64>().ok(),
+        },
+    })
+}
+
+fn decode_cookie_field(value: &str) -> Option<String> {
+    String::from_utf8(BASE64.decode(value).ok()?).ok()
+}
+
+struct H3RequestOptions<'a> {
+    headers: &'a [quiche::h3::Header],
+    request_body: &'a [u8],
+    timeout: Duration,
+    url: &'a Url,
+    max_response_body_bytes: u64,
+    response_body_path: Option<&'a str>,
+    cancel_token_id: Option<u64>,
+    progress_id: Option<u64>,
 }
 
 fn perform_http3_request(
     transport: &mut PooledHttp3Connection,
-    headers: &[quiche::h3::Header],
-    request_body: &[u8],
-    timeout: Duration,
-    url: &Url,
-    max_response_body_bytes: u64,
+    options: H3RequestOptions<'_>,
 ) -> Result<Http3ResponseParts, VaneError> {
     let mut request_stream_id = None;
     let mut body_offset = 0usize;
-    let deadline = Instant::now() + timeout;
-    let mut response = H3ResponseState::new(max_response_body_bytes);
+    let deadline = Instant::now() + options.timeout;
+    let mut response =
+        H3ResponseState::new(options.max_response_body_bytes, options.response_body_path)?;
 
     while Instant::now() < deadline {
+        check_cancelled(options.cancel_token_id)?;
         read_quic_packets(
             &transport.socket,
             &mut transport.conn,
@@ -920,30 +1135,43 @@ fn perform_http3_request(
         )?;
 
         if request_stream_id.is_none() {
-            let fin = request_body.is_empty();
+            let fin = options.request_body.is_empty();
             request_stream_id = Some(transport.http3.send_request(
                 &mut transport.conn,
-                headers,
+                options.headers,
                 fin,
             )?);
         }
 
         if let Some(stream_id) = request_stream_id {
-            while body_offset < request_body.len() {
+            while body_offset < options.request_body.len() {
                 match transport.http3.send_body(
                     &mut transport.conn,
                     stream_id,
-                    &request_body[body_offset..],
+                    &options.request_body[body_offset..],
                     true,
                 ) {
-                    Ok(written) => body_offset += written,
+                    Ok(written) => {
+                        body_offset += written;
+                        progress_upload(
+                            options.progress_id,
+                            body_offset as u64,
+                            options.request_body.len() as u64,
+                        );
+                    }
                     Err(quiche::h3::Error::Done) => break,
                     Err(e) => return Err(e.into()),
                 }
             }
         }
 
-        process_h3_events(&mut transport.http3, &mut transport.conn, &mut response)?;
+        process_h3_events(
+            &mut transport.http3,
+            &mut transport.conn,
+            &mut response,
+            options.cancel_token_id,
+            options.progress_id,
+        )?;
 
         if response.finished {
             flush_quic_packets(&transport.socket, &mut transport.conn)?;
@@ -968,7 +1196,8 @@ fn perform_http3_request(
         headers: response.headers,
         set_cookie_headers: response.set_cookie_headers,
         body: response.body,
-        url: url.to_string(),
+        body_file_path: response.body_file_path,
+        url: options.url.to_string(),
     })
 }
 
@@ -1059,9 +1288,9 @@ fn resolve_peer_addr(
 fn verify_certificate_pins(
     host: &str,
     peer_cert_der: Option<&[u8]>,
-    config: &VaneClientConfig,
+    certificate_pins: &HashMap<String, Vec<String>>,
 ) -> Result<(), VaneError> {
-    let Some(pins) = config.certificate_pins.get(host) else {
+    let Some(pins) = certificate_pins.get(host) else {
         return Ok(());
     };
 
@@ -1087,6 +1316,36 @@ fn verify_certificate_pins(
     Err(VaneError::Generic(format!(
         "Certificate pin mismatch for {host}"
     )))
+}
+
+fn validate_certificate_pin_host(host: &str) -> Result<(), VaneError> {
+    if host.is_empty() {
+        return Err(VaneError::Generic(
+            "Certificate pin host must not be empty".to_string(),
+        ));
+    }
+    if host.contains("://") || host.contains('/') {
+        return Err(VaneError::Generic(
+            "Certificate pin host must be a hostname without scheme or path".to_string(),
+        ));
+    }
+    if !host.is_ascii() {
+        return Err(VaneError::Generic(
+            "Certificate pin host must be ASCII; use punycode for IDN hosts".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_certificate_pins(pins: &[String]) -> Result<(), VaneError> {
+    for pin in pins {
+        if !(pin.starts_with("sha256/") || pin.starts_with("sha256-cert/")) {
+            return Err(VaneError::Generic(format!(
+                "Unsupported certificate pin format: {pin}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn certificate_pin_values(cert_der: &[u8]) -> Vec<String> {
@@ -1172,6 +1431,22 @@ fn validate_request_body_limit(body: &[u8], max_request_body_bytes: u64) -> Resu
     Ok(())
 }
 
+fn load_request_body(request: &VaneRequest) -> Result<Vec<u8>, VaneError> {
+    if let Some(path) = &request.body_file_path
+        && !path.is_empty()
+    {
+        let mut file = File::open(path).map_err(|e| {
+            VaneError::Generic(format!("Failed to open request body file {path}: {e}"))
+        })?;
+        let mut body = Vec::new();
+        file.read_to_end(&mut body).map_err(|e| {
+            VaneError::Generic(format!("Failed to read request body file {path}: {e}"))
+        })?;
+        return Ok(body);
+    }
+    Ok(request.body.clone().unwrap_or_default())
+}
+
 fn validate_response_body_limit(
     current_len: usize,
     read_len: usize,
@@ -1184,6 +1459,97 @@ fn validate_response_body_limit(
     }
 
     Ok(())
+}
+
+fn check_cancelled(cancel_token_id: Option<u64>) -> Result<(), VaneError> {
+    let Some(id) = cancel_token_id else {
+        return Ok(());
+    };
+    let cancelled = CANCEL_TOKENS
+        .lock()
+        .ok()
+        .and_then(|tokens| tokens.get(&id).cloned())
+        .is_some_and(|token| token.load(Ordering::Relaxed));
+    if cancelled {
+        Err(VaneError::Generic("Vane request was cancelled".to_string()))
+    } else {
+        Ok(())
+    }
+}
+
+fn progress_init(progress_id: Option<u64>, upload_total: u64) {
+    let Some(id) = progress_id else {
+        return;
+    };
+    if let Ok(mut states) = PROGRESS_STATES.lock() {
+        states.insert(
+            id,
+            VaneProgressState {
+                upload_total,
+                ..VaneProgressState::default()
+            },
+        );
+    }
+}
+
+fn progress_upload(progress_id: Option<u64>, sent: u64, total: u64) {
+    let Some(id) = progress_id else {
+        return;
+    };
+    if let Ok(mut states) = PROGRESS_STATES.lock() {
+        let state = states.entry(id).or_default();
+        state.upload_sent = sent;
+        state.upload_total = total;
+    }
+}
+
+fn progress_download(progress_id: Option<u64>, received: u64, total: u64) {
+    let Some(id) = progress_id else {
+        return;
+    };
+    if let Ok(mut states) = PROGRESS_STATES.lock() {
+        let state = states.entry(id).or_default();
+        state.download_received = received;
+        state.download_total = total;
+    }
+}
+
+fn progress_done(progress_id: Option<u64>) {
+    let Some(id) = progress_id else {
+        return;
+    };
+    if let Ok(mut states) = PROGRESS_STATES.lock() {
+        states.entry(id).or_default().done = true;
+    }
+}
+
+fn progress_create() -> u64 {
+    let id = NEXT_PROGRESS_ID.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut states) = PROGRESS_STATES.lock() {
+        states.insert(id, VaneProgressState::default());
+    }
+    id
+}
+
+fn progress_snapshot(id: u64) -> VaneProgressSnapshot {
+    let state = PROGRESS_STATES
+        .lock()
+        .ok()
+        .and_then(|states| states.get(&id).cloned())
+        .unwrap_or_default();
+    VaneProgressSnapshot {
+        upload_sent: state.upload_sent,
+        upload_total: state.upload_total,
+        download_received: state.download_received,
+        download_total: state.download_total,
+        done: state.done,
+    }
+}
+
+fn progress_free(id: u64) {
+    if let Ok(mut states) = PROGRESS_STATES.lock() {
+        states.remove(&id);
+    }
 }
 
 fn should_retry_response(
@@ -1361,20 +1727,46 @@ struct H3ResponseState {
     headers: HashMap<String, String>,
     set_cookie_headers: Vec<String>,
     body: Vec<u8>,
+    body_file_path: Option<String>,
+    body_file: Option<File>,
     finished: bool,
     max_body_bytes: u64,
+    body_len: usize,
 }
 
 impl H3ResponseState {
-    fn new(max_body_bytes: u64) -> Self {
-        Self {
+    fn new(max_body_bytes: u64, body_file_path: Option<&str>) -> Result<Self, VaneError> {
+        let body_file = match body_file_path {
+            Some(path) if !path.is_empty() => Some(File::create(path).map_err(|e| {
+                VaneError::Generic(format!("Failed to create response body file {path}: {e}"))
+            })?),
+            _ => None,
+        };
+        Ok(Self {
             status_code: 0,
             headers: HashMap::new(),
             set_cookie_headers: Vec::new(),
             body: Vec::new(),
+            body_file_path: body_file_path
+                .filter(|path| !path.is_empty())
+                .map(ToString::to_string),
+            body_file,
             finished: false,
             max_body_bytes,
+            body_len: 0,
+        })
+    }
+
+    fn push_body(&mut self, bytes: &[u8]) -> Result<(), VaneError> {
+        validate_response_body_limit(self.body_len, bytes.len(), self.max_body_bytes)?;
+        self.body_len += bytes.len();
+        if let Some(file) = &mut self.body_file {
+            file.write_all(bytes)
+                .map_err(|e| VaneError::Generic(format!("Failed to write response body: {e}")))?;
+        } else {
+            self.body.extend_from_slice(bytes);
         }
+        Ok(())
     }
 }
 
@@ -1382,6 +1774,8 @@ fn process_h3_events(
     http3: &mut quiche::h3::Connection,
     conn: &mut quiche::Connection,
     response: &mut H3ResponseState,
+    cancel_token_id: Option<u64>,
+    progress_id: Option<u64>,
 ) -> Result<(), VaneError> {
     let mut buf = [0; 16 * 1024];
 
@@ -1402,14 +1796,11 @@ fn process_h3_events(
                 let _ = stream_id;
             }
             Ok((stream_id, quiche::h3::Event::Data)) => loop {
+                check_cancelled(cancel_token_id)?;
                 match http3.recv_body(conn, stream_id, &mut buf) {
                     Ok(read) => {
-                        validate_response_body_limit(
-                            response.body.len(),
-                            read,
-                            response.max_body_bytes,
-                        )?;
-                        response.body.extend_from_slice(&buf[..read]);
+                        response.push_body(&buf[..read])?;
+                        progress_download(progress_id, response.body_len as u64, 0);
                     }
                     Err(quiche::h3::Error::Done) => break,
                     Err(e) => return Err(e.into()),
@@ -1443,6 +1834,21 @@ pub fn create_default_config() -> VaneClientConfig {
 #[uniffi::export]
 pub fn create_vane_client(config: VaneClientConfig) -> Result<Arc<VaneClient>, VaneError> {
     Ok(Arc::new(VaneClient::new(config)?))
+}
+
+#[uniffi::export]
+pub fn create_progress() -> u64 {
+    progress_create()
+}
+
+#[uniffi::export]
+pub fn progress_snapshot_by_id(id: u64) -> VaneProgressSnapshot {
+    progress_snapshot(id)
+}
+
+#[uniffi::export]
+pub fn free_progress(id: u64) {
+    progress_free(id);
 }
 
 #[uniffi::export]
@@ -1481,6 +1887,18 @@ impl VaneClient {
         body: Option<Vec<u8>>,
     ) -> Result<VaneResponse, VaneError> {
         self.make_request("PATCH", &url, body)
+    }
+
+    pub fn set_certificate_pins(&self, host: String, pins: Vec<String>) -> Result<(), VaneError> {
+        self.set_certificate_pins_internal(host, pins)
+    }
+
+    pub fn add_certificate_pin(&self, host: String, pin: String) -> Result<(), VaneError> {
+        self.add_certificate_pin_internal(host, pin)
+    }
+
+    pub fn clear_certificate_pins(&self, host: String) -> Result<(), VaneError> {
+        self.set_certificate_pins_internal(host, Vec::new())
     }
 }
 
@@ -1530,6 +1948,7 @@ pub struct VaneFfiClientConfig {
     pub certificate_pins: *const VaneFfiStringListPair,
     pub certificate_pins_len: usize,
     pub cookies_enabled: bool,
+    pub cookie_persistence_path: VaneFfiString,
     pub connection_pool_enabled: bool,
     pub max_idle_connections: u64,
     pub connection_idle_timeout_seconds: u64,
@@ -1555,6 +1974,10 @@ pub struct VaneFfiRequest {
     pub headers_len: usize,
     pub query_params: *const VaneFfiStringPair,
     pub query_params_len: usize,
+    pub body_file_path: VaneFfiString,
+    pub response_body_path: VaneFfiString,
+    pub cancel_token_id: u64,
+    pub progress_id: u64,
     pub timeout_seconds: i64,
     pub follow_redirects: bool,
 }
@@ -1585,8 +2008,18 @@ pub struct VaneFfiResponse {
     pub is_success: bool,
     pub headers: VaneFfiHeaderArray,
     pub body: VaneFfiBuffer,
+    pub body_file_path: VaneFfiBuffer,
     pub url: VaneFfiBuffer,
     pub error: VaneFfiBuffer,
+}
+
+#[repr(C)]
+pub struct VaneFfiProgress {
+    pub upload_sent: u64,
+    pub upload_total: u64,
+    pub download_received: u64,
+    pub download_total: u64,
+    pub done: bool,
 }
 
 static FFI_CLIENTS: LazyLock<Mutex<HashMap<u64, Arc<VaneClient>>>> =
@@ -1626,6 +2059,77 @@ pub extern "C" fn vane_ffi_client_close(handle: u64) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_client_set_certificate_pins(
+    handle: u64,
+    host: VaneFfiString,
+    pins: VaneFfiStringList,
+    out_error: *mut VaneFfiBuffer,
+) -> bool {
+    ffi_clear_error(out_error);
+    match std::panic::catch_unwind(|| ffi_set_certificate_pins(handle, host, pins)) {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            ffi_set_error(out_error, error);
+            false
+        }
+        Err(_) => {
+            ffi_set_error(
+                out_error,
+                "Rust panic while setting certificate pins".to_string(),
+            );
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_cancel_token_create() -> u64 {
+    let id = NEXT_CANCEL_TOKEN_ID.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut tokens) = CANCEL_TOKENS.lock() {
+        tokens.insert(id, Arc::new(AtomicBool::new(false)));
+    }
+    id
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_cancel_token_cancel(id: u64) {
+    if let Ok(tokens) = CANCEL_TOKENS.lock()
+        && let Some(token) = tokens.get(&id)
+    {
+        token.store(true, Ordering::Relaxed);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_cancel_token_free(id: u64) {
+    if let Ok(mut tokens) = CANCEL_TOKENS.lock() {
+        tokens.remove(&id);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_progress_create() -> u64 {
+    progress_create()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_progress_snapshot(id: u64) -> VaneFfiProgress {
+    let state = progress_snapshot(id);
+    VaneFfiProgress {
+        upload_sent: state.upload_sent,
+        upload_total: state.upload_total,
+        download_received: state.download_received,
+        download_total: state.download_total,
+        done: state.done,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_progress_free(id: u64) {
+    progress_free(id);
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn vane_ffi_execute(
     handle: u64,
     request: *const VaneFfiRequest,
@@ -1654,6 +2158,7 @@ pub unsafe extern "C" fn vane_ffi_response_free(response: *mut VaneFfiResponse) 
         let response = Box::from_raw(response);
         ffi_header_array_free(response.headers);
         ffi_buffer_free(response.body);
+        ffi_buffer_free(response.body_file_path);
         ffi_buffer_free(response.url);
         ffi_buffer_free(response.error);
     }
@@ -1699,12 +2204,36 @@ fn ffi_execute(
     client.execute(request).map_err(|error| error.to_string())
 }
 
+fn ffi_set_certificate_pins(
+    handle: u64,
+    host: VaneFfiString,
+    pins: VaneFfiStringList,
+) -> Result<(), String> {
+    let client = {
+        let clients = FFI_CLIENTS
+            .lock()
+            .map_err(|_| "Vane FFI client registry lock was poisoned".to_string())?;
+        clients
+            .get(&handle)
+            .cloned()
+            .ok_or_else(|| format!("No Vane client exists for handle {handle}"))?
+    };
+    let host = ffi_required_string(host, "certificate_pin_host")?;
+    let pins = ffi_string_list(pins, "certificate_pins")?;
+    client
+        .set_certificate_pins(host, pins)
+        .map_err(|error| error.to_string())
+}
+
 fn ffi_response_from_vane(response: VaneResponse) -> VaneFfiResponse {
     VaneFfiResponse {
         status_code: response.status_code,
         is_success: response.is_success,
         headers: ffi_header_array_from_map(response.headers),
         body: ffi_buffer_from_vec(response.body),
+        body_file_path: ffi_buffer_from_vec(
+            response.body_file_path.unwrap_or_default().into_bytes(),
+        ),
         url: ffi_buffer_from_vec(response.url.into_bytes()),
         error: ffi_buffer_from_vec(Vec::new()),
     }
@@ -1716,6 +2245,7 @@ fn ffi_error_response(error: String) -> VaneFfiResponse {
         is_success: false,
         headers: ffi_header_array_empty(),
         body: ffi_buffer_from_vec(Vec::new()),
+        body_file_path: ffi_buffer_from_vec(Vec::new()),
         url: ffi_buffer_from_vec(Vec::new()),
         error: ffi_buffer_from_vec(error.into_bytes()),
     }
@@ -1744,6 +2274,10 @@ fn ffi_config(config: *const VaneFfiClientConfig) -> Result<VaneClientConfig, St
             "certificate_pins",
         )?,
         cookies_enabled: config.cookies_enabled,
+        cookie_persistence_path: ffi_optional_string(
+            config.cookie_persistence_path,
+            "cookie_persistence_path",
+        )?,
         connection_pool_enabled: config.connection_pool_enabled,
         max_idle_connections: config.max_idle_connections,
         connection_idle_timeout_seconds: config.connection_idle_timeout_seconds,
@@ -1780,6 +2314,10 @@ fn ffi_request(request: *const VaneFfiRequest) -> Result<VaneRequest, String> {
             "query_params",
         )?,
         body: None,
+        body_file_path: ffi_optional_string(request.body_file_path, "body_file_path")?,
+        response_body_path: ffi_optional_string(request.response_body_path, "response_body_path")?,
+        cancel_token_id: (request.cancel_token_id != 0).then_some(request.cancel_token_id),
+        progress_id: (request.progress_id != 0).then_some(request.progress_id),
         timeout_seconds: ffi_optional_u64(request.timeout_seconds, "timeout_seconds")?,
         follow_redirects: request.follow_redirects,
     })
@@ -1993,6 +2531,10 @@ mod tests {
             headers: HashMap::new(),
             query_params: HashMap::new(),
             body: None,
+            body_file_path: None,
+            response_body_path: None,
+            cancel_token_id: None,
+            progress_id: None,
             timeout_seconds: None,
             follow_redirects: true,
         }
@@ -2282,12 +2824,10 @@ mod tests {
     fn certificate_pinning_accepts_matching_cert_der_pin() {
         let host = "api.example.com";
         let cert_der = b"fake certificate bytes";
-        let mut config = VaneClientConfig::default();
-        config
-            .certificate_pins
-            .insert(host.to_string(), vec![sha256_pin("sha256-cert", cert_der)]);
+        let certificate_pins =
+            HashMap::from([(host.to_string(), vec![sha256_pin("sha256-cert", cert_der)])]);
 
-        let result = verify_certificate_pins(host, Some(cert_der), &config);
+        let result = verify_certificate_pins(host, Some(cert_der), &certificate_pins);
 
         assert!(result.is_ok());
     }
@@ -2296,16 +2836,15 @@ mod tests {
     fn certificate_pinning_accepts_backup_pin() {
         let host = "api.example.com";
         let cert_der = b"fake certificate bytes";
-        let mut config = VaneClientConfig::default();
-        config.certificate_pins.insert(
+        let certificate_pins = HashMap::from([(
             host.to_string(),
             vec![
                 "sha256-cert/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
                 sha256_pin("sha256-cert", cert_der),
             ],
-        );
+        )]);
 
-        let result = verify_certificate_pins(host, Some(cert_der), &config);
+        let result = verify_certificate_pins(host, Some(cert_der), &certificate_pins);
 
         assert!(result.is_ok());
     }
@@ -2313,14 +2852,13 @@ mod tests {
     #[test]
     fn certificate_pinning_rejects_mismatch() {
         let host = "api.example.com";
-        let mut config = VaneClientConfig::default();
-        config.certificate_pins.insert(
+        let certificate_pins = HashMap::from([(
             host.to_string(),
             vec!["sha256-cert/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()],
-        );
+        )]);
 
-        let err =
-            verify_certificate_pins(host, Some(b"different certificate"), &config).unwrap_err();
+        let err = verify_certificate_pins(host, Some(b"different certificate"), &certificate_pins)
+            .unwrap_err();
 
         assert!(err.to_string().contains("Certificate pin mismatch"));
     }
@@ -2328,14 +2866,53 @@ mod tests {
     #[test]
     fn certificate_pinning_requires_peer_cert_when_configured() {
         let host = "api.example.com";
-        let mut config = VaneClientConfig::default();
-        config
-            .certificate_pins
-            .insert(host.to_string(), vec!["sha256/example".to_string()]);
+        let certificate_pins =
+            HashMap::from([(host.to_string(), vec!["sha256/example".to_string()])]);
 
-        let err = verify_certificate_pins(host, None, &config).unwrap_err();
+        let err = verify_certificate_pins(host, None, &certificate_pins).unwrap_err();
 
         assert!(err.to_string().contains("peer certificate was unavailable"));
+    }
+
+    #[test]
+    fn dynamic_certificate_pins_can_be_updated_and_cleared() {
+        let host = "api.example.com".to_string();
+        let client = VaneClient::new(VaneClientConfig::default()).unwrap();
+
+        client
+            .set_certificate_pins(host.clone(), vec!["sha256/example".to_string()])
+            .unwrap();
+        assert_eq!(
+            client
+                .certificate_pins_snapshot()
+                .unwrap()
+                .get(&host)
+                .cloned(),
+            Some(vec!["sha256/example".to_string()])
+        );
+
+        client
+            .add_certificate_pin(host.clone(), "sha256-cert/example".to_string())
+            .unwrap();
+        assert_eq!(
+            client
+                .certificate_pins_snapshot()
+                .unwrap()
+                .get(&host)
+                .cloned(),
+            Some(vec![
+                "sha256/example".to_string(),
+                "sha256-cert/example".to_string()
+            ])
+        );
+
+        client.clear_certificate_pins(host.clone()).unwrap();
+        assert!(
+            !client
+                .certificate_pins_snapshot()
+                .unwrap()
+                .contains_key(&host)
+        );
     }
 
     #[test]
@@ -2429,19 +3006,19 @@ mod tests {
         assert!(cookie.secure);
         assert!(cookie.matches(
             &Url::parse("https://api.example.com/v1/users").unwrap(),
-            Instant::now()
+            now_epoch_seconds()
         ));
         assert!(!cookie.matches(
             &Url::parse("http://api.example.com/v1/users").unwrap(),
-            Instant::now()
+            now_epoch_seconds()
         ));
         assert!(!cookie.matches(
             &Url::parse("https://api.example.com/v2/users").unwrap(),
-            Instant::now()
+            now_epoch_seconds()
         ));
 
         let delete = StoredCookie::parse(&url, "session=deleted; Path=/v1; Max-Age=0").unwrap();
-        assert!(delete.is_expired(Instant::now()));
+        assert!(delete.is_expired(now_epoch_seconds()));
     }
 
     #[test]
@@ -2472,6 +3049,50 @@ mod tests {
         );
         assert_eq!(client.cookie_header(&other_path).unwrap(), "global=xyz");
         assert_eq!(client.cookie_header(&other_host).unwrap(), "");
+    }
+
+    #[test]
+    fn cookie_jar_persists_to_disk_when_path_is_configured() {
+        let path = std::env::temp_dir().join(format!("vane-cookies-{}.txt", now_epoch_seconds()));
+        let path = path.to_string_lossy().to_string();
+        let url = Url::parse("https://api.example.com/v1/users").unwrap();
+        let client = VaneClient::new(VaneClientConfig {
+            cookies_enabled: true,
+            cookie_persistence_path: Some(path.clone()),
+            ..VaneClientConfig::default()
+        })
+        .unwrap();
+
+        client
+            .store_response_cookies(&url, &["session=abc; Path=/v1; Max-Age=60".to_string()])
+            .unwrap();
+        let loaded = load_cookie_jar(Some(&path)).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "session");
+        assert_eq!(loaded[0].value, "abc");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn cancel_tokens_and_progress_state_are_tracked_by_id() {
+        let cancel_id = vane_ffi_cancel_token_create();
+        assert!(check_cancelled(Some(cancel_id)).is_ok());
+        vane_ffi_cancel_token_cancel(cancel_id);
+        assert!(check_cancelled(Some(cancel_id)).is_err());
+        vane_ffi_cancel_token_free(cancel_id);
+
+        let progress_id = vane_ffi_progress_create();
+        progress_init(Some(progress_id), 10);
+        progress_upload(Some(progress_id), 4, 10);
+        progress_download(Some(progress_id), 8, 0);
+        progress_done(Some(progress_id));
+        let progress = vane_ffi_progress_snapshot(progress_id);
+        assert_eq!(progress.upload_sent, 4);
+        assert_eq!(progress.upload_total, 10);
+        assert_eq!(progress.download_received, 8);
+        assert!(progress.done);
+        vane_ffi_progress_free(progress_id);
     }
 
     #[test]
@@ -2540,8 +3161,8 @@ mod tests {
             .dns_overrides
             .insert("api.example.com".to_string(), "203.0.113.10".to_string());
 
-        let base_key = PoolKey::new(&url, &base);
-        let dns_key = PoolKey::new(&url, &dns_config);
+        let base_key = PoolKey::new(&url, &base, &base.certificate_pins);
+        let dns_key = PoolKey::new(&url, &dns_config, &dns_config.certificate_pins);
 
         assert_ne!(base_key, dns_key);
         assert_eq!(
