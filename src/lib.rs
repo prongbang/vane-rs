@@ -3,7 +3,9 @@ uniffi::setup_scaffolding!();
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::{Arc, Mutex};
+use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,6 +14,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 #[cfg(feature = "spki-pinning")]
 use boring::x509::X509;
 use quiche::h3::NameValue;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -261,7 +264,8 @@ fn percent_encode_query(value: &str) -> String {
 }
 
 // ---------- Models ----------
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Debug, Clone, Deserialize, Serialize, uniffi::Record)]
+#[serde(rename_all = "camelCase")]
 pub struct VaneRequest {
     pub url: String,
     pub method: String,
@@ -272,7 +276,8 @@ pub struct VaneRequest {
     pub follow_redirects: bool,
 }
 
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Debug, Clone, Deserialize, Serialize, uniffi::Record)]
+#[serde(rename_all = "camelCase")]
 pub struct VaneResponse {
     pub status_code: u16,
     pub headers: HashMap<String, String>,
@@ -281,18 +286,24 @@ pub struct VaneResponse {
     pub url: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize, uniffi::Enum)]
 pub enum VaneProtocolMode {
     /// Kept for source compatibility; this build uses HTTP/3 only.
+    #[serde(rename = "http3ThenHttp2ThenHttp1")]
     Http3ThenHttp2ThenHttp1,
+    #[serde(rename = "http3Only")]
     Http3Only,
     /// Kept for source compatibility; HTTP/2 and HTTP/1.1 are unsupported.
+    #[serde(rename = "http2ThenHttp1")]
     Http2ThenHttp1,
+    #[serde(rename = "http2Only")]
     Http2Only,
+    #[serde(rename = "http1Only")]
     Http1Only,
 }
 
-#[derive(Debug, Clone, uniffi::Record)]
+#[derive(Debug, Clone, Deserialize, Serialize, uniffi::Record)]
+#[serde(rename_all = "camelCase")]
 pub struct VaneClientConfig {
     pub base_url: Option<String>,
     pub default_headers: HashMap<String, String>,
@@ -1487,6 +1498,240 @@ impl VaneClient {
 pub fn response_body_utf8(resp: &VaneResponse) -> Result<String, VaneError> {
     String::from_utf8(resp.body.clone())
         .map_err(|e| VaneError::Generic(format!("Invalid UTF-8 in response body: {e}")))
+}
+
+// ---------- Stable C ABI for Dart FFI ----------
+#[repr(C)]
+pub struct VaneFfiBuffer {
+    pub data: *mut u8,
+    pub len: usize,
+    pub cap: usize,
+}
+
+#[repr(C)]
+pub struct VaneFfiResponse {
+    pub status_code: u16,
+    pub is_success: bool,
+    pub headers_json: VaneFfiBuffer,
+    pub body: VaneFfiBuffer,
+    pub url: VaneFfiBuffer,
+    pub error: VaneFfiBuffer,
+}
+
+static FFI_CLIENTS: LazyLock<Mutex<HashMap<u64, Arc<VaneClient>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static FFI_NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_client_create(
+    config_json_data: *const u8,
+    config_json_len: usize,
+    out_error: *mut VaneFfiBuffer,
+) -> u64 {
+    ffi_clear_error(out_error);
+    match std::panic::catch_unwind(|| ffi_create_client(config_json_data, config_json_len)) {
+        Ok(Ok(handle)) => handle,
+        Ok(Err(error)) => {
+            ffi_set_error(out_error, error);
+            0
+        }
+        Err(_) => {
+            ffi_set_error(
+                out_error,
+                "Rust panic while creating Vane client".to_string(),
+            );
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_client_close(handle: u64) {
+    if handle == 0 {
+        return;
+    }
+    if let Ok(mut clients) = FFI_CLIENTS.lock() {
+        clients.remove(&handle);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_execute(
+    handle: u64,
+    request_json_data: *const u8,
+    request_json_len: usize,
+    body_data: *const u8,
+    body_len: usize,
+) -> *mut VaneFfiResponse {
+    let result = std::panic::catch_unwind(|| {
+        ffi_execute(
+            handle,
+            request_json_data,
+            request_json_len,
+            body_data,
+            body_len,
+        )
+    });
+    let response = match result {
+        Ok(Ok(response)) => ffi_response_from_vane(response),
+        Ok(Err(error)) => ffi_error_response(error),
+        Err(_) => ffi_error_response("Rust panic while executing Vane request".to_string()),
+    };
+    Box::into_raw(Box::new(response))
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `response` must be a pointer previously returned by `vane_ffi_execute`.
+/// It must be passed to this function at most once.
+pub unsafe extern "C" fn vane_ffi_response_free(response: *mut VaneFfiResponse) {
+    if response.is_null() {
+        return;
+    }
+    unsafe {
+        let response = Box::from_raw(response);
+        ffi_buffer_free(response.headers_json);
+        ffi_buffer_free(response.body);
+        ffi_buffer_free(response.url);
+        ffi_buffer_free(response.error);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_buffer_free(buffer: VaneFfiBuffer) {
+    ffi_buffer_free(buffer);
+}
+
+fn ffi_create_client(config_json_data: *const u8, config_json_len: usize) -> Result<u64, String> {
+    let config_json = ffi_str(config_json_data, config_json_len)?;
+    let config = if config_json.is_empty() {
+        VaneClientConfig::default()
+    } else {
+        serde_json::from_str::<VaneClientConfig>(config_json)
+            .map_err(|error| format!("Invalid Vane config JSON: {error}"))?
+    };
+    let client = Arc::new(VaneClient::new(config).map_err(|error| error.to_string())?);
+    let handle = FFI_NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    FFI_CLIENTS
+        .lock()
+        .map_err(|_| "Vane FFI client registry lock was poisoned".to_string())?
+        .insert(handle, client);
+    Ok(handle)
+}
+
+fn ffi_execute(
+    handle: u64,
+    request_json_data: *const u8,
+    request_json_len: usize,
+    body_data: *const u8,
+    body_len: usize,
+) -> Result<VaneResponse, String> {
+    let client = {
+        let clients = FFI_CLIENTS
+            .lock()
+            .map_err(|_| "Vane FFI client registry lock was poisoned".to_string())?;
+        clients
+            .get(&handle)
+            .cloned()
+            .ok_or_else(|| format!("No Vane client exists for handle {handle}"))?
+    };
+    let request_json = ffi_str(request_json_data, request_json_len)?;
+    let mut request = serde_json::from_str::<VaneRequest>(request_json)
+        .map_err(|error| format!("Invalid Vane request JSON: {error}"))?;
+    if body_len > 0 {
+        request.body = Some(ffi_bytes(body_data, body_len)?.to_vec());
+    } else {
+        request.body = None;
+    }
+    client.execute(request).map_err(|error| error.to_string())
+}
+
+fn ffi_response_from_vane(response: VaneResponse) -> VaneFfiResponse {
+    let headers_json = serde_json::to_vec(&response.headers).unwrap_or_else(|_| b"{}".to_vec());
+    VaneFfiResponse {
+        status_code: response.status_code,
+        is_success: response.is_success,
+        headers_json: ffi_buffer_from_vec(headers_json),
+        body: ffi_buffer_from_vec(response.body),
+        url: ffi_buffer_from_vec(response.url.into_bytes()),
+        error: ffi_buffer_from_vec(Vec::new()),
+    }
+}
+
+fn ffi_error_response(error: String) -> VaneFfiResponse {
+    VaneFfiResponse {
+        status_code: 0,
+        is_success: false,
+        headers_json: ffi_buffer_from_vec(b"{}".to_vec()),
+        body: ffi_buffer_from_vec(Vec::new()),
+        url: ffi_buffer_from_vec(Vec::new()),
+        error: ffi_buffer_from_vec(error.into_bytes()),
+    }
+}
+
+fn ffi_buffer_from_vec(mut bytes: Vec<u8>) -> VaneFfiBuffer {
+    if bytes.is_empty() {
+        return VaneFfiBuffer {
+            data: ptr::null_mut(),
+            len: 0,
+            cap: 0,
+        };
+    }
+    let buffer = VaneFfiBuffer {
+        data: bytes.as_mut_ptr(),
+        len: bytes.len(),
+        cap: bytes.capacity(),
+    };
+    std::mem::forget(bytes);
+    buffer
+}
+
+fn ffi_buffer_free(buffer: VaneFfiBuffer) {
+    if buffer.data.is_null() || buffer.cap == 0 {
+        return;
+    }
+    unsafe {
+        drop(Vec::from_raw_parts(buffer.data, buffer.len, buffer.cap));
+    }
+}
+
+fn ffi_clear_error(out_error: *mut VaneFfiBuffer) {
+    if !out_error.is_null() {
+        unsafe {
+            *out_error = VaneFfiBuffer {
+                data: ptr::null_mut(),
+                len: 0,
+                cap: 0,
+            };
+        }
+    }
+}
+
+fn ffi_set_error(out_error: *mut VaneFfiBuffer, error: String) {
+    if !out_error.is_null() {
+        unsafe {
+            *out_error = ffi_buffer_from_vec(error.into_bytes());
+        }
+    }
+}
+
+fn ffi_str<'a>(data: *const u8, len: usize) -> Result<&'a str, String> {
+    if len == 0 {
+        return Ok("");
+    }
+    let bytes = ffi_bytes(data, len)?;
+    std::str::from_utf8(bytes).map_err(|error| format!("Invalid UTF-8: {error}"))
+}
+
+fn ffi_bytes<'a>(data: *const u8, len: usize) -> Result<&'a [u8], String> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if data.is_null() {
+        return Err("FFI data pointer is null".to_string());
+    }
+    Ok(unsafe { std::slice::from_raw_parts(data, len) })
 }
 
 #[cfg(test)]
