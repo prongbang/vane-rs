@@ -18,9 +18,9 @@ keeps certificate DER pins (`sha256-cert/<base64>`).
 HTTP/1.0 and dynamic DNS callback resolvers are explicitly unsupported in the
 first production candidate. Static custom DNS overrides are available for
 routing a hostname to a specific IP while preserving the original hostname for
-SNI, authority, and certificate verification. HTTP/3 proxying is not supported
-yet because it requires a MASQUE/CONNECT-UDP transport path. Certificate
-pinning is available as opt-in host-scoped pins for the HTTP/3 backend.
+SNI, authority, and certificate verification. HTTP/3 proxying is supported
+through HTTPS MASQUE/CONNECT-UDP proxies. Certificate pinning is available as
+opt-in host-scoped pins for the HTTP/3 backend.
 Optional retry policy, HTTP/3 connection pooling, and in-memory cookies are
 available behind explicit configuration. Remaining production work is tracked
 in the repository root `PLAN.md`.
@@ -254,10 +254,10 @@ Vane retries transient transport failures and HTTP status `408`, `425`, `429`,
 Connection pooling defaults to disabled. When enabled, Vane keeps idle HTTP/3
 connections by origin, DNS override, protocol mode, and certificate pin set.
 
-Proxy configuration remains in the public config shape for source
-compatibility, but this build does not support proxies. Any request with
-`proxyUrl` set fails clearly because HTTP/3 proxying requires a future
-MASQUE/CONNECT-UDP transport path.
+Proxy configuration uses MASQUE/CONNECT-UDP over HTTP/3. Set `proxyUrl` to an
+HTTPS proxy endpoint such as `https://proxy.example.com:443`; classic
+`http://` CONNECT proxies are rejected because QUIC packets require UDP
+tunneling.
 
 Protocol modes:
 

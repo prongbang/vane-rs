@@ -518,16 +518,12 @@ impl VaneClient {
                 "quiche backend only supports https:// URLs over HTTP/3".to_string(),
             ));
         }
-        if self.config.proxy_url.is_some() {
-            return Err(VaneError::Generic(
-                "HTTP/3 proxying is not supported yet; QUIC proxying requires MASQUE/CONNECT-UDP."
-                    .to_string(),
-            ));
-        }
-
         let host = url
             .host_str()
             .ok_or_else(|| VaneError::Generic("URL is missing host".to_string()))?;
+        if let Some(proxy_url) = self.config.proxy_url.as_deref() {
+            MasqueProxyConfig::parse(proxy_url)?;
+        }
         let peer_addr = resolve_peer_addr(
             host,
             url.port_or_known_default().unwrap_or(443),
@@ -594,7 +590,7 @@ impl VaneClient {
                     self.return_pooled_connection(transport)?;
                 } else {
                     transport.conn.close(true, 0x00, b"done").ok();
-                    flush_quic_packets(&transport.socket, &mut transport.conn).ok();
+                    transport.flush_packets().ok();
                 }
 
                 Ok(public_response)
@@ -602,7 +598,7 @@ impl VaneClient {
             Err(err) => {
                 progress_done(request.progress_id);
                 transport.conn.close(true, 0x01, b"request failed").ok();
-                flush_quic_packets(&transport.socket, &mut transport.conn).ok();
+                transport.flush_packets().ok();
                 Err(err)
             }
         }
@@ -616,50 +612,91 @@ impl VaneClient {
         key: PoolKey,
         certificate_pins: &HashMap<String, Vec<String>>,
     ) -> Result<PooledHttp3Connection, VaneError> {
-        let bind_addr = match peer_addr {
-            SocketAddr::V4(_) => "0.0.0.0:0",
-            SocketAddr::V6(_) => "[::]:0",
-        };
+        if let Some(proxy_url) = self.config.proxy_url.as_deref() {
+            return self.connect_http3_via_masque(
+                host,
+                peer_addr,
+                proxy_url,
+                timeout,
+                key,
+                certificate_pins,
+            );
+        }
 
-        let socket = UdpSocket::bind(bind_addr)
-            .map_err(|e| VaneError::Generic(format!("Failed to bind UDP socket: {e}")))?;
-        socket.connect(peer_addr).map_err(|e| {
-            VaneError::Generic(format!("Failed to connect UDP socket to {peer_addr}: {e}"))
-        })?;
-        let local_addr = socket
-            .local_addr()
-            .map_err(|e| VaneError::Generic(format!("Failed to read UDP local address: {e}")))?;
-        socket
-            .set_read_timeout(Some(Duration::from_millis(10)))
-            .map_err(|e| VaneError::Generic(format!("Failed to set UDP read timeout: {e}")))?;
-        socket
-            .set_write_timeout(Some(timeout))
-            .map_err(|e| VaneError::Generic(format!("Failed to set UDP write timeout: {e}")))?;
+        let direct = connect_quic_h3(host, peer_addr, timeout, certificate_pins)?;
+        Ok(PooledHttp3Connection {
+            key,
+            io: Http3Io::Direct {
+                socket: direct.socket,
+            },
+            local_addr: direct.local_addr,
+            peer_addr: direct.peer_addr,
+            conn: direct.conn,
+            http3: direct.http3,
+            last_used: Instant::now(),
+        })
+    }
 
-        let mut quic_config = create_quiche_config(timeout)?;
+    fn connect_http3_via_masque(
+        &self,
+        host: &str,
+        peer_addr: SocketAddr,
+        proxy_url: &str,
+        timeout: Duration,
+        key: PoolKey,
+        certificate_pins: &HashMap<String, Vec<String>>,
+    ) -> Result<PooledHttp3Connection, VaneError> {
+        let proxy = MasqueProxyConfig::parse(proxy_url)?;
+        let proxy_addr = resolve_peer_addr(&proxy.host, proxy.port, &self.config.dns_overrides)?;
+        let mut outer = connect_quic_h3(&proxy.host, proxy_addr, timeout, certificate_pins)?;
+        let stream_id = establish_connect_udp_tunnel(
+            &mut outer,
+            &proxy,
+            host,
+            peer_addr.port(),
+            self.config.proxy_authorization.as_deref(),
+            timeout,
+        )?;
+
         let mut scid = [0; quiche::MAX_CONN_ID_LEN];
         getrandom::fill(&mut scid).map_err(|e| {
             VaneError::Generic(format!("Failed to generate QUIC connection ID: {e}"))
         })?;
         let scid = quiche::ConnectionId::from_ref(&scid);
-        let mut conn = quiche::connect(Some(host), &scid, local_addr, peer_addr, &mut quic_config)
-            .map_err(|e| VaneError::Generic(format!("Failed to create QUIC client: {e}")))?;
+        let mut quic_config = create_quiche_config(timeout)?;
+        let mut conn = quiche::connect(
+            Some(host),
+            &scid,
+            outer.local_addr,
+            peer_addr,
+            &mut quic_config,
+        )
+        .map_err(|e| VaneError::Generic(format!("Failed to create QUIC client: {e}")))?;
         let h3_config = quiche::h3::Config::new()
             .map_err(|e| VaneError::Generic(format!("Failed to create HTTP/3 config: {e}")))?;
+        let mut io = Http3Io::Masque(Box::new(MasqueTunnel {
+            socket: outer.socket,
+            local_addr: outer.local_addr,
+            peer_addr: outer.peer_addr,
+            conn: outer.conn,
+            http3: outer.http3,
+            stream_id,
+            flow_id: stream_id / 4,
+        }));
 
-        flush_quic_packets(&socket, &mut conn)?;
+        flush_quic_packets_via(&mut io, &mut conn)?;
         let deadline = Instant::now() + timeout;
 
         while Instant::now() < deadline {
-            read_quic_packets(&socket, &mut conn, local_addr, peer_addr)?;
+            read_quic_packets_via(&mut io, &mut conn, outer.local_addr, peer_addr)?;
 
             if conn.is_established() {
                 verify_certificate_pins(host, conn.peer_cert(), certificate_pins)?;
                 let http3 = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
                 return Ok(PooledHttp3Connection {
                     key,
-                    socket,
-                    local_addr,
+                    io,
+                    local_addr: outer.local_addr,
                     peer_addr,
                     conn,
                     http3,
@@ -667,7 +704,7 @@ impl VaneClient {
                 });
             }
 
-            flush_quic_packets(&socket, &mut conn)?;
+            flush_quic_packets_via(&mut io, &mut conn)?;
 
             if conn.is_closed() {
                 return Err(VaneError::Generic(
@@ -699,9 +736,7 @@ impl VaneClient {
         };
 
         let conn = pool.swap_remove(index);
-        conn.socket.set_write_timeout(Some(timeout)).map_err(|e| {
-            VaneError::Generic(format!("Failed to set pooled UDP write timeout: {e}"))
-        })?;
+        conn.set_write_timeout(timeout)?;
         Ok(Some(conn))
     }
 
@@ -716,7 +751,7 @@ impl VaneClient {
         let max_idle = self.config.max_idle_connections as usize;
         if max_idle == 0 {
             connection.conn.close(true, 0x00, b"pool disabled").ok();
-            flush_quic_packets(&connection.socket, &mut connection.conn).ok();
+            connection.flush_packets().ok();
             return Ok(());
         }
 
@@ -726,7 +761,7 @@ impl VaneClient {
         while pool.len() > max_idle {
             if let Some(removed) = pool.first_mut() {
                 removed.conn.close(true, 0x00, b"pool full").ok();
-                flush_quic_packets(&removed.socket, &mut removed.conn).ok();
+                removed.flush_packets().ok();
             }
             pool.remove(0);
         }
@@ -749,7 +784,7 @@ impl VaneClient {
             conn.conn
                 .close(true, 0x00, b"certificate pins changed")
                 .ok();
-            flush_quic_packets(&conn.socket, &mut conn.conn).ok();
+            conn.flush_packets().ok();
         }
         pool.clear();
         Ok(())
@@ -868,6 +903,8 @@ struct PoolKey {
     port: u16,
     protocol_mode: VaneProtocolMode,
     dns_override: Option<String>,
+    proxy_url: Option<String>,
+    proxy_authorization: Option<String>,
     certificate_pins: Vec<String>,
 }
 
@@ -887,6 +924,8 @@ impl PoolKey {
             port: url.port_or_known_default().unwrap_or(443),
             protocol_mode: config.protocol_mode.clone(),
             dns_override: config.dns_overrides.get(&host).cloned(),
+            proxy_url: config.proxy_url.clone(),
+            proxy_authorization: config.proxy_authorization.clone(),
             certificate_pins,
         }
     }
@@ -894,12 +933,118 @@ impl PoolKey {
 
 struct PooledHttp3Connection {
     key: PoolKey,
-    socket: UdpSocket,
+    io: Http3Io,
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
     conn: quiche::Connection,
     http3: quiche::h3::Connection,
     last_used: Instant,
+}
+
+impl PooledHttp3Connection {
+    fn set_write_timeout(&self, timeout: Duration) -> Result<(), VaneError> {
+        self.io.set_write_timeout(timeout)
+    }
+
+    fn read_packets(&mut self) -> Result<(), VaneError> {
+        read_quic_packets_via(
+            &mut self.io,
+            &mut self.conn,
+            self.local_addr,
+            self.peer_addr,
+        )
+    }
+
+    fn flush_packets(&mut self) -> Result<(), VaneError> {
+        flush_quic_packets_via(&mut self.io, &mut self.conn)
+    }
+}
+
+struct DirectHttp3Connection {
+    socket: UdpSocket,
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+    conn: quiche::Connection,
+    http3: quiche::h3::Connection,
+}
+
+enum Http3Io {
+    Direct { socket: UdpSocket },
+    Masque(Box<MasqueTunnel>),
+}
+
+impl Http3Io {
+    fn set_write_timeout(&self, timeout: Duration) -> Result<(), VaneError> {
+        match self {
+            Self::Direct { socket } => socket
+                .set_write_timeout(Some(timeout))
+                .map_err(|e| VaneError::Generic(format!("Failed to set UDP write timeout: {e}"))),
+            Self::Masque(tunnel) => tunnel.socket.set_write_timeout(Some(timeout)).map_err(|e| {
+                VaneError::Generic(format!("Failed to set proxy UDP write timeout: {e}"))
+            }),
+        }
+    }
+}
+
+struct MasqueTunnel {
+    socket: UdpSocket,
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+    conn: quiche::Connection,
+    http3: quiche::h3::Connection,
+    stream_id: u64,
+    flow_id: u64,
+}
+
+impl MasqueTunnel {
+    fn send_origin_packet(&mut self, packet: &[u8]) -> Result<(), VaneError> {
+        let datagram = encode_h3_datagram(self.flow_id, 0, packet)?;
+        self.conn.dgram_send(&datagram)?;
+        flush_quic_packets(&self.socket, &mut self.conn)
+    }
+
+    fn read_origin_packets(
+        &mut self,
+        origin_conn: &mut quiche::Connection,
+        origin_local_addr: SocketAddr,
+        origin_peer_addr: SocketAddr,
+    ) -> Result<(), VaneError> {
+        read_quic_packets(
+            &self.socket,
+            &mut self.conn,
+            self.local_addr,
+            self.peer_addr,
+        )?;
+        process_masque_control_events(&mut self.http3, &mut self.conn, self.stream_id)?;
+
+        let mut buf = [0; MAX_DATAGRAM_SIZE];
+        loop {
+            match self.conn.dgram_recv(&mut buf) {
+                Ok(len) => {
+                    let Some((flow_id, context_id, payload_offset)) =
+                        decode_h3_datagram(&buf[..len])?
+                    else {
+                        continue;
+                    };
+                    if flow_id != self.flow_id || context_id != 0 {
+                        continue;
+                    }
+                    let recv_info = quiche::RecvInfo {
+                        from: origin_peer_addr,
+                        to: origin_local_addr,
+                    };
+                    match origin_conn.recv(&mut buf[payload_offset..len], recv_info) {
+                        Ok(_) | Err(quiche::Error::Done) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                Err(quiche::Error::Done) => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Ok(())
+    }
 }
 
 struct Http3ResponseParts {
@@ -1104,6 +1249,390 @@ fn decode_cookie_field(value: &str) -> Option<String> {
     String::from_utf8(BASE64.decode(value).ok()?).ok()
 }
 
+struct MasqueProxyConfig {
+    host: String,
+    port: u16,
+    authority: String,
+}
+
+impl MasqueProxyConfig {
+    fn parse(proxy_url: &str) -> Result<Self, VaneError> {
+        let url = Url::parse(proxy_url)
+            .map_err(|e| VaneError::Generic(format!("Invalid proxyUrl {proxy_url}: {e}")))?;
+        if url.scheme() != "https" {
+            return Err(VaneError::Generic(
+                "HTTP/3 proxyUrl must use https:// for MASQUE/CONNECT-UDP".to_string(),
+            ));
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| VaneError::Generic("proxyUrl is missing host".to_string()))?
+            .to_string();
+        let port = url.port_or_known_default().unwrap_or(443);
+        let authority = match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.clone(),
+        };
+        Ok(Self {
+            host,
+            port,
+            authority,
+        })
+    }
+}
+
+fn connect_quic_h3(
+    host: &str,
+    peer_addr: SocketAddr,
+    timeout: Duration,
+    certificate_pins: &HashMap<String, Vec<String>>,
+) -> Result<DirectHttp3Connection, VaneError> {
+    let bind_addr = match peer_addr {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+
+    let socket = UdpSocket::bind(bind_addr)
+        .map_err(|e| VaneError::Generic(format!("Failed to bind UDP socket: {e}")))?;
+    socket.connect(peer_addr).map_err(|e| {
+        VaneError::Generic(format!("Failed to connect UDP socket to {peer_addr}: {e}"))
+    })?;
+    let local_addr = socket
+        .local_addr()
+        .map_err(|e| VaneError::Generic(format!("Failed to read UDP local address: {e}")))?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(10)))
+        .map_err(|e| VaneError::Generic(format!("Failed to set UDP read timeout: {e}")))?;
+    socket
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| VaneError::Generic(format!("Failed to set UDP write timeout: {e}")))?;
+
+    let mut quic_config = create_quiche_config(timeout)?;
+    let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+    getrandom::fill(&mut scid)
+        .map_err(|e| VaneError::Generic(format!("Failed to generate QUIC connection ID: {e}")))?;
+    let scid = quiche::ConnectionId::from_ref(&scid);
+    let mut conn = quiche::connect(Some(host), &scid, local_addr, peer_addr, &mut quic_config)
+        .map_err(|e| VaneError::Generic(format!("Failed to create QUIC client: {e}")))?;
+    let mut h3_config = quiche::h3::Config::new()
+        .map_err(|e| VaneError::Generic(format!("Failed to create HTTP/3 config: {e}")))?;
+    h3_config.enable_extended_connect(true);
+
+    flush_quic_packets(&socket, &mut conn)?;
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        read_quic_packets(&socket, &mut conn, local_addr, peer_addr)?;
+
+        if conn.is_established() {
+            verify_certificate_pins(host, conn.peer_cert(), certificate_pins)?;
+            let http3 = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
+            return Ok(DirectHttp3Connection {
+                socket,
+                local_addr,
+                peer_addr,
+                conn,
+                http3,
+            });
+        }
+
+        flush_quic_packets(&socket, &mut conn)?;
+
+        if conn.is_closed() {
+            return Err(VaneError::Generic(
+                "QUIC connection closed before handshake completed".to_string(),
+            ));
+        }
+    }
+
+    Err(VaneError::Generic("HTTP/3 handshake timed out".to_string()))
+}
+
+fn establish_connect_udp_tunnel(
+    transport: &mut DirectHttp3Connection,
+    proxy: &MasqueProxyConfig,
+    target_host: &str,
+    target_port: u16,
+    proxy_authorization: Option<&str>,
+    timeout: Duration,
+) -> Result<u64, VaneError> {
+    let target_path = format!(
+        "/.well-known/masque/udp/{}/{}/",
+        masque_path_component(target_host),
+        target_port
+    );
+    let mut headers = vec![
+        quiche::h3::Header::new(b":method", b"CONNECT"),
+        quiche::h3::Header::new(b":protocol", b"connect-udp"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", proxy.authority.as_bytes()),
+        quiche::h3::Header::new(b":path", target_path.as_bytes()),
+    ];
+    if let Some(value) = proxy_authorization.filter(|value| !value.is_empty()) {
+        headers.push(quiche::h3::Header::new(
+            b"proxy-authorization",
+            value.as_bytes(),
+        ));
+    }
+
+    let stream_id = transport
+        .http3
+        .send_request(&mut transport.conn, &headers, true)?;
+    flush_quic_packets(&transport.socket, &mut transport.conn)?;
+
+    let deadline = Instant::now() + timeout;
+    let mut tunnel_accepted = false;
+    while Instant::now() < deadline {
+        read_quic_packets(
+            &transport.socket,
+            &mut transport.conn,
+            transport.local_addr,
+            transport.peer_addr,
+        )?;
+        process_connect_udp_events(
+            &mut transport.http3,
+            &mut transport.conn,
+            stream_id,
+            &mut tunnel_accepted,
+        )?;
+
+        if tunnel_accepted {
+            if !transport.http3.extended_connect_enabled_by_peer() {
+                return Err(VaneError::Generic(
+                    "MASQUE proxy did not advertise Extended CONNECT support".to_string(),
+                ));
+            }
+            if !transport.http3.dgram_enabled_by_peer(&transport.conn) {
+                return Err(VaneError::Generic(
+                    "MASQUE proxy did not advertise HTTP/3 DATAGRAM support".to_string(),
+                ));
+            }
+            return Ok(stream_id);
+        }
+
+        flush_quic_packets(&transport.socket, &mut transport.conn)?;
+
+        if transport.conn.is_closed() {
+            return Err(VaneError::Generic(
+                "MASQUE proxy connection closed before CONNECT-UDP completed".to_string(),
+            ));
+        }
+    }
+
+    Err(VaneError::Generic(
+        "MASQUE CONNECT-UDP establishment timed out".to_string(),
+    ))
+}
+
+fn process_connect_udp_events(
+    http3: &mut quiche::h3::Connection,
+    conn: &mut quiche::Connection,
+    tunnel_stream_id: u64,
+    tunnel_accepted: &mut bool,
+) -> Result<(), VaneError> {
+    loop {
+        match http3.poll(conn) {
+            Ok((stream_id, quiche::h3::Event::Headers { list, .. }))
+                if stream_id == tunnel_stream_id =>
+            {
+                let mut status = None;
+                for header in list {
+                    if header.name() == b":status" {
+                        status = Some(String::from_utf8_lossy(header.value()).to_string());
+                    }
+                }
+                let Some(status) = status else {
+                    return Err(VaneError::Generic(
+                        "MASQUE proxy CONNECT-UDP response is missing :status".to_string(),
+                    ));
+                };
+                if status.starts_with('2') {
+                    *tunnel_accepted = true;
+                } else {
+                    return Err(VaneError::Generic(format!(
+                        "MASQUE proxy rejected CONNECT-UDP with status {status}"
+                    )));
+                }
+            }
+            Ok((stream_id, quiche::h3::Event::Data)) => {
+                let mut buf = [0; 4096];
+                loop {
+                    match http3.recv_body(conn, stream_id, &mut buf) {
+                        Ok(_) => {}
+                        Err(quiche::h3::Error::Done) => break,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            Ok((stream_id, quiche::h3::Event::Finished))
+                if stream_id == tunnel_stream_id && !*tunnel_accepted =>
+            {
+                return Err(VaneError::Generic(
+                    "MASQUE proxy closed CONNECT-UDP before accepting it".to_string(),
+                ));
+            }
+            Ok((stream_id, quiche::h3::Event::Reset(e))) if stream_id == tunnel_stream_id => {
+                return Err(VaneError::Generic(format!(
+                    "MASQUE proxy reset CONNECT-UDP stream: {e:?}"
+                )));
+            }
+            Ok((_stream_id, quiche::h3::Event::Headers { .. }))
+            | Ok((_stream_id, quiche::h3::Event::Finished))
+            | Ok((_stream_id, quiche::h3::Event::Reset(_)))
+            | Ok((_stream_id, quiche::h3::Event::PriorityUpdate)) => {}
+            Ok((_id, quiche::h3::Event::GoAway)) => {
+                return Err(VaneError::Generic(
+                    "MASQUE proxy sent HTTP/3 GOAWAY".to_string(),
+                ));
+            }
+            Err(quiche::h3::Error::Done) => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(())
+}
+
+fn process_masque_control_events(
+    http3: &mut quiche::h3::Connection,
+    conn: &mut quiche::Connection,
+    tunnel_stream_id: u64,
+) -> Result<(), VaneError> {
+    let mut accepted = true;
+    process_connect_udp_events(http3, conn, tunnel_stream_id, &mut accepted)
+}
+
+fn read_quic_packets_via(
+    io: &mut Http3Io,
+    conn: &mut quiche::Connection,
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+) -> Result<(), VaneError> {
+    match io {
+        Http3Io::Direct { socket } => read_quic_packets(socket, conn, local_addr, peer_addr),
+        Http3Io::Masque(tunnel) => tunnel.read_origin_packets(conn, local_addr, peer_addr),
+    }
+}
+
+fn flush_quic_packets_via(
+    io: &mut Http3Io,
+    conn: &mut quiche::Connection,
+) -> Result<(), VaneError> {
+    let mut out = [0; MAX_DATAGRAM_SIZE];
+    loop {
+        match conn.send(&mut out) {
+            Ok((written, send_info)) => {
+                let _ = send_info;
+                match io {
+                    Http3Io::Direct { socket } => {
+                        socket.send(&out[..written]).map_err(|e| {
+                            VaneError::Generic(format!("Failed to send UDP packet: {e}"))
+                        })?;
+                    }
+                    Http3Io::Masque(tunnel) => {
+                        tunnel.send_origin_packet(&out[..written])?;
+                    }
+                }
+            }
+            Err(quiche::Error::Done) => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+fn encode_h3_datagram(flow_id: u64, context_id: u64, payload: &[u8]) -> Result<Vec<u8>, VaneError> {
+    let mut out = Vec::with_capacity(varint_len(flow_id) + varint_len(context_id) + payload.len());
+    put_varint(flow_id, &mut out)?;
+    put_varint(context_id, &mut out)?;
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+fn decode_h3_datagram(buf: &[u8]) -> Result<Option<(u64, u64, usize)>, VaneError> {
+    let Some((flow_id, offset)) = get_varint(buf, 0)? else {
+        return Ok(None);
+    };
+    let Some((context_id, offset)) = get_varint(buf, offset)? else {
+        return Ok(None);
+    };
+    Ok(Some((flow_id, context_id, offset)))
+}
+
+fn varint_len(value: u64) -> usize {
+    match value {
+        0..=0x3f => 1,
+        0x40..=0x3fff => 2,
+        0x4000..=0x3fff_ffff => 4,
+        _ => 8,
+    }
+}
+
+fn put_varint(value: u64, out: &mut Vec<u8>) -> Result<(), VaneError> {
+    match value {
+        0..=0x3f => out.push(value as u8),
+        0x40..=0x3fff => {
+            out.push(((value >> 8) as u8) | 0x40);
+            out.push(value as u8);
+        }
+        0x4000..=0x3fff_ffff => {
+            out.push(((value >> 24) as u8) | 0x80);
+            out.push((value >> 16) as u8);
+            out.push((value >> 8) as u8);
+            out.push(value as u8);
+        }
+        0x4000_0000..=0x3fff_ffff_ffff_ffff => {
+            out.push(((value >> 56) as u8) | 0xc0);
+            out.push((value >> 48) as u8);
+            out.push((value >> 40) as u8);
+            out.push((value >> 32) as u8);
+            out.push((value >> 24) as u8);
+            out.push((value >> 16) as u8);
+            out.push((value >> 8) as u8);
+            out.push(value as u8);
+        }
+        _ => {
+            return Err(VaneError::Generic(format!(
+                "HTTP/3 datagram varint is too large: {value}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn get_varint(buf: &[u8], offset: usize) -> Result<Option<(u64, usize)>, VaneError> {
+    let Some(first) = buf.get(offset).copied() else {
+        return Ok(None);
+    };
+    let len = match first >> 6 {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    if buf.len() < offset + len {
+        return Ok(None);
+    }
+    let mut value = (first & 0x3f) as u64;
+    for byte in &buf[offset + 1..offset + len] {
+        value = (value << 8) | u64::from(*byte);
+    }
+    Ok(Some((value, offset + len)))
+}
+
+fn masque_path_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            byte => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 struct H3RequestOptions<'a> {
     headers: &'a [quiche::h3::Header],
     request_body: &'a [u8],
@@ -1127,12 +1656,7 @@ fn perform_http3_request(
 
     while Instant::now() < deadline {
         check_cancelled(options.cancel_token_id)?;
-        read_quic_packets(
-            &transport.socket,
-            &mut transport.conn,
-            transport.local_addr,
-            transport.peer_addr,
-        )?;
+        transport.read_packets()?;
 
         if request_stream_id.is_none() {
             let fin = options.request_body.is_empty();
@@ -1174,11 +1698,11 @@ fn perform_http3_request(
         )?;
 
         if response.finished {
-            flush_quic_packets(&transport.socket, &mut transport.conn)?;
+            transport.flush_packets()?;
             break;
         }
 
-        flush_quic_packets(&transport.socket, &mut transport.conn)?;
+        transport.flush_packets()?;
 
         if transport.conn.is_closed() && !response.finished {
             return Err(VaneError::Generic(
@@ -1211,6 +1735,7 @@ fn create_quiche_config(timeout: Duration) -> Result<quiche::Config, VaneError> 
     config.set_max_idle_timeout(timeout.as_millis().try_into().unwrap_or(u64::MAX));
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
+    config.enable_dgram(true, 1024, 1024);
     config.set_initial_max_data(10_000_000);
     config.set_initial_max_stream_data_bidi_local(1_000_000);
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
@@ -2727,7 +3252,7 @@ mod tests {
     }
 
     #[test]
-    fn http3_backend_rejects_proxy_configuration() {
+    fn http3_backend_requires_https_proxy_for_masque() {
         let client = VaneClient::new(VaneClientConfig {
             protocol_mode: VaneProtocolMode::Http3Only,
             proxy_url: Some("http://proxy.example.com:8080".to_string()),
@@ -2739,8 +3264,32 @@ mod tests {
             .execute(request("https://api.example.com/users"))
             .unwrap_err();
 
-        assert!(err.to_string().contains("HTTP/3 proxying"));
+        assert!(err.to_string().contains("proxyUrl must use https://"));
         assert!(err.to_string().contains("MASQUE/CONNECT-UDP"));
+    }
+
+    #[test]
+    fn masque_proxy_config_parses_https_authority() {
+        let proxy = MasqueProxyConfig::parse("https://proxy.example.com:8443").unwrap();
+
+        assert_eq!(proxy.host, "proxy.example.com");
+        assert_eq!(proxy.port, 8443);
+        assert_eq!(proxy.authority, "proxy.example.com:8443");
+    }
+
+    #[test]
+    fn h3_datagram_roundtrips_flow_context_and_payload() {
+        let encoded = encode_h3_datagram(64, 0, b"packet").unwrap();
+        let decoded = decode_h3_datagram(&encoded).unwrap().unwrap();
+
+        assert_eq!(decoded.0, 64);
+        assert_eq!(decoded.1, 0);
+        assert_eq!(&encoded[decoded.2..], b"packet");
+    }
+
+    #[test]
+    fn masque_path_component_percent_encodes_ipv6_colons() {
+        assert_eq!(masque_path_component("2001:db8::1"), "2001%3Adb8%3A%3A1");
     }
 
     #[test]
