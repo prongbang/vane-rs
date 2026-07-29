@@ -313,12 +313,20 @@ set connection-management or framing headers (`connection`, `content-length`,
 `host`, `keep-alive`, `proxy-connection`, `te`, `trailer`,
 `transfer-encoding`, `upgrade`).
 
-**Android needs one line of setup for the TCP path.** TLS there is verified
-against the platform trust store through JNI, which has to be handed a
-`Context` before the first request:
-`rustls_platform_verifier::android::init_with_env(&mut env, context)` from your
-JNI entry point. Without it, TCP requests fail closed. Apple platforms use
-SecTrust and need no setup.
+**Android needs no setup for the TCP path, and does it for you.** TLS there is
+verified against the platform trust store through JNI, which has to be handed a
+`Context` before the first request. Vane's AAR registers a `VaneInitProvider`
+`ContentProvider` that calls `Vane.initialize(context)` before any application
+code runs; that reaches `rustls_platform_verifier::android::init_with_env`
+through the `VaneNative.initAndroid` JNI export. The AAR also bundles the
+`org.rustls.platformverifier` classes that verification calls into, since they
+are not published to Maven.
+
+Only if the merged manifest lost that provider — a custom build, or a process
+that loads `libvane.so` by itself — call `Vane.initialize(context)` once at
+startup. A TCP request on an uninitialized process does not produce a
+certificate error; it fails with a message naming that call. Apple platforms
+use SecTrust and need none of this, and HTTP/3 never does.
 
 Cookies default to disabled. When enabled, Vane keeps an in-memory cookie jar
 inside each `VaneClient`/`VaneSession`. The jar handles common `Set-Cookie`

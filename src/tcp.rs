@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::io::{self, Read};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::AtomicBool;
+#[cfg(target_os = "android")]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError};
 use std::time::Instant;
 
@@ -126,10 +128,80 @@ fn pin_lookup_host(server_name: &ServerName<'_>) -> Option<String> {
     }
 }
 
+/// Set once [`Java_com_inteniquetic_vanekotlin_VaneNative_initAndroid`] has
+/// handed the platform verifier an app `Context`.
+///
+/// Android is the one platform where certificate verification needs setup
+/// before it can run: the trust store is only reachable over JNI. Skipping it
+/// does not merely fail the handshake — `rustls-platform-verifier` panics
+/// inside its first verification, and the release profile is `panic = "abort"`,
+/// so the whole app process dies. Hence a flag checked *before* a verifier is
+/// ever built, rather than letting the failure happen where it would.
+#[cfg(target_os = "android")]
+static ANDROID_TRUST_READY: AtomicBool = AtomicBool::new(false);
+
+/// One-time JNI handshake giving `rustls-platform-verifier` the app `Context`
+/// it verifies certificates through. Idempotent, and only the first call
+/// counts (the crate stores its handles in a `OnceCell`).
+///
+/// An exported native method rather than a `JNI_OnLoad` hook: `JNI_OnLoad` is
+/// handed only a `JavaVM`, and there is no supported way to reach a `Context`
+/// from one — `ActivityThread.currentApplication()` is hidden API — while
+/// `init_with_env` needs the `Context` to reach the app class loader that owns
+/// `org.rustls.platformverifier.CertificateVerifier`.
+///
+/// Returns false instead of throwing, because the caller is a `ContentProvider`
+/// running during app startup: a failure here has to degrade to "TCP fallback
+/// unavailable", never to a crash before the app's first frame.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_inteniquetic_vanekotlin_VaneNative_initAndroid<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    _this: jni::objects::JObject<'local>,
+    context: jni::objects::JObject<'local>,
+) -> jni::sys::jboolean {
+    env.with_env(|env| -> Result<jni::sys::jboolean, jni::errors::Error> {
+        // A local ref is what this wants: it promotes the `Context` to a global
+        // itself, along with the class loader it reads off it.
+        rustls_platform_verifier::android::init_with_env(env, context)?;
+        ANDROID_TRUST_READY.store(true, Ordering::Release);
+        Ok(jni::sys::JNI_TRUE)
+    })
+    // Logs and returns 0 (`JNI_FALSE`) on error or panic; never throws, and
+    // never unwinds into the JVM.
+    .resolve::<jni::errors::LogErrorAndDefault>()
+}
+
+/// Refuses a TCP request that would otherwise reach an uninitialized verifier.
+///
+/// The message names the missing call on purpose: the alternative failure is a
+/// process abort with no mention of Android setup anywhere in the trace, which
+/// is a multi-hour diagnosis for a one-line fix.
+#[cfg(target_os = "android")]
+fn check_android_trust_ready() -> Result<(), VaneError> {
+    if ANDROID_TRUST_READY.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    Err(VaneError::Generic(
+        "Android platform trust store is not initialized, so the TCP transport \
+         (HTTP/2 and HTTP/1.1) cannot verify certificates. Vane's AAR does this \
+         automatically from its VaneInitProvider ContentProvider; if the merged \
+         manifest dropped that provider, or libvane.so was loaded without it, \
+         call Vane.initialize(context) once at startup. HTTP/3 does not need this."
+            .to_string(),
+    ))
+}
+
 fn tls_config(
     mode: &VaneProtocolMode,
     certificate_pins: HashMap<String, Vec<String>>,
 ) -> Result<ClientConfig, VaneError> {
+    // Before `Verifier::new`, not after: this is the only place a platform
+    // verifier is constructed, so every TCP request is covered by this one
+    // guard regardless of which entry point it came in through.
+    #[cfg(target_os = "android")]
+    check_android_trust_ready()?;
+
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let inner = rustls_platform_verifier::Verifier::new(provider.clone())
         .map_err(|e| VaneError::Generic(format!("Failed to build TLS verifier: {e}")))?;
@@ -411,12 +483,9 @@ fn follow_and_read(
             builder = builder.body(body.to_vec());
         }
 
-        let response = builder.send().map_err(|e| {
-            // `without_url` drops the URL reqwest appends to its Display, which
-            // would otherwise put query-string tokens into caller-visible
-            // errors and application logs.
-            VaneError::Generic(format!("HTTP request failed: {}", e.without_url()))
-        })?;
+        let response = builder
+            .send()
+            .map_err(|e| VaneError::Generic(format!("HTTP request failed: {}", describe(e))))?;
         // Belt and braces for the host we based every security decision on:
         // reqwest re-parses the URL with its own parser, so if the two ever
         // disagree about the host, fail closed instead of acting on ours.
@@ -485,6 +554,26 @@ fn follow_and_read(
         is_success: (200..=299).contains(&status_code),
         url: current.to_string(),
     })
+}
+
+/// Renders a reqwest error with its whole source chain.
+///
+/// reqwest's own `Display` is "error sending request" for everything from a
+/// refused connection to a rejected certificate — the part worth reading is
+/// always a source or two down, e.g. the rustls "invalid peer certificate"
+/// text. `without_url` still drops the URL reqwest appends to its own Display,
+/// which would otherwise put query-string tokens into caller-visible errors and
+/// application logs; no error further down the chain carries one.
+fn describe(error: reqwest::Error) -> String {
+    let error = error.without_url();
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        use std::fmt::Write as _;
+        let _ = write!(message, ": {cause}");
+        source = cause.source();
+    }
+    message
 }
 
 fn collect_set_cookie(response: &reqwest::blocking::Response) -> Vec<String> {

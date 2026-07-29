@@ -30,7 +30,16 @@ spki-pinning = ["dep:boring"]
 # for a feature that is off by default. The dot-and-IP-literal guard in
 # `domain_is_assignable` ships in both profiles either way.
 psl = ["dep:psl"]
-tcp-fallback = ["dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier"]
+tcp-fallback = ["dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier", "dep:jni"]
+
+# Android's trust store is only reachable over JNI, so the TCP path needs one
+# `Context` handshake before its first handshake. Pinned to the same 0.22 the
+# platform verifier itself depends on: `init_with_env` takes *its* `Env` type,
+# so a second jni version in the tree would not typecheck. Optional and
+# target-scoped, so --no-default-features links no JNI and no other platform
+# sees it.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.22", optional = true, default-features = false }
 
 [dev-dependencies]
 rcgen = "0.14"
