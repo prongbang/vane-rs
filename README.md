@@ -264,19 +264,61 @@ Dart callers get it for free. The C ABI `VaneFfiClientConfig` struct is raw:
 a zeroed struct means `connection_pool_enabled = false`, so direct C ABI
 callers must set the field themselves.
 
-Proxy configuration uses MASQUE/CONNECT-UDP over HTTP/3. Set `proxyUrl` to an
-HTTPS proxy endpoint such as `https://proxy.example.com:443`; classic
-`http://` CONNECT proxies are rejected because QUIC packets require UDP
-tunneling.
+`proxyUrl` is one setting read differently per transport, because the two
+transports need different proxy protocols:
+
+- HTTP/3 tunnels through it with MASQUE/CONNECT-UDP, so it must be an HTTPS
+  endpoint such as `https://proxy.example.com:443`. Classic `http://` CONNECT
+  proxies are rejected there because QUIC needs UDP tunneling.
+- The TCP path uses it as an ordinary HTTP CONNECT proxy, so `http://` and
+  `https://` proxies both work.
+
+`proxyAuthorization` is sent verbatim as the proxy authorization header on
+both.
 
 Protocol modes:
 
 - `Http3Only`: default. Use HTTP/3 over QUIC.
-- `Http3ThenHttp2ThenHttp1`: kept for source compatibility; this build still
-  uses HTTP/3 only.
-- `Http2ThenHttp1`, `Http2Only`, and `Http1Only`: kept for source
-  compatibility; requests fail because HTTP/1.1 and HTTP/2 fallback were
-  removed.
+- `Http3ThenHttp2ThenHttp1`: HTTP/3 first, falling back to the TCP path
+  (ALPN `h2`, then `http/1.1`) when the HTTP/3 *transport* fails. An HTTP
+  status is a successful exchange and never triggers a fallback; a cancelled
+  request is not replayed; and a method the retry policy refuses to replay
+  (`POST`/`PATCH` unless `retryUnsafeMethods` is set) is never re-sent over
+  TCP, because HTTP/3 can fail after the server already accepted the request.
+  The two transports are tried sequentially and each runs its own retry loop,
+  so worst case is `2 × retryMaxAttempts` requests and roughly
+  `2 × retryMaxAttempts × timeoutSeconds` of blocking.
+- `Http2ThenHttp1`: TCP with ALPN negotiating `h2` or `http/1.1`.
+- `Http2Only`: TCP with HTTP/2 prior knowledge.
+- `Http1Only`: TCP restricted to HTTP/1.1.
+
+The four TCP-using modes need the `tcp-fallback` Cargo feature, which is on by
+default. Built with `--no-default-features`, the artifact links no TCP stack at
+all and those modes return an explicit "fallback unavailable" error. On the TCP
+path, TLS is rustls (TLS 1.2 and 1.3), certificate pins are enforced by the same
+pin set and the same fail-closed check as HTTP/3, and the cookie jar, retry
+policy, body limits, progress and cancellation are the shared implementations.
+Redirects are followed there (up to 10 hops) when the request's
+`followRedirects` is set; the HTTP/3 path does not follow redirects. A hop is
+refused — and the 3xx handed back to the caller — if it would downgrade to
+`http://`, or if it would leave a host that has certificate pins configured,
+since a pin only constrains the hop it was checked on. Caller-supplied headers
+are dropped when a hop changes host (only `accept`, `accept-language`,
+`content-type` and `user-agent` survive), so an API key cannot follow a
+redirect to another origin. Cookies are re-derived per hop and `Set-Cookie` is
+stored from intermediate responses, scoped to the host that sent it.
+
+Neither path does transparent response decompression, and neither lets callers
+set connection-management or framing headers (`connection`, `content-length`,
+`host`, `keep-alive`, `proxy-connection`, `te`, `trailer`,
+`transfer-encoding`, `upgrade`).
+
+**Android needs one line of setup for the TCP path.** TLS there is verified
+against the platform trust store through JNI, which has to be handed a
+`Context` before the first request:
+`rustls_platform_verifier::android::init_with_env(&mut env, context)` from your
+JNI entry point. Without it, TCP requests fail closed. Apple platforms use
+SecTrust and need no setup.
 
 Cookies default to disabled. When enabled, Vane keeps an in-memory cookie jar
 inside each `VaneClient`/`VaneSession`. The jar handles common `Set-Cookie`

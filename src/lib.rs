@@ -1,5 +1,8 @@
 uniffi::setup_scaffolding!();
 
+#[cfg(feature = "tcp-fallback")]
+mod tcp;
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -46,6 +49,22 @@ const MAX_TLS_SESSIONS: usize = 8;
 /// overhead), so the key space is not a fixed pair of constants. Swap in an LRU
 /// only if config rebuilds show up in a profile.
 const MAX_QUIC_CONFIGS: usize = 8;
+/// Flat ceiling on the cookie jar; see `store_response_cookies`.
+const MAX_COOKIES: usize = 512;
+/// Headers the transport owns. Hop-by-hop names are illegal on HTTP/3
+/// (RFC 9114 4.2), and a caller-supplied framing header lets a request be
+/// framed differently by us and by an intermediary.
+const RESERVED_HEADERS: [&str; 9] = [
+    "connection",
+    "content-length",
+    "host",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
 
 static CANCEL_TOKENS: LazyLock<Mutex<HashMap<u64, Arc<AtomicBool>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -90,6 +109,8 @@ impl Url {
         let (scheme, rest) = input
             .split_once("://")
             .ok_or_else(|| "URL must include http:// or https:// scheme".to_string())?;
+        // Schemes are case-insensitive; "HTTPS://host/" is legal.
+        let scheme = scheme.to_ascii_lowercase();
         if scheme != "http" && scheme != "https" {
             return Err(format!("unsupported URL scheme {scheme}"));
         }
@@ -109,7 +130,7 @@ impl Url {
         let (path, query) = split_path_and_query(path_and_query);
 
         Ok(Self {
-            scheme: scheme.to_string(),
+            scheme,
             host,
             port,
             path,
@@ -118,7 +139,11 @@ impl Url {
     }
 
     fn join(&self, input: &str) -> Result<Self, String> {
-        if input.contains("://") {
+        // Absoluteness is decided by a scheme before the first path/query
+        // separator, not by "://" appearing anywhere: a relative target like
+        // `/login?return_to=https://app.example.com/` is the single most common
+        // SSO shape and must not be mistaken for an absolute URL.
+        if has_url_scheme(input) {
             return Self::parse(input);
         }
 
@@ -207,6 +232,20 @@ impl std::fmt::Display for Url {
     }
 }
 
+/// True when `input` starts with a URL scheme, i.e. a `:` that comes before any
+/// `/`, `?` or `#` and is preceded only by scheme characters.
+fn has_url_scheme(input: &str) -> bool {
+    let Some(colon) = input.find([':', '/', '?', '#']) else {
+        return false;
+    };
+    if input.as_bytes()[colon] != b':' || colon == 0 {
+        return false;
+    }
+    input[..colon]
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
 fn parse_authority(authority: &str) -> Result<(String, Option<u16>), String> {
     if authority.contains('@') {
         return Err("userinfo in URLs is not supported".to_string());
@@ -223,6 +262,9 @@ fn parse_authority(authority: &str) -> Result<(String, Option<u16>), String> {
         } else {
             return Err("invalid IPv6 authority".to_string());
         };
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err("bracketed host must be an IPv6 address".to_string());
+        }
         return Ok((format!("[{host}]"), port));
     }
 
@@ -242,8 +284,22 @@ fn parse_authority(authority: &str) -> Result<(String, Option<u16>), String> {
     if !host.is_ascii() {
         return Err("non-ASCII hosts are not supported; use punycode".to_string());
     }
+    // Every security decision downstream — certificate pins, cross-origin
+    // header stripping, cookie scoping — keys off this host, but the bytes we
+    // hand to a transport get re-parsed by that transport's own URL parser.
+    // Anything the two parsers could spell differently (backslash, tab,
+    // percent-escape, control characters) would let those decisions be made
+    // about a host we never actually connect to, so only the characters that
+    // are unambiguously part of a hostname are allowed through.
+    let host = host.to_ascii_lowercase();
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        return Err(format!("URL host contains unsupported characters: {host}"));
+    }
 
-    Ok((host.to_ascii_lowercase(), port))
+    Ok((host, port))
 }
 
 fn parse_port(port: &str) -> Result<u16, String> {
@@ -354,12 +410,15 @@ pub struct VaneProgressSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum VaneProtocolMode {
-    /// Kept for source compatibility; this build uses HTTP/3 only.
+    /// HTTP/3 first, falling back to HTTP/2 or HTTP/1.1 over TCP when the
+    /// HTTP/3 transport fails. Needs the `tcp-fallback` build feature.
     Http3ThenHttp2ThenHttp1,
     Http3Only,
-    /// Kept for source compatibility; HTTP/2 and HTTP/1.1 are unsupported.
+    /// TCP with ALPN negotiating HTTP/2 or HTTP/1.1. Needs `tcp-fallback`.
     Http2ThenHttp1,
+    /// TCP with HTTP/2 prior knowledge. Needs `tcp-fallback`.
     Http2Only,
+    /// TCP restricted to HTTP/1.1. Needs `tcp-fallback`.
     Http1Only,
 }
 
@@ -441,6 +500,7 @@ impl From<io::Error> for VaneError {
     }
 }
 
+#[cfg(not(feature = "tcp-fallback"))]
 fn unsupported_tcp_backend_error() -> VaneError {
     VaneError::Generic(
         "This Vane build supports HTTP/3 only; HTTP/1.1 and HTTP/2 fallback were removed"
@@ -500,10 +560,32 @@ pub struct VaneClient {
     certificate_pins: Mutex<HashMap<String, Vec<String>>>,
     quic_config: QuicConfigCache,
     tls_sessions: TlsSessionStore,
+    /// Built on first TCP use so HTTP/3-only applications never spin up a tokio
+    /// runtime, and cleared whenever the pins it was built with change.
+    #[cfg(feature = "tcp-fallback")]
+    tcp_client: Mutex<Option<reqwest::blocking::Client>>,
 }
 
 impl VaneClient {
     pub fn new(config: VaneClientConfig) -> Result<Self, VaneError> {
+        // One rule for both transports, checked once at construction: which
+        // transport ends up carrying a request depends on network conditions,
+        // so the proxy posture must not.
+        if let Some(proxy_url) = config.proxy_url.as_deref() {
+            let proxy = Url::parse(proxy_url).map_err(|e| {
+                VaneError::Generic(format!(
+                    "Invalid proxyUrl {}: {e}",
+                    redact_url_userinfo(proxy_url)
+                ))
+            })?;
+            if proxy.scheme() != "https" {
+                return Err(VaneError::Generic(
+                    "proxyUrl must use https://: a plaintext proxy exposes the CONNECT target \
+                     and proxyAuthorization on the local network"
+                        .to_string(),
+                ));
+            }
+        }
         let cookie_jar = if config.cookies_enabled {
             load_cookie_jar(config.cookie_persistence_path.as_deref())?
         } else {
@@ -517,19 +599,137 @@ impl VaneClient {
             certificate_pins: Mutex::new(certificate_pins),
             quic_config: Mutex::new(HashMap::new()),
             tls_sessions: Mutex::new(HashMap::new()),
+            #[cfg(feature = "tcp-fallback")]
+            tcp_client: Mutex::new(None),
         })
     }
 
     pub fn execute(&self, request: VaneRequest) -> Result<VaneResponse, VaneError> {
         let url = self.build_url(&request)?;
+        // Without the TCP backend these modes cannot work, so fail before
+        // touching the request body file.
+        #[cfg(not(feature = "tcp-fallback"))]
+        if matches!(
+            self.config.protocol_mode,
+            VaneProtocolMode::Http2ThenHttp1
+                | VaneProtocolMode::Http2Only
+                | VaneProtocolMode::Http1Only
+        ) {
+            return Err(unsupported_tcp_backend_error());
+        }
+        // Loaded once for every attempt on every transport: neither a retry nor
+        // a fallback may re-read the body file (it can change underneath us) or
+        // re-copy an in-memory body.
+        let request_body = load_request_body(&request)?;
+        validate_request_body_limit(&request_body, self.config.max_request_body_bytes)?;
+        let body = request_body.as_ref();
+
+        let result = self.dispatch(&request, &url, body);
+        // Marked done once, when the caller-visible request ends. Doing it per
+        // transport attempt would flip `done` true between the HTTP/3 failure
+        // and the TCP fallback, and a poller that latched it would stop early.
+        progress_done(progress_handle(request.progress_id).as_deref());
+        result
+    }
+
+    fn dispatch(
+        &self,
+        request: &VaneRequest,
+        url: &Url,
+        body: &[u8],
+    ) -> Result<VaneResponse, VaneError> {
         match self.config.protocol_mode {
-            VaneProtocolMode::Http3ThenHttp2ThenHttp1 | VaneProtocolMode::Http3Only => {
-                self.execute_with_retry(&request, &url)
+            VaneProtocolMode::Http3Only => self.execute_http3(request, url, body),
+            VaneProtocolMode::Http3ThenHttp2ThenHttp1 => {
+                let http3 = self.execute_http3(request, url, body);
+                // Only a transport failure falls through: an HTTP status is a
+                // successful exchange, and a cancelled request must stay
+                // cancelled rather than being replayed over TCP.
+                //
+                // ponytail: sequential, so a dead HTTP/3 path costs up to two
+                // timeouts. Happy-eyeballs-style racing is the upgrade path.
+                match http3 {
+                    Ok(response) => Ok(response),
+                    Err(err) if !self.tcp_fallback_enabled() => Err(err),
+                    // A method the retry policy refuses to replay must not be
+                    // replayed by the fallback either. HTTP/3 can fail *after*
+                    // the server accepted the request — response over the body
+                    // limit, connection lost mid-response — so re-sending a
+                    // POST here would create the resource a second time.
+                    Err(err)
+                        if !is_retryable_method(
+                            &request.method,
+                            self.config.retry_unsafe_methods,
+                        ) =>
+                    {
+                        Err(err)
+                    }
+                    Err(err) => {
+                        if check_cancelled(cancel_token(request.cancel_token_id).as_deref())
+                            .is_err()
+                        {
+                            return Err(err);
+                        }
+                        // ponytail: `VaneError` is one opaque variant, so a
+                        // non-transport failure (body limit, bad body file)
+                        // also costs one wasted TCP attempt. Classifying needs
+                        // an error-shape change, which is an ABI change.
+                        self.execute_tcp(request, url, body).map_err(|tcp_err| {
+                            // Both transports failed: reporting only one of
+                            // them sends whoever debugs this down the wrong
+                            // path. Still a single opaque variant, so the
+                            // error shape callers see is unchanged.
+                            VaneError::Generic(format!(
+                                "HTTP/3 transport failed ({err}); TCP fallback also failed \
+                                 ({tcp_err})"
+                            ))
+                        })
+                    }
+                }
             }
             VaneProtocolMode::Http2ThenHttp1
             | VaneProtocolMode::Http2Only
-            | VaneProtocolMode::Http1Only => Err(unsupported_tcp_backend_error()),
+            | VaneProtocolMode::Http1Only => self.execute_tcp(request, url, body),
         }
+    }
+
+    fn execute_http3(
+        &self,
+        request: &VaneRequest,
+        url: &Url,
+        body: &[u8],
+    ) -> Result<VaneResponse, VaneError> {
+        self.execute_with_retry(request, || self.execute_http3_once(request, url, body))
+    }
+
+    #[cfg(feature = "tcp-fallback")]
+    fn tcp_fallback_enabled(&self) -> bool {
+        true
+    }
+
+    #[cfg(not(feature = "tcp-fallback"))]
+    fn tcp_fallback_enabled(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "tcp-fallback")]
+    fn execute_tcp(
+        &self,
+        request: &VaneRequest,
+        url: &Url,
+        body: &[u8],
+    ) -> Result<VaneResponse, VaneError> {
+        self.execute_with_retry(request, || tcp::execute_tcp_once(self, request, url, body))
+    }
+
+    #[cfg(not(feature = "tcp-fallback"))]
+    fn execute_tcp(
+        &self,
+        _request: &VaneRequest,
+        _url: &Url,
+        _body: &[u8],
+    ) -> Result<VaneResponse, VaneError> {
+        Err(unsupported_tcp_backend_error())
     }
 
     fn build_url(&self, request: &VaneRequest) -> Result<Url, VaneError> {
@@ -550,21 +750,18 @@ impl VaneClient {
         }
     }
 
+    /// Runs one transport's attempt closure under the shared retry policy.
     fn execute_with_retry(
         &self,
         request: &VaneRequest,
-        url: &Url,
+        attempt_once: impl Fn() -> Result<VaneResponse, VaneError>,
     ) -> Result<VaneResponse, VaneError> {
-        // Loaded once for every attempt: a retry must not re-read the body file
-        // (it may have changed) and must not re-copy an in-memory body.
-        let request_body = load_request_body(request)?;
-        validate_request_body_limit(&request_body, self.config.max_request_body_bytes)?;
         let max_attempts = self.config.retry_max_attempts.max(1);
         let mut attempt = 1u64;
         let mut last_error = None;
 
         while attempt <= max_attempts {
-            match self.execute_http3_once(request, url, &request_body) {
+            match attempt_once() {
                 Ok(response) => {
                     if should_retry_response(
                         &request.method,
@@ -678,7 +875,6 @@ impl VaneClient {
                     if self.config.cookies_enabled {
                         self.store_response_cookies(url, &response.set_cookie_headers)?;
                     }
-                    progress_done(progress.as_deref());
                     // The server's NewSessionTicket normally lands after the
                     // handshake loop already returned, so this is the point
                     // where a resumable ticket actually exists.
@@ -718,7 +914,6 @@ impl VaneClient {
                         continue;
                     }
 
-                    progress_done(progress.as_deref());
                     return Err(err);
                 }
             }
@@ -973,6 +1168,9 @@ impl VaneClient {
     ) -> Result<(), VaneError> {
         validate_certificate_pin_host(&host)?;
         validate_certificate_pins(&pins)?;
+        // Every lookup lowercases, so storing "API.Example.com" verbatim would
+        // create a pin that can never match — a silently unpinned host.
+        let host = host.to_ascii_lowercase();
         // Stored tickets for this host were minted under the old trust context,
         // and a resumed handshake would skip the certificate exchange the new
         // pins need to be checked against. Drops every port and hop role for
@@ -982,6 +1180,21 @@ impl VaneClient {
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|key, _| key.host != host);
         {
+            // The TCP client's TLS verifier holds a snapshot of the pins, so it
+            // has to be rebuilt rather than reused with a stale pin set. The
+            // guard is held across the pins write, and the lock order here
+            // (tcp_client -> certificate_pins) matches `shared_client`: without
+            // that, a build racing this invalidation could publish a client
+            // carrying the pre-change pins and never be rebuilt, silently
+            // dropping to platform-verification-only for the process lifetime.
+            #[cfg(feature = "tcp-fallback")]
+            let mut tcp_client = self
+                .tcp_client
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            #[cfg(feature = "tcp-fallback")]
+            tcp_client.take();
+
             let mut configured = self
                 .certificate_pins
                 .lock()
@@ -1042,6 +1255,13 @@ impl VaneClient {
             if let Some(cookie) = StoredCookie::parse(url, header) {
                 jar.retain(|existing| !existing.same_key(&cookie));
                 if !cookie.is_expired(now_epoch_seconds()) {
+                    // ponytail: oldest-first eviction at a flat cap, not
+                    // per-domain quotas as RFC 6265 5.3 suggests. A redirect
+                    // chain can plant one cookie per hop, so the jar needs
+                    // *some* bound; refine if a real workload needs it.
+                    if jar.len() >= MAX_COOKIES {
+                        jar.remove(0);
+                    }
                     jar.push(cookie);
                 }
             }
@@ -1308,7 +1528,10 @@ impl StoredCookie {
             match key.trim().to_ascii_lowercase().as_str() {
                 "domain" => {
                     let domain = value.trim().trim_start_matches('.').to_ascii_lowercase();
-                    if domain.is_empty() || !domain_matches(&origin_host, &domain) {
+                    if domain.is_empty()
+                        || !domain_is_assignable(&origin_host, &domain)
+                        || !domain_matches(&origin_host, &domain)
+                    {
                         return None;
                     }
                     cookie.domain = domain;
@@ -1459,8 +1682,12 @@ struct MasqueProxyConfig {
 
 impl MasqueProxyConfig {
     fn parse(proxy_url: &str) -> Result<Self, VaneError> {
-        let url = Url::parse(proxy_url)
-            .map_err(|e| VaneError::Generic(format!("Invalid proxyUrl {proxy_url}: {e}")))?;
+        let url = Url::parse(proxy_url).map_err(|e| {
+            VaneError::Generic(format!(
+                "Invalid proxyUrl {}: {e}",
+                redact_url_userinfo(proxy_url)
+            ))
+        })?;
         if url.scheme() != "https" {
             return Err(VaneError::Generic(
                 "HTTP/3 proxyUrl must use https:// for MASQUE/CONNECT-UDP".to_string(),
@@ -2014,7 +2241,7 @@ fn perform_http3_request(
     let mut body_offset = 0usize;
     let deadline = Instant::now() + options.timeout;
     let mut response =
-        H3ResponseState::new(options.max_response_body_bytes, options.response_body_path)?;
+        ResponseState::new(options.max_response_body_bytes, options.response_body_path)?;
 
     // Send before the first read: the read blocks for up to 50 ms, so reading
     // first delays the request by a full poll interval on every attempt. The
@@ -2252,6 +2479,19 @@ fn verify_certificate_pins(
     )))
 }
 
+/// Replaces any `user:password@` in a URL before it reaches an error message.
+/// Proxy URLs routinely carry credentials, and these errors surface to callers
+/// and into application logs.
+fn redact_url_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    match rest.split_once('@') {
+        Some((_, host)) => format!("{scheme}://***@{host}"),
+        None => url.to_string(),
+    }
+}
+
 fn validate_certificate_pin_host(host: &str) -> Result<(), VaneError> {
     if host.is_empty() {
         return Err(VaneError::Generic(
@@ -2266,6 +2506,14 @@ fn validate_certificate_pin_host(host: &str) -> Result<(), VaneError> {
     if !host.is_ascii() {
         return Err(VaneError::Generic(
             "Certificate pin host must be ASCII; use punycode for IDN hosts".to_string(),
+        ));
+    }
+    // A pin keyed "host:443" could never match: every lookup uses the bare
+    // host, so accepting it would silently leave the host unpinned.
+    let bare = host.strip_prefix('[').and_then(|r| r.split_once(']'));
+    if bare.map_or(host, |(_, after)| after).contains(':') {
+        return Err(VaneError::Generic(
+            "Certificate pin host must not include a port".to_string(),
         ));
     }
     Ok(())
@@ -2341,6 +2589,39 @@ fn domain_matches(host: &str, domain: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
+/// RFC 6265 5.3 step 5: a `Domain` attribute that is itself a public suffix
+/// must be ignored, or any host we talk to could set a cookie for every site
+/// under `com` (or `co.uk`, or `github.io`) and shadow a real session cookie.
+///
+/// `domain_matches` alone says `evil.com` matches `com`, so this is the check
+/// that stops it.
+///
+/// The two cheap rules below ship in every build. The `psl` feature (on by
+/// default, dropped by the small profile) layers the full public suffix list on
+/// top so multi-label suffixes like `co.uk` and `github.io` are refused too;
+/// it does not replace them, since the list says nothing about IP literals.
+/// Without `psl`, bare-TLD supercookies are still blocked and multi-label
+/// public suffixes are not — see ARTIFACT_SIZES.md.
+fn domain_is_assignable(host: &str, domain: &str) -> bool {
+    // An IP literal has no domain hierarchy: "10.0.0.1" domain-matches "1".
+    if host.starts_with('[') || host.parse::<IpAddr>().is_ok() {
+        return false;
+    }
+    // A single-label Domain is a bare TLD.
+    if !domain.contains('.') {
+        return false;
+    }
+
+    #[cfg(feature = "psl")]
+    if let Some(suffix) = psl::suffix_str(domain) {
+        // The attribute must name something strictly narrower than the
+        // registrable suffix it sits under.
+        return domain.len() > suffix.len() && domain.ends_with(suffix);
+    }
+
+    true
+}
+
 fn path_matches(request_path: &str, cookie_path: &str) -> bool {
     if request_path == cookie_path {
         return true;
@@ -2358,7 +2639,7 @@ fn path_matches(request_path: &str, cookie_path: &str) -> bool {
 fn validate_request_body_limit(body: &[u8], max_request_body_bytes: u64) -> Result<(), VaneError> {
     if body.len() as u64 > max_request_body_bytes {
         return Err(VaneError::Generic(format!(
-            "HTTP/3 request body exceeded {max_request_body_bytes} bytes"
+            "Request body exceeded {max_request_body_bytes} bytes"
         )));
     }
 
@@ -2388,7 +2669,7 @@ fn validate_response_body_limit(
 ) -> Result<(), VaneError> {
     if current_len as u64 + read_len as u64 > max_response_body_bytes {
         return Err(VaneError::Generic(format!(
-            "HTTP/3 response body exceeded {max_response_body_bytes} bytes"
+            "Response body exceeded {max_response_body_bytes} bytes"
         )));
     }
 
@@ -2411,10 +2692,14 @@ fn check_cancelled(cancel_token: Option<&AtomicBool>) -> Result<(), VaneError> {
 }
 
 fn progress_init(progress_id: Option<u64>, upload_total: u64) -> Option<Arc<VaneProgressState>> {
-    let id = progress_id?;
-    let state = PROGRESS_STATES.lock().ok()?.entry(id).or_default().clone();
+    let state = progress_handle(progress_id)?;
     state.reset(upload_total);
     Some(state)
+}
+
+fn progress_handle(progress_id: Option<u64>) -> Option<Arc<VaneProgressState>> {
+    let id = progress_id?;
+    Some(PROGRESS_STATES.lock().ok()?.entry(id).or_default().clone())
 }
 
 fn progress_upload(progress: Option<&VaneProgressState>, sent: u64, total: u64) {
@@ -2550,33 +2835,56 @@ fn build_h3_headers(
         user_agent.as_bytes(),
     ));
 
-    for (key, value) in &config.default_headers {
-        push_regular_header(&mut headers, key, value)?;
-    }
-    for (key, value) in &request.headers {
-        push_regular_header(&mut headers, key, value)?;
-    }
-    if let Some(cookie_header) = cookie_header.filter(|header| !header.is_empty()) {
-        push_regular_header(&mut headers, "cookie", cookie_header)?;
-    }
+    for_each_regular_header(request, config, cookie_header, |key, value| {
+        headers.push(quiche::h3::Header::new(
+            key.to_ascii_lowercase().as_bytes(),
+            value.as_bytes(),
+        ));
+        Ok(())
+    })?;
 
     Ok(headers)
 }
 
-fn push_regular_header(
-    headers: &mut Vec<quiche::h3::Header>,
-    key: &str,
-    value: &str,
+/// Walks the non-pseudo request headers in the order both transports must send
+/// them: client defaults, then per-request overrides, then the cookie jar.
+///
+/// Shared so the TCP backend cannot drift from the HTTP/3 backend on which
+/// headers a request carries or which ones callers are allowed to set.
+fn for_each_regular_header(
+    request: &VaneRequest,
+    config: &VaneClientConfig,
+    cookie_header: Option<&str>,
+    mut push: impl FnMut(&str, &str) -> Result<(), VaneError>,
 ) -> Result<(), VaneError> {
-    if key.starts_with(':') {
-        return Err(VaneError::Generic(format!(
-            "HTTP/3 pseudo-header cannot be set by callers: {key}"
-        )));
+    let mut push_checked = |key: &str, value: &str| -> Result<(), VaneError> {
+        if key.starts_with(':') {
+            return Err(VaneError::Generic(format!(
+                "HTTP/3 pseudo-header cannot be set by callers: {key}"
+            )));
+        }
+        // Connection-management and framing headers are the transport's to set.
+        // hyper honours a caller `content-length` over the real body length,
+        // which is a request-smuggling shape against intermediaries, and
+        // RFC 9114 4.2 makes the hop-by-hop names illegal on HTTP/3 outright.
+        if RESERVED_HEADERS
+            .iter()
+            .any(|reserved| key.eq_ignore_ascii_case(reserved))
+        {
+            return Err(VaneError::Generic(format!(
+                "Header cannot be set by callers: {key}"
+            )));
+        }
+        push(key, value)
+    };
+
+    for (key, value) in config.default_headers.iter().chain(&request.headers) {
+        push_checked(key, value)?;
     }
-    headers.push(quiche::h3::Header::new(
-        key.to_ascii_lowercase().as_bytes(),
-        value.as_bytes(),
-    ));
+    if let Some(cookie_header) = cookie_header.filter(|header| !header.is_empty()) {
+        push_checked("cookie", cookie_header)?;
+    }
+
     Ok(())
 }
 
@@ -2654,7 +2962,7 @@ fn flush_quic_packets(
     Ok(())
 }
 
-struct H3ResponseState {
+struct ResponseState {
     status_code: u16,
     headers: HashMap<String, String>,
     set_cookie_headers: Vec<String>,
@@ -2667,7 +2975,7 @@ struct H3ResponseState {
     download_total: u64,
 }
 
-impl H3ResponseState {
+impl ResponseState {
     fn new(max_body_bytes: u64, body_file_path: Option<&str>) -> Result<Self, VaneError> {
         let body_file = match body_file_path {
             Some(path) if !path.is_empty() => Some(File::create(path).map_err(|e| {
@@ -2725,7 +3033,7 @@ fn process_h3_events(
     http3: &mut quiche::h3::Connection,
     conn: &mut quiche::Connection,
     buf: &mut [u8],
-    response: &mut H3ResponseState,
+    response: &mut ResponseState,
     cancel_token: Option<&AtomicBool>,
     progress: Option<&VaneProgressState>,
     response_started: &mut bool,
@@ -3482,6 +3790,24 @@ fn ffi_bytes<'a>(data: *const u8, len: usize) -> Result<&'a [u8], String> {
     Ok(unsafe { std::slice::from_raw_parts(data, len) })
 }
 
+/// Shared by the unit tests in this file and in `tcp::tests`.
+#[cfg(all(test, feature = "tcp-fallback"))]
+fn test_request(url: &str) -> VaneRequest {
+    VaneRequest {
+        url: url.to_string(),
+        method: "GET".to_string(),
+        headers: HashMap::new(),
+        query_params: HashMap::new(),
+        body: None,
+        body_file_path: None,
+        response_body_path: None,
+        cancel_token_id: None,
+        progress_id: None,
+        timeout_seconds: None,
+        follow_redirects: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3689,20 +4015,38 @@ mod tests {
     }
 
     #[test]
-    fn http3_backend_requires_https_proxy_for_masque() {
-        let client = VaneClient::new(VaneClientConfig {
-            protocol_mode: VaneProtocolMode::Http3Only,
+    fn plaintext_proxies_are_rejected_for_both_transports() {
+        fn client_error(config: VaneClientConfig) -> String {
+            match VaneClient::new(config) {
+                Ok(_) => panic!("client construction should have failed"),
+                Err(err) => err.to_string(),
+            }
+        }
+
+        // Checked at construction so the posture cannot depend on which
+        // transport ends up carrying the request.
+        let err = client_error(VaneClientConfig {
             proxy_url: Some("http://proxy.example.com:8080".to_string()),
             ..VaneClientConfig::default()
-        })
-        .unwrap();
+        });
 
-        let err = client
-            .execute(request("https://api.example.com/users"))
-            .unwrap_err();
+        assert!(err.contains("proxyUrl must use https://"), "got {err}");
+        assert!(err.contains("proxyAuthorization"), "got {err}");
 
-        assert!(err.to_string().contains("proxyUrl must use https://"));
-        assert!(err.to_string().contains("MASQUE/CONNECT-UDP"));
+        // Credentials in a bad proxy URL must not reach the error string.
+        let err = client_error(VaneClientConfig {
+            proxy_url: Some("http://user:hunter2@proxy.example.com".to_string()),
+            ..VaneClientConfig::default()
+        });
+        assert!(!err.contains("hunter2"), "proxy password leaked: {err}");
+
+        assert!(
+            VaneClient::new(VaneClientConfig {
+                proxy_url: Some("https://proxy.example.com:443".to_string()),
+                ..VaneClientConfig::default()
+            })
+            .is_ok()
+        );
     }
 
     #[test]
@@ -3739,21 +4083,226 @@ mod tests {
         assert_eq!(masque_path_component("2001:db8::1"), "2001%3Adb8%3A%3A1");
     }
 
+    #[cfg(not(feature = "tcp-fallback"))]
     #[test]
-    fn tcp_modes_report_that_fallback_was_removed() {
+    fn tcp_modes_report_that_fallback_is_unavailable() {
+        for mode in [
+            VaneProtocolMode::Http2ThenHttp1,
+            VaneProtocolMode::Http2Only,
+            VaneProtocolMode::Http1Only,
+        ] {
+            let client = VaneClient::new(VaneClientConfig {
+                protocol_mode: mode,
+                ..VaneClientConfig::default()
+            })
+            .unwrap();
+
+            let err = client
+                .execute(request("https://api.example.com/users"))
+                .unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains("HTTP/3 only; HTTP/1.1 and HTTP/2 fallback were removed")
+            );
+        }
+    }
+
+    /// Loopback port 1 refuses immediately, so this reaches the TCP backend and
+    /// forces the client to actually build — TLS config, root store, pinned
+    /// verifier and mode flags — without depending on the network.
+    #[cfg(feature = "tcp-fallback")]
+    fn assert_reaches_tcp_backend(mode: VaneProtocolMode) {
         let client = VaneClient::new(VaneClientConfig {
-            protocol_mode: VaneProtocolMode::Http2ThenHttp1,
+            protocol_mode: mode.clone(),
+            timeout_seconds: Some(1),
             ..VaneClientConfig::default()
         })
         .unwrap();
 
         let err = client
-            .execute(request("https://api.example.com/users"))
-            .unwrap_err();
+            .execute(request("https://127.0.0.1:1/"))
+            .unwrap_err()
+            .to_string();
 
         assert!(
-            err.to_string()
-                .contains("HTTP/3 only; HTTP/1.1 and HTTP/2 fallback were removed")
+            !err.contains("fallback were removed"),
+            "{mode:?} should dispatch to the TCP backend, got {err}"
+        );
+        assert!(
+            err.contains("HTTP request failed"),
+            "{mode:?} should fail at the TCP transport, got {err}"
+        );
+    }
+
+    #[cfg(feature = "tcp-fallback")]
+    #[test]
+    fn tcp_only_modes_dispatch_to_the_tcp_backend() {
+        assert_reaches_tcp_backend(VaneProtocolMode::Http2ThenHttp1);
+        assert_reaches_tcp_backend(VaneProtocolMode::Http2Only);
+        assert_reaches_tcp_backend(VaneProtocolMode::Http1Only);
+    }
+
+    #[cfg(feature = "tcp-fallback")]
+    #[test]
+    fn http3_then_tcp_mode_falls_back_after_the_http3_transport_fails() {
+        // HTTP/3 cannot hand back a response here, so reaching a TCP transport
+        // error proves the fallback engaged rather than surfacing the H3 error.
+        assert_reaches_tcp_backend(VaneProtocolMode::Http3ThenHttp2ThenHttp1);
+
+        let client = VaneClient::new(VaneClientConfig {
+            protocol_mode: VaneProtocolMode::Http3ThenHttp2ThenHttp1,
+            timeout_seconds: Some(1),
+            ..VaneClientConfig::default()
+        })
+        .unwrap();
+        let err = client
+            .execute(request("https://127.0.0.1:1/"))
+            .unwrap_err()
+            .to_string();
+
+        // When both transports fail the caller needs to see both.
+        assert!(err.contains("HTTP/3 transport failed"), "got {err}");
+        assert!(err.contains("TCP fallback also failed"), "got {err}");
+    }
+
+    /// Transport-level only: the endpoint just has to speak HTTPS over TCP, so
+    /// this asserts a status, headers and a readable body — not any particular
+    /// response shape.
+    #[cfg(feature = "tcp-fallback")]
+    fn assert_live_tcp_get(mode: VaneProtocolMode) {
+        let Some(base_url) = live_https_base_url() else {
+            return;
+        };
+
+        let client = VaneClient::new(VaneClientConfig {
+            base_url: Some(base_url),
+            protocol_mode: mode.clone(),
+            timeout_seconds: Some(30),
+            ..VaneClientConfig::default()
+        })
+        .unwrap();
+
+        let response = client
+            .get_request("/".to_string())
+            .unwrap_or_else(|err| panic!("{mode:?} GET over TCP should succeed: {err}"));
+
+        assert!(
+            response.status_code >= 100,
+            "{mode:?} should return a status line"
+        );
+        assert!(
+            !response.headers.is_empty(),
+            "{mode:?} should return response headers"
+        );
+    }
+
+    #[cfg(feature = "tcp-fallback")]
+    #[test]
+    fn live_http1_only_get_over_tcp_when_base_url_is_set() {
+        assert_live_tcp_get(VaneProtocolMode::Http1Only);
+    }
+
+    #[cfg(feature = "tcp-fallback")]
+    #[test]
+    fn live_http2_then_http1_get_over_tcp_when_base_url_is_set() {
+        assert_live_tcp_get(VaneProtocolMode::Http2ThenHttp1);
+    }
+
+    #[cfg(feature = "tcp-fallback")]
+    #[test]
+    fn non_idempotent_methods_never_fall_back_to_tcp() {
+        // HTTP/3 can fail after the server already accepted the request, so
+        // replaying a POST over TCP would create the resource twice. The
+        // fallback must honour the same rule the retry policy does.
+        for (method, unsafe_methods, may_fall_back) in [
+            ("POST", false, false),
+            ("PATCH", false, false),
+            ("POST", true, true),
+            ("GET", false, true),
+            ("PUT", false, true),
+        ] {
+            let client = VaneClient::new(VaneClientConfig {
+                protocol_mode: VaneProtocolMode::Http3ThenHttp2ThenHttp1,
+                retry_unsafe_methods: unsafe_methods,
+                timeout_seconds: Some(1),
+                ..VaneClientConfig::default()
+            })
+            .unwrap();
+            let mut req = request("https://127.0.0.1:1/");
+            req.method = method.to_string();
+
+            let err = client.execute(req).unwrap_err().to_string();
+
+            assert_eq!(
+                err.contains("TCP fallback also failed"),
+                may_fall_back,
+                "{method} (retry_unsafe_methods={unsafe_methods}) fallback decision wrong: {err}"
+            );
+        }
+    }
+
+    /// An HTTP status is a completed exchange. Falling back on one would send
+    /// the request a second time over a different transport.
+    #[cfg(feature = "tcp-fallback")]
+    #[test]
+    fn http3_non_2xx_responses_never_reach_the_fallback() {
+        let Some(base_url) = live_https_base_url() else {
+            return;
+        };
+        let client = VaneClient::new(VaneClientConfig {
+            base_url: Some(base_url),
+            protocol_mode: VaneProtocolMode::Http3ThenHttp2ThenHttp1,
+            timeout_seconds: Some(30),
+            ..VaneClientConfig::default()
+        })
+        .unwrap();
+
+        let response = client
+            .get_request("/vane-nonexistent-path-for-status-test".to_string())
+            .expect("a non-2xx status is a successful exchange, not a transport failure");
+
+        assert!(response.status_code >= 400, "expected an error status");
+        assert!(!response.is_success);
+    }
+
+    #[cfg(not(feature = "tcp-fallback"))]
+    #[test]
+    fn http3_then_tcp_mode_returns_the_raw_http3_error_without_the_feature() {
+        let client = VaneClient::new(VaneClientConfig {
+            protocol_mode: VaneProtocolMode::Http3ThenHttp2ThenHttp1,
+            timeout_seconds: Some(1),
+            ..VaneClientConfig::default()
+        })
+        .unwrap();
+
+        let err = client
+            .execute(request("http://api.example.com/users"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("https:// URLs"), "got {err}");
+        assert!(!err.contains("TCP fallback"), "got {err}");
+    }
+
+    #[cfg(feature = "tcp-fallback")]
+    #[test]
+    fn http3_only_mode_never_falls_back_to_tcp() {
+        let client = VaneClient::new(VaneClientConfig {
+            protocol_mode: VaneProtocolMode::Http3Only,
+            timeout_seconds: Some(1),
+            ..VaneClientConfig::default()
+        })
+        .unwrap();
+
+        let err = client
+            .execute(request("https://127.0.0.1:1/"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            !err.contains("HTTP request failed"),
+            "Http3Only must not reach the TCP backend, got {err}"
         );
     }
 
@@ -3913,9 +4462,13 @@ mod tests {
 
     #[test]
     fn pseudo_headers_are_rejected() {
-        let mut headers = Vec::new();
+        // Both transports funnel through this, so one check covers both.
+        let mut req = request("https://example.com/items");
+        req.headers
+            .insert(":authority".to_string(), "example.com".to_string());
 
-        let err = push_regular_header(&mut headers, ":authority", "example.com").unwrap_err();
+        let err = for_each_regular_header(&req, &VaneClientConfig::default(), None, |_, _| Ok(()))
+            .unwrap_err();
 
         assert!(err.to_string().contains("pseudo-header"));
     }
@@ -3975,7 +4528,7 @@ mod tests {
     fn request_body_limit_rejects_oversized_body() {
         let err = validate_request_body_limit(b"abcd", 3).unwrap_err();
 
-        assert!(err.to_string().contains("request body exceeded 3 bytes"));
+        assert!(err.to_string().contains("Request body exceeded 3 bytes"));
         assert!(validate_request_body_limit(b"abc", 3).is_ok());
     }
 
@@ -3983,7 +4536,7 @@ mod tests {
     fn response_body_limit_rejects_oversized_body() {
         let err = validate_response_body_limit(3, 2, 4).unwrap_err();
 
-        assert!(err.to_string().contains("response body exceeded 4 bytes"));
+        assert!(err.to_string().contains("Response body exceeded 4 bytes"));
         assert!(validate_response_body_limit(3, 1, 4).is_ok());
     }
 
@@ -4015,6 +4568,103 @@ mod tests {
 
         let delete = StoredCookie::parse(&url, "session=deleted; Path=/v1; Max-Age=0").unwrap();
         assert!(delete.is_expired(now_epoch_seconds()));
+    }
+
+    /// Ships in both profiles: `domain_matches("evil.com", "com")` is true, so
+    /// without this any host could plant a cookie for every *.com site and
+    /// shadow a real session cookie.
+    #[test]
+    fn cookie_domain_cannot_be_a_bare_tld_or_an_ip_literal() {
+        let url = Url::parse("https://evil.com/x").unwrap();
+        for domain in ["com", "net", "org", "io"] {
+            assert!(
+                StoredCookie::parse(&url, &format!("session=x; Domain={domain}")).is_none(),
+                "Domain={domain} must be refused"
+            );
+        }
+
+        // One label narrower than the suffix is legitimate.
+        let ok = StoredCookie::parse(&url, "session=x; Domain=evil.com").unwrap();
+        assert_eq!(ok.domain, "evil.com");
+        assert!(!ok.host_only);
+
+        // An IP literal has no domain hierarchy: "10.0.0.1" domain-matches "1".
+        let ip = Url::parse("https://10.0.0.1/x").unwrap();
+        assert!(StoredCookie::parse(&ip, "session=x; Domain=1").is_none());
+        assert!(StoredCookie::parse(&ip, "session=x; Domain=0.0.1").is_none());
+        assert!(StoredCookie::parse(&ip, "session=x; Domain=10.0.0.1").is_none());
+        let ipv6 = Url::parse("https://[::1]/x").unwrap();
+        assert!(StoredCookie::parse(&ipv6, "session=x; Domain=::1").is_none());
+    }
+
+    /// Only the full public suffix list can see that `co.uk` is a suffix; the
+    /// dot rule cannot.
+    #[cfg(feature = "psl")]
+    #[test]
+    fn cookie_domain_cannot_be_a_multi_label_public_suffix() {
+        for (origin, domain) in [
+            ("https://evil.co.uk/x", "co.uk"),
+            ("https://evil.github.io/x", "github.io"),
+            ("https://evil.com.au/x", "com.au"),
+        ] {
+            let url = Url::parse(origin).unwrap();
+            assert!(
+                StoredCookie::parse(&url, &format!("session=x; Domain={domain}")).is_none(),
+                "Domain={domain} must be refused with the psl feature on"
+            );
+        }
+
+        // A registrable name under a multi-label suffix is still assignable.
+        let url = Url::parse("https://api.evil.co.uk/x").unwrap();
+        let ok = StoredCookie::parse(&url, "session=x; Domain=evil.co.uk").unwrap();
+        assert_eq!(ok.domain, "evil.co.uk");
+    }
+
+    /// Pins the small profile's actual posture so the gap is a tested fact
+    /// rather than a claim in a document: bare TLDs and IP literals are still
+    /// refused, multi-label public suffixes are not.
+    #[cfg(not(feature = "psl"))]
+    #[test]
+    fn cookie_domain_without_psl_still_blocks_bare_tlds_but_not_multi_label_suffixes() {
+        let url = Url::parse("https://evil.com/x").unwrap();
+        assert!(StoredCookie::parse(&url, "session=x; Domain=com").is_none());
+
+        let ip = Url::parse("https://10.0.0.1/x").unwrap();
+        assert!(StoredCookie::parse(&ip, "session=x; Domain=1").is_none());
+
+        // Known gap without the public suffix list.
+        let couk = Url::parse("https://evil.co.uk/x").unwrap();
+        assert!(StoredCookie::parse(&couk, "session=x; Domain=co.uk").is_some());
+    }
+
+    #[test]
+    fn hosts_two_url_parsers_could_spell_differently_are_rejected() {
+        // Every pin, cross-origin and cookie decision keys off our host, but the
+        // transport re-parses the URL with its own parser. Anything the two
+        // could read differently must not parse at all.
+        for hostile in [
+            "https://attacker.test\\.api.victim.com/y",
+            "https://attacker.test\t.api.victim.com/y",
+            "https://attacker%2etest/y",
+            "https://attacker.test\u{7f}.victim.com/y",
+            "https://[not-an-ipv6]/y",
+        ] {
+            assert!(
+                Url::parse(hostile).is_err(),
+                "{hostile} must be rejected outright"
+            );
+        }
+
+        // Ordinary hosts, IPv6 literals and uppercase schemes still work.
+        assert_eq!(
+            Url::parse("HTTPS://API.Example.com/y").unwrap().to_string(),
+            "https://api.example.com/y"
+        );
+        assert_eq!(
+            Url::parse("https://[::1]:8443/y").unwrap().host_str(),
+            Some("[::1]")
+        );
+        assert!(Url::parse("https://my-host_1.example.com/y").is_ok());
     }
 
     #[test]
@@ -4243,7 +4893,7 @@ mod tests {
 
     #[test]
     fn content_length_sets_download_total_and_caps_the_reservation() {
-        let mut response = H3ResponseState::new(64 * 1024 * 1024, None).unwrap();
+        let mut response = ResponseState::new(64 * 1024 * 1024, None).unwrap();
 
         response.on_content_length("not-a-number");
         assert_eq!(response.body.capacity(), 0);
@@ -4259,7 +4909,7 @@ mod tests {
         assert!(response.body.capacity() <= MAX_BODY_RESERVE_BYTES as usize);
 
         // The configured limit still wins when it is the smaller cap.
-        let mut small = H3ResponseState::new(1_024, None).unwrap();
+        let mut small = ResponseState::new(1_024, None).unwrap();
         small.on_content_length("999999999999");
         assert!(small.body.capacity() <= 1_024);
     }

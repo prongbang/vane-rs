@@ -1,0 +1,589 @@
+//! TCP fallback backend: HTTP/1.1 and HTTP/2 over TLS 1.2/1.3.
+//!
+//! Gated behind the `tcp-fallback` feature so the HTTP/3-only artifact never
+//! links reqwest, hyper, tokio or rustls. Everything user-visible — the cookie
+//! jar, retry policy, body limits, progress, cancellation and certificate pins
+//! — is the same machinery the HTTP/3 path uses, so the two transports are
+//! interchangeable from the caller's side.
+
+use std::collections::HashMap;
+use std::io::{self, Read};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, PoisonError};
+use std::time::Instant;
+
+use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::redirect;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+
+use super::{
+    H3_BODY_BUFFER_BYTES, ResponseState, Url, VaneClient, VaneError, VaneProgressState,
+    VaneProtocolMode, VaneRequest, VaneResponse, cancel_token, check_cancelled,
+    for_each_regular_header, progress_download, progress_init, progress_upload,
+    redact_url_userinfo, verify_certificate_pins,
+};
+
+/// Redirect hops allowed when `follow_redirects` is on.
+const MAX_REDIRECTS: usize = 10;
+
+/// Caller-supplied headers allowed to survive a redirect to a different
+/// origin.
+/// Everything else — API keys, bearer tokens, tenant ids — is dropped: reqwest
+/// strips only a fixed list of well-known auth headers, so a custom
+/// `X-Api-Key` would otherwise be handed straight to the redirect target.
+const CROSS_ORIGIN_SAFE_HEADERS: [&str; 4] =
+    ["accept", "accept-language", "content-type", "user-agent"];
+
+/// Wraps the platform's own certificate verifier and adds Vane's host-scoped
+/// pins.
+///
+/// Platform verification runs first and is never replaced or weakened — a pin
+/// is an additional constraint on top of it, never a substitute. The pin check
+/// is literally the same `verify_certificate_pins` the HTTP/3 path calls, so
+/// both transports accept and reject exactly the same certificates.
+///
+/// (`ClientConfig::dangerous()` is only how rustls spells "install a custom
+/// verifier"; nothing here skips verification.)
+#[derive(Debug)]
+struct PinnedServerCertVerifier {
+    inner: Arc<dyn ServerCertVerifier>,
+    certificate_pins: HashMap<String, Vec<String>>,
+}
+
+impl ServerCertVerifier for PinnedServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+
+        if self.certificate_pins.is_empty() {
+            return Ok(ServerCertVerified::assertion());
+        }
+
+        // Fail closed: a name shape we cannot spell cannot be matched against a
+        // pin, and this client has pins configured.
+        let host = pin_lookup_host(server_name).ok_or_else(|| {
+            rustls::Error::General(
+                "Unsupported TLS server name for certificate pinning".to_string(),
+            )
+        })?;
+
+        verify_certificate_pins(&host, Some(end_entity.as_ref()), &self.certificate_pins)
+            .map_err(|err| rustls::Error::General(err.to_string()))?;
+
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// Spells a TLS server name the way [`Url::host_str`] does, so a pinned host is
+/// looked up under the same key the caller configured it with. Getting this
+/// wrong fails open — the lookup misses and an unpinned host is assumed.
+fn pin_lookup_host(server_name: &ServerName<'_>) -> Option<String> {
+    match server_name {
+        ServerName::DnsName(name) => Some(name.as_ref().to_ascii_lowercase()),
+        ServerName::IpAddress(ip) => Some(match IpAddr::from(*ip) {
+            IpAddr::V4(address) => address.to_string(),
+            IpAddr::V6(address) => format!("[{address}]"),
+        }),
+        _ => None,
+    }
+}
+
+fn tls_config(
+    mode: &VaneProtocolMode,
+    certificate_pins: HashMap<String, Vec<String>>,
+) -> Result<ClientConfig, VaneError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let inner = rustls_platform_verifier::Verifier::new(provider.clone())
+        .map_err(|e| VaneError::Generic(format!("Failed to build TLS verifier: {e}")))?;
+
+    // `with_safe_default_protocol_versions` is TLS 1.2 + 1.3.
+    let mut config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| VaneError::Generic(format!("Failed to configure TLS versions: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedServerCertVerifier {
+            inner: Arc::new(inner),
+            certificate_pins,
+        }))
+        .with_no_client_auth();
+
+    // reqwest only fills these in on its own TLS path; a preconfigured config
+    // is passed through untouched, so without this nothing offers ALPN, HTTP/2
+    // is never negotiated, and prior-knowledge h2 violates RFC 9113 3.4.
+    config.alpn_protocols = match mode {
+        VaneProtocolMode::Http1Only => vec![b"http/1.1".to_vec()],
+        VaneProtocolMode::Http2Only => vec![b"h2".to_vec()],
+        _ => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+    };
+
+    Ok(config)
+}
+
+fn build_client(
+    client: &VaneClient,
+    certificate_pins: HashMap<String, Vec<String>>,
+) -> Result<Client, VaneError> {
+    let config = &client.config;
+    let mut builder = Client::builder()
+        .use_preconfigured_tls(tls_config(&config.protocol_mode, certificate_pins)?)
+        // Redirects are driven by hand in `follow_and_read`: reqwest's policy
+        // cannot re-derive the cookie header per hop, cannot see intermediate
+        // `Set-Cookie`, and cannot drop caller headers when the host changes.
+        .redirect(redirect::Policy::none())
+        // Plaintext is rejected before we reach here; this is the backstop.
+        .https_only(true);
+
+    builder = match config.protocol_mode {
+        VaneProtocolMode::Http1Only => builder.http1_only(),
+        VaneProtocolMode::Http2Only => builder.http2_prior_knowledge(),
+        _ => builder,
+    };
+
+    builder = if config.connection_pool_enabled {
+        builder
+            .pool_max_idle_per_host(config.max_idle_connections as usize)
+            .pool_idle_timeout(std::time::Duration::from_secs(
+                config.connection_idle_timeout_seconds,
+            ))
+    } else {
+        builder.pool_max_idle_per_host(0)
+    };
+
+    for (host, address) in &config.dns_overrides {
+        let ip = address.parse::<IpAddr>().map_err(|e| {
+            VaneError::Generic(format!(
+                "Invalid DNS override for {host}: expected IP address, got {address}: {e}"
+            ))
+        })?;
+        // Port 0 tells reqwest to take the port from the URL, matching how the
+        // HTTP/3 path applies overrides.
+        builder = builder.resolve(host, SocketAddr::new(ip, 0));
+    }
+
+    if let Some(proxy_url) = config.proxy_url.as_deref() {
+        // Per-transport reading of one setting: MASQUE/CONNECT-UDP on HTTP/3,
+        // HTTP CONNECT here.
+        let mut proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
+            VaneError::Generic(format!(
+                "Invalid proxyUrl {}: {e}",
+                redact_url_userinfo(proxy_url)
+            ))
+        })?;
+        if let Some(authorization) = config
+            .proxy_authorization
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            let value = HeaderValue::from_str(authorization)
+                .map_err(|_| VaneError::Generic("Invalid proxyAuthorization header".to_string()))?;
+            proxy = proxy.custom_http_auth(value);
+        }
+        builder = builder.proxy(proxy);
+    } else {
+        // reqwest otherwise picks up $HTTPS_PROXY and OS proxy settings. The
+        // HTTP/3 path never does, so an unset proxyUrl has to mean "no proxy"
+        // on both transports rather than "whatever the environment says".
+        builder = builder.no_proxy();
+    }
+
+    builder
+        .build()
+        .map_err(|e| VaneError::Generic(format!("Failed to build TCP client: {e}")))
+}
+
+/// Returns the client's blocking reqwest client, building it on first use so
+/// HTTP/3-only applications never pay for the tokio runtime.
+fn shared_client(client: &VaneClient) -> Result<(Client, HashMap<String, Vec<String>>), VaneError> {
+    // Lock order is tcp_client -> certificate_pins, matching
+    // `set_certificate_pins_internal`. Snapshotting the pins first would let an
+    // invalidation land between the read and the insert, permanently caching a
+    // client whose verifier holds stale (usually empty) pins.
+    let mut cached = client
+        .tcp_client
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    // Read inside the same critical section, so the redirect gate and the TLS
+    // verifier baked into the client can never disagree about the pin set.
+    let certificate_pins = client.certificate_pins_snapshot()?;
+    if let Some(existing) = cached.as_ref() {
+        return Ok((existing.clone(), certificate_pins));
+    }
+    let built = build_client(client, certificate_pins.clone())?;
+    Ok((cached.insert(built).clone(), certificate_pins))
+}
+
+/// Builds the header map for one hop. `origin` is the origin the caller
+/// addressed; once a redirect has moved us to a different one, caller-supplied
+/// headers are cut down to [`CROSS_ORIGIN_SAFE_HEADERS`].
+fn build_headers(
+    client: &VaneClient,
+    request: &VaneRequest,
+    url: &Url,
+    origin: (&str, u16),
+    cookie_header: Option<&str>,
+    body_dropped: bool,
+) -> Result<HeaderMap, VaneError> {
+    // Port is part of the origin: app.example.com and app.example.com:8443 are
+    // different security origins on multi-tenant and dev/staging hosts.
+    let same_origin = (url.host_str().unwrap_or_default(), origin_port(url)) == origin;
+    let mut headers = HeaderMap::new();
+
+    for_each_regular_header(request, &client.config, None, |key, value| {
+        let lower = key.to_ascii_lowercase();
+        if !same_origin && !CROSS_ORIGIN_SAFE_HEADERS.contains(&lower.as_str()) {
+            return Ok(());
+        }
+        // A 303 rewrite drops the body, so a caller content-type would describe
+        // a payload that is no longer being sent.
+        if body_dropped && lower == "content-type" {
+            return Ok(());
+        }
+        let name = HeaderName::from_bytes(lower.as_bytes())
+            .map_err(|e| VaneError::Generic(format!("Invalid header name {key}: {e}")))?;
+        let value = HeaderValue::from_str(value)
+            .map_err(|_| VaneError::Generic(format!("Invalid value for header {key}")))?;
+        // Append rather than insert: the HTTP/3 path sends every occurrence,
+        // and replacing would silently drop a caller's second value.
+        headers.append(name, value);
+        Ok(())
+    })?;
+
+    // Only set when the caller did not, so we never send two User-Agents.
+    if !headers.contains_key(reqwest::header::USER_AGENT) {
+        let user_agent = client.config.user_agent.as_deref().unwrap_or("Vane/0.1.0");
+        headers.insert(
+            reqwest::header::USER_AGENT,
+            HeaderValue::from_str(user_agent)
+                .map_err(|_| VaneError::Generic("Invalid userAgent".to_string()))?,
+        );
+    }
+
+    // Inserted after the allowlist, which exists to govern *caller* headers:
+    // the jar's cookies are already scoped to this hop's host and path, so
+    // running them through the cross-origin filter would just discard them.
+    if let Some(cookie_header) = cookie_header.filter(|header| !header.is_empty()) {
+        headers.insert(
+            reqwest::header::COOKIE,
+            HeaderValue::from_str(cookie_header)
+                .map_err(|_| VaneError::Generic("Invalid cookie header".to_string()))?,
+        );
+    }
+
+    Ok(headers)
+}
+
+fn origin_port(url: &Url) -> u16 {
+    url.port_or_known_default().unwrap_or(443)
+}
+
+pub(crate) fn execute_tcp_once(
+    client: &VaneClient,
+    request: &VaneRequest,
+    url: &Url,
+    request_body: &[u8],
+) -> Result<VaneResponse, VaneError> {
+    // Same guard as the HTTP/3 path. Without it an `http://` URL is sent in the
+    // clear with no TLS and therefore no pin check — and in the fallback mode
+    // the HTTP/3 https-only rejection is exactly what would have routed us
+    // here, turning a hard failure into a silent cleartext send.
+    if url.scheme() != "https" {
+        return Err(VaneError::Generic(
+            "Vane only supports https:// URLs".to_string(),
+        ));
+    }
+
+    let cancel_token = cancel_token(request.cancel_token_id);
+    let progress = progress_init(request.progress_id, request_body.len() as u64);
+    // `execute` marks the request done once the whole dispatch resolves, so a
+    // poller never sees `done` flip while a fallback is still to come.
+    follow_and_read(
+        client,
+        request,
+        url,
+        request_body,
+        cancel_token.as_deref(),
+        progress.as_deref(),
+    )
+}
+
+fn follow_and_read(
+    client: &VaneClient,
+    request: &VaneRequest,
+    url: &Url,
+    request_body: &[u8],
+    cancel_token: Option<&AtomicBool>,
+    progress: Option<&VaneProgressState>,
+) -> Result<VaneResponse, VaneError> {
+    let origin = (
+        url.host_str().unwrap_or_default().to_string(),
+        origin_port(url),
+    );
+    let timeout = std::time::Duration::from_secs(
+        request
+            .timeout_seconds
+            .or(client.config.timeout_seconds)
+            .unwrap_or(30),
+    );
+    // One deadline for the whole chain. Applying the timeout per hop would let
+    // a hostile server hold a caller thread for hop-cap times the requested
+    // timeout, and the retry loop multiplies that again.
+    let deadline = Instant::now() + timeout;
+    let (http, certificate_pins) = shared_client(client)?;
+
+    // Created before anything goes on the wire so a bad response_body_path
+    // fails without having sent a request, matching the HTTP/3 path.
+    let mut state = ResponseState::new(
+        client.config.max_response_body_bytes,
+        request.response_body_path.as_deref(),
+    )?;
+
+    let mut current = url.clone();
+    let mut method = reqwest::Method::from_bytes(request.method.to_ascii_uppercase().as_bytes())
+        .map_err(|_| VaneError::Generic(format!("Invalid HTTP method {}", request.method)))?;
+    let mut body = request_body;
+    let mut body_dropped = false;
+    let mut hops = 0usize;
+
+    let response = loop {
+        check_cancelled(cancel_token)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(VaneError::Generic("HTTP request timed out".to_string()));
+        }
+        let cookie_header = if client.config.cookies_enabled {
+            // Re-derived per hop: cookies are scoped by host and path, so the
+            // header built for the first URL is wrong for a redirect target.
+            Some(client.cookie_header(&current)?)
+        } else {
+            None
+        };
+        let mut builder = http
+            .request(method.clone(), current.to_string())
+            .headers(build_headers(
+                client,
+                request,
+                &current,
+                (&origin.0, origin.1),
+                cookie_header.as_deref(),
+                body_dropped,
+            )?)
+            .timeout(remaining);
+        if !body.is_empty() {
+            // reqwest owns the body; the HTTP/3 path can borrow, this cannot.
+            builder = builder.body(body.to_vec());
+        }
+
+        let response = builder.send().map_err(|e| {
+            // `without_url` drops the URL reqwest appends to its Display, which
+            // would otherwise put query-string tokens into caller-visible
+            // errors and application logs.
+            VaneError::Generic(format!("HTTP request failed: {}", e.without_url()))
+        })?;
+        // Belt and braces for the host we based every security decision on:
+        // reqwest re-parses the URL with its own parser, so if the two ever
+        // disagree about the host, fail closed instead of acting on ours.
+        if response.url().host_str() != current.host_str() {
+            return Err(VaneError::Generic(
+                "URL host was interpreted differently by the HTTP client".to_string(),
+            ));
+        }
+        // The caller's body is uploaded once, on the first hop; a later hop
+        // whose body was dropped has nothing more to send. Reporting that
+        // hop's (zero) length would walk the progress bar backwards, so the
+        // cumulative figure stands.
+        progress_upload(
+            progress,
+            request_body.len() as u64,
+            request_body.len() as u64,
+        );
+
+        // Harvested per hop: only the final response reaches the body read, so
+        // a `Set-Cookie` on a 302 would otherwise be dropped and the caller
+        // would look silently logged out.
+        if client.config.cookies_enabled {
+            let set_cookies = collect_set_cookie(&response);
+            if !set_cookies.is_empty() {
+                client.store_response_cookies(&current, &set_cookies)?;
+            }
+        }
+
+        let Some(next) = redirect_target(&response, &current, request, hops, &certificate_pins)
+        else {
+            break response;
+        };
+        // 307 and 308 keep the method and body by definition, so a cross-origin
+        // hop would hand the request payload — where the credential usually
+        // lives — to the new origin. Header stripping does not cover that, so
+        // the hop is refused and the 3xx goes back to the caller.
+        let status = response.status().as_u16();
+        if matches!(status, 307 | 308)
+            && !body.is_empty()
+            && (next.host_str().unwrap_or_default(), origin_port(&next))
+                != (
+                    current.host_str().unwrap_or_default(),
+                    origin_port(&current),
+                )
+        {
+            break response;
+        }
+        // 303, and 301/302 on a non-idempotent method, become a bodyless GET.
+        if status == 303 || (matches!(status, 301 | 302) && method != reqwest::Method::GET) {
+            method = reqwest::Method::GET;
+            body = &[];
+            body_dropped = true;
+        }
+        current = next;
+        hops += 1;
+    };
+
+    read_body(response, &mut state, cancel_token, progress)?;
+
+    let status_code = state.status_code;
+    Ok(VaneResponse {
+        status_code,
+        headers: state.headers,
+        body: state.body,
+        body_file_path: state.body_file_path,
+        is_success: (200..=299).contains(&status_code),
+        url: current.to_string(),
+    })
+}
+
+fn collect_set_cookie(response: &reqwest::blocking::Response) -> Vec<String> {
+    response
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).to_string())
+        .collect()
+}
+
+/// Decides whether a response is a redirect worth following, and to where.
+/// `None` means "treat this as the final response" — which hands the 3xx back
+/// to the caller exactly as the HTTP/3 path would.
+fn redirect_target(
+    response: &reqwest::blocking::Response,
+    current: &Url,
+    request: &VaneRequest,
+    hops: usize,
+    certificate_pins: &HashMap<String, Vec<String>>,
+) -> Option<Url> {
+    if !request.follow_redirects || !response.status().is_redirection() || hops >= MAX_REDIRECTS {
+        return None;
+    }
+    // `get` takes the first Location if a server sent several; a response with
+    // conflicting Location headers is malformed either way and the hop is
+    // gated by the scheme/pin/origin rules below regardless of which we pick.
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())?;
+    // Resolved with Vane's own parser, which is stricter than the URL crate
+    // reqwest uses (no userinfo, ASCII hosts only). An unparsable or
+    // unsupported target stops the chain rather than being guessed at.
+    // An empty Location means "no redirect" rather than the site root.
+    if location.is_empty() {
+        return None;
+    }
+    let next = current.join(location).ok()?;
+    // Never downgrade to cleartext.
+    if next.scheme() != "https" {
+        return None;
+    }
+    // A pin only constrains the hop it was checked on, so leaving a pinned
+    // host means leaving the pin behind: stop instead.
+    let current_host = current.host_str().unwrap_or_default();
+    if next.host_str() != Some(current_host)
+        && certificate_pins
+            .get(current_host)
+            .is_some_and(|pins| !pins.is_empty())
+    {
+        return None;
+    }
+
+    Some(next)
+}
+
+fn read_body(
+    mut response: reqwest::blocking::Response,
+    state: &mut ResponseState,
+    cancel_token: Option<&AtomicBool>,
+    progress: Option<&VaneProgressState>,
+) -> Result<(), VaneError> {
+    state.status_code = response.status().as_u16();
+    for (name, value) in response.headers() {
+        if name == reqwest::header::SET_COOKIE {
+            // Already harvested per hop.
+            continue;
+        }
+        let name = name.as_str().to_string();
+        let value = String::from_utf8_lossy(value.as_bytes()).to_string();
+        if name.eq_ignore_ascii_case("content-length") {
+            state.on_content_length(&value);
+        }
+        state.headers.insert(name, value);
+    }
+
+    let mut buf = vec![0; H3_BODY_BUFFER_BYTES];
+    loop {
+        // ponytail: only between reads, so a cancel lands on a chunk boundary
+        // instead of the ~50 ms the HTTP/3 loop manages. Needs a wrapping
+        // reader to do better.
+        check_cancelled(cancel_token)?;
+        match response.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(read) => {
+                state.push_body(&buf[..read])?;
+                progress_download(progress, state.body_len as u64, state.download_total);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                return Err(VaneError::Generic(format!(
+                    "Failed to read HTTP response body: {e}"
+                )));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "tcp/tests.rs"]
+mod tests;
