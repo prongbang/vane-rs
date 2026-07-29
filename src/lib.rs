@@ -1,13 +1,15 @@
 uniffi::setup_scaffolding!();
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fs::{self, File};
 use std::io;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,21 +24,56 @@ use thiserror::Error;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const DEFAULT_MAX_REQUEST_BODY_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_MAX_RESPONSE_BODY_BYTES: u64 = 64 * 1024 * 1024;
+/// Ceiling on the up-front body reservation made from `content-length`. Keeps a
+/// bodiless (HEAD, 304) or lying response from allocating the full body limit.
+const MAX_BODY_RESERVE_BYTES: u64 = 1 << 20;
+/// One datagram plus headroom. We advertise `MAX_DATAGRAM_SIZE` as our max
+/// receive payload and read with plain connected-socket `recv` (no GRO), so a
+/// conforming peer can never hand us more than that in one call.
+const UDP_RECV_BUFFER_BYTES: usize = 2 * MAX_DATAGRAM_SIZE;
+const H3_BODY_BUFFER_BYTES: usize = 16 * 1024;
+const MASQUE_CONTROL_BUFFER_BYTES: usize = 4096;
+/// Used when the outer connection reports no datagram capacity; quiche's own
+/// minimum outgoing UDP payload is 1200.
+const MASQUE_INNER_FALLBACK_UDP_PAYLOAD: usize = 1200;
+/// ponytail: naive bound — when the store is full it is cleared wholesale
+/// rather than evicting the least-recently-used entry. A client talking to more
+/// than this many origins just pays full handshakes. Swap in an LRU only if
+/// that shows up in a profile.
+const MAX_TLS_SESSIONS: usize = 8;
+/// ponytail: same naive bound as the session store. The MASQUE inner payload is
+/// measured per connection (it depends on the server's DCID length and crypto
+/// overhead), so the key space is not a fixed pair of constants. Swap in an LRU
+/// only if config rebuilds show up in a profile.
+const MAX_QUIC_CONFIGS: usize = 8;
 
 static CANCEL_TOKENS: LazyLock<Mutex<HashMap<u64, Arc<AtomicBool>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_CANCEL_TOKEN_ID: AtomicU64 = AtomicU64::new(1);
-static PROGRESS_STATES: LazyLock<Mutex<HashMap<u64, VaneProgressState>>> =
+static PROGRESS_STATES: LazyLock<Mutex<HashMap<u64, Arc<VaneProgressState>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_PROGRESS_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, Default)]
+/// Shared progress counters for one request. The global map only resolves ids
+/// to handles; the transfer loop writes the atomics directly so it never takes
+/// a lock per chunk.
+#[derive(Debug, Default)]
 struct VaneProgressState {
-    upload_sent: u64,
-    upload_total: u64,
-    download_received: u64,
-    download_total: u64,
-    done: bool,
+    upload_sent: AtomicU64,
+    upload_total: AtomicU64,
+    download_received: AtomicU64,
+    download_total: AtomicU64,
+    done: AtomicBool,
+}
+
+impl VaneProgressState {
+    fn reset(&self, upload_total: u64) {
+        self.done.store(false, Ordering::Relaxed);
+        self.upload_sent.store(0, Ordering::Relaxed);
+        self.upload_total.store(upload_total, Ordering::Relaxed);
+        self.download_received.store(0, Ordering::Relaxed);
+        self.download_total.store(0, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,7 +397,7 @@ impl Default for VaneClientConfig {
             certificate_pins: HashMap::new(),
             cookies_enabled: false,
             cookie_persistence_path: None,
-            connection_pool_enabled: false,
+            connection_pool_enabled: true,
             max_idle_connections: 4,
             connection_idle_timeout_seconds: 30,
             retry_max_attempts: 1,
@@ -411,6 +448,49 @@ fn unsupported_tcp_backend_error() -> VaneError {
     )
 }
 
+/// Cached `quiche::Config`s keyed by `(max-idle-timeout millis, max send UDP
+/// payload)` — the only per-connection settings on them. Building one re-reads
+/// the platform CA bundle, which is a whole directory scan on Android. Bounded
+/// in practice by the handful of distinct timeouts an application uses, times
+/// the two payload sizes (direct/outer vs MASQUE inner).
+type QuicConfigCache = Mutex<HashMap<(u64, usize), quiche::Config>>;
+
+/// Serialized TLS session tickets for TLS 1.3 resumption. Ticket reuse only —
+/// 0-RTT/early data is never enabled (replay risk).
+type TlsSessionStore = Mutex<HashMap<TlsSessionKey, Vec<u8>>>;
+
+/// What a stored ticket is scoped to.
+///
+/// A resumed TLS 1.3 handshake performs no certificate verification, so a
+/// ticket must never be offered to anything but the exact peer that minted it.
+/// Host alone is not that peer: a different port can be a different terminator,
+/// and the proxy hop and the origin are different trust contexts even when they
+/// share a hostname.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TlsSessionKey {
+    host: String,
+    port: u16,
+    proxy_hop: bool,
+}
+
+impl TlsSessionKey {
+    fn origin(host: &str, port: u16) -> Self {
+        Self {
+            host: host.to_string(),
+            port,
+            proxy_hop: false,
+        }
+    }
+
+    fn proxy(host: &str, port: u16) -> Self {
+        Self {
+            host: host.to_string(),
+            port,
+            proxy_hop: true,
+        }
+    }
+}
+
 // ---------- Client ----------
 #[derive(uniffi::Object)]
 pub struct VaneClient {
@@ -418,6 +498,8 @@ pub struct VaneClient {
     pool: Mutex<Vec<PooledHttp3Connection>>,
     cookie_jar: Mutex<Vec<StoredCookie>>,
     certificate_pins: Mutex<HashMap<String, Vec<String>>>,
+    quic_config: QuicConfigCache,
+    tls_sessions: TlsSessionStore,
 }
 
 impl VaneClient {
@@ -433,6 +515,8 @@ impl VaneClient {
             pool: Mutex::new(Vec::new()),
             cookie_jar: Mutex::new(cookie_jar),
             certificate_pins: Mutex::new(certificate_pins),
+            quic_config: Mutex::new(HashMap::new()),
+            tls_sessions: Mutex::new(HashMap::new()),
         })
     }
 
@@ -471,12 +555,16 @@ impl VaneClient {
         request: &VaneRequest,
         url: &Url,
     ) -> Result<VaneResponse, VaneError> {
+        // Loaded once for every attempt: a retry must not re-read the body file
+        // (it may have changed) and must not re-copy an in-memory body.
+        let request_body = load_request_body(request)?;
+        validate_request_body_limit(&request_body, self.config.max_request_body_bytes)?;
         let max_attempts = self.config.retry_max_attempts.max(1);
         let mut attempt = 1u64;
         let mut last_error = None;
 
         while attempt <= max_attempts {
-            match self.execute_http3_once(request, url) {
+            match self.execute_http3_once(request, url, &request_body) {
                 Ok(response) => {
                     if should_retry_response(
                         &request.method,
@@ -512,6 +600,7 @@ impl VaneClient {
         &self,
         request: &VaneRequest,
         url: &Url,
+        request_body: &[u8],
     ) -> Result<VaneResponse, VaneError> {
         if url.scheme() != "https" {
             return Err(VaneError::Generic(
@@ -541,65 +630,97 @@ impl VaneClient {
             None
         };
         let headers = build_h3_headers(url, request, &self.config, cookie_header.as_deref())?;
-        let request_body = load_request_body(request)?;
-        validate_request_body_limit(&request_body, self.config.max_request_body_bytes)?;
-        progress_init(request.progress_id, request_body.len() as u64);
+        let cancel_token = cancel_token(request.cancel_token_id);
+        let progress = progress_init(request.progress_id, request_body.len() as u64);
         let certificate_pins = self.certificate_pins_snapshot()?;
         let pool_key = PoolKey::new(url, &self.config, &certificate_pins);
-        let mut transport = match if self.config.connection_pool_enabled {
-            self.take_pooled_connection(&pool_key, timeout)?
-        } else {
-            None
-        } {
-            Some(connection) => connection,
-            None => self
-                .connect_http3(
-                    host,
-                    peer_addr,
+        let mut allow_pooled = self.config.connection_pool_enabled;
+
+        loop {
+            let pooled = if allow_pooled {
+                self.take_pooled_connection(&pool_key, timeout)?
+            } else {
+                None
+            };
+            let reused = pooled.is_some();
+            let mut transport = match pooled {
+                Some(connection) => connection,
+                None => self
+                    .connect_http3(
+                        host,
+                        peer_addr,
+                        timeout,
+                        pool_key.clone(),
+                        &certificate_pins,
+                    )
+                    .inspect_err(|_| {
+                        self.drop_closed_connections();
+                    })?,
+            };
+
+            let mut response_started = false;
+            let result = perform_http3_request(
+                &mut transport,
+                H3RequestOptions {
+                    headers: &headers,
+                    request_body,
                     timeout,
-                    pool_key.clone(),
-                    &certificate_pins,
-                )
-                .inspect_err(|_| {
-                    self.drop_closed_connections();
-                })?,
-        };
+                    url,
+                    max_response_body_bytes: self.config.max_response_body_bytes,
+                    response_body_path: request.response_body_path.as_deref(),
+                    cancel_token: cancel_token.as_deref(),
+                    progress: progress.as_deref(),
+                },
+                &mut response_started,
+            );
+            match result {
+                Ok(response) => {
+                    if self.config.cookies_enabled {
+                        self.store_response_cookies(url, &response.set_cookie_headers)?;
+                    }
+                    progress_done(progress.as_deref());
+                    // The server's NewSessionTicket normally lands after the
+                    // handshake loop already returned, so this is the point
+                    // where a resumable ticket actually exists.
+                    store_tls_session(
+                        &self.tls_sessions,
+                        &transport.conn,
+                        &TlsSessionKey::origin(host, peer_addr.port()),
+                        &certificate_pins,
+                    );
 
-        let result = perform_http3_request(
-            &mut transport,
-            H3RequestOptions {
-                headers: &headers,
-                request_body: &request_body,
-                timeout,
-                url,
-                max_response_body_bytes: self.config.max_response_body_bytes,
-                response_body_path: request.response_body_path.as_deref(),
-                cancel_token_id: request.cancel_token_id,
-                progress_id: request.progress_id,
-            },
-        );
-        match result {
-            Ok(response) => {
-                if self.config.cookies_enabled {
-                    self.store_response_cookies(url, &response.set_cookie_headers)?;
+                    let public_response = response.into_public_response();
+                    if self.config.connection_pool_enabled && !transport.conn.is_closed() {
+                        self.return_pooled_connection(transport)?;
+                    } else {
+                        transport.conn.close(true, 0x00, b"done").ok();
+                        transport.flush_packets().ok();
+                    }
+
+                    return Ok(public_response);
                 }
-                progress_done(request.progress_id);
-
-                let public_response = response.into_public_response();
-                if self.config.connection_pool_enabled && !transport.conn.is_closed() {
-                    self.return_pooled_connection(transport)?;
-                } else {
-                    transport.conn.close(true, 0x00, b"done").ok();
+                Err(err) => {
+                    transport.conn.close(true, 0x01, b"request failed").ok();
                     transport.flush_packets().ok();
-                }
 
-                Ok(public_response)
-            }
-            Err(err) => {
-                progress_done(request.progress_id);
-                transport.conn.close(true, 0x01, b"request failed").ok();
-                transport.flush_packets().ok();
-                Err(err)
+                    // A pooled connection that died silently (NAT rebind, server
+                    // idle timeout shorter than ours, GOAWAY) only fails once we
+                    // try to use it. No response byte arrived, so the request was
+                    // never processed and retrying once on a fresh connection is
+                    // safe even for non-idempotent methods. `allow_pooled` is
+                    // cleared first, so this can happen at most once. A cancelled
+                    // request must not pay for another handshake to fail again.
+                    if reused
+                        && !response_started
+                        && check_cancelled(cancel_token.as_deref()).is_ok()
+                    {
+                        allow_pooled = false;
+                        continue;
+                    }
+
+                    progress_done(progress.as_deref());
+                    return Err(err);
+                }
             }
         }
     }
@@ -623,17 +744,29 @@ impl VaneClient {
             );
         }
 
-        let direct = connect_quic_h3(host, peer_addr, timeout, certificate_pins)?;
+        let direct = connect_quic_h3(
+            host,
+            peer_addr,
+            timeout,
+            certificate_pins,
+            &self.quic_config,
+            &self.tls_sessions,
+            &TlsSessionKey::origin(host, peer_addr.port()),
+        )?;
         Ok(PooledHttp3Connection {
             key,
             io: Http3Io::Direct {
                 socket: direct.socket,
+                last_read_timeout: None,
+                recv_buf: vec![0; UDP_RECV_BUFFER_BYTES],
             },
             local_addr: direct.local_addr,
             peer_addr: direct.peer_addr,
             conn: direct.conn,
             http3: direct.http3,
             last_used: Instant::now(),
+            send_buf: vec![0; MAX_DATAGRAM_SIZE],
+            body_buf: vec![0; H3_BODY_BUFFER_BYTES],
         })
     }
 
@@ -648,7 +781,15 @@ impl VaneClient {
     ) -> Result<PooledHttp3Connection, VaneError> {
         let proxy = MasqueProxyConfig::parse(proxy_url)?;
         let proxy_addr = resolve_peer_addr(&proxy.host, proxy.port, &self.config.dns_overrides)?;
-        let mut outer = connect_quic_h3(&proxy.host, proxy_addr, timeout, certificate_pins)?;
+        let mut outer = connect_quic_h3(
+            &proxy.host,
+            proxy_addr,
+            timeout,
+            certificate_pins,
+            &self.quic_config,
+            &self.tls_sessions,
+            &TlsSessionKey::proxy(&proxy.host, proxy.port),
+        )?;
         let stream_id = establish_connect_udp_tunnel(
             &mut outer,
             &proxy,
@@ -657,21 +798,35 @@ impl VaneClient {
             self.config.proxy_authorization.as_deref(),
             timeout,
         )?;
+        // The proxy's ticket usually only arrives during tunnel establishment,
+        // after `connect_quic_h3` already returned.
+        store_tls_session(
+            &self.tls_sessions,
+            &outer.conn,
+            &TlsSessionKey::proxy(&proxy.host, proxy.port),
+            certificate_pins,
+        );
 
         let mut scid = [0; quiche::MAX_CONN_ID_LEN];
         getrandom::fill(&mut scid).map_err(|e| {
             VaneError::Generic(format!("Failed to generate QUIC connection ID: {e}"))
         })?;
         let scid = quiche::ConnectionId::from_ref(&scid);
-        let mut quic_config = create_quiche_config(timeout)?;
-        let mut conn = quiche::connect(
-            Some(host),
+        let mut conn = quic_connect(
+            &self.quic_config,
+            host,
             &scid,
             outer.local_addr,
             peer_addr,
-            &mut quic_config,
-        )
-        .map_err(|e| VaneError::Generic(format!("Failed to create QUIC client: {e}")))?;
+            timeout,
+            masque_inner_udp_payload(&outer.conn, stream_id / 4),
+        )?;
+        resume_tls_session(
+            &self.tls_sessions,
+            &mut conn,
+            &TlsSessionKey::origin(host, peer_addr.port()),
+            certificate_pins,
+        );
         let h3_config = quiche::h3::Config::new()
             .map_err(|e| VaneError::Generic(format!("Failed to create HTTP/3 config: {e}")))?;
         let mut io = Http3Io::Masque(Box::new(MasqueTunnel {
@@ -682,9 +837,15 @@ impl VaneClient {
             http3: outer.http3,
             stream_id,
             flow_id: stream_id / 4,
+            last_read_timeout: None,
+            recv_buf: vec![0; UDP_RECV_BUFFER_BYTES],
+            send_buf: vec![0; MAX_DATAGRAM_SIZE],
+            dgram_buf: vec![0; MAX_DATAGRAM_SIZE],
+            control_buf: vec![0; MASQUE_CONTROL_BUFFER_BYTES],
         }));
 
-        flush_quic_packets_via(&mut io, &mut conn)?;
+        let mut send_buf = vec![0; MAX_DATAGRAM_SIZE];
+        flush_quic_packets_via(&mut io, &mut send_buf, &mut conn)?;
         let deadline = Instant::now() + timeout;
 
         while Instant::now() < deadline {
@@ -692,6 +853,12 @@ impl VaneClient {
 
             if conn.is_established() {
                 verify_certificate_pins(host, conn.peer_cert(), certificate_pins)?;
+                store_tls_session(
+                    &self.tls_sessions,
+                    &conn,
+                    &TlsSessionKey::origin(host, peer_addr.port()),
+                    certificate_pins,
+                );
                 let http3 = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
                 return Ok(PooledHttp3Connection {
                     key,
@@ -701,10 +868,12 @@ impl VaneClient {
                     conn,
                     http3,
                     last_used: Instant::now(),
+                    send_buf,
+                    body_buf: vec![0; H3_BODY_BUFFER_BYTES],
                 });
             }
 
-            flush_quic_packets_via(&mut io, &mut conn)?;
+            flush_quic_packets_via(&mut io, &mut send_buf, &mut conn)?;
 
             if conn.is_closed() {
                 return Err(VaneError::Generic(
@@ -804,6 +973,14 @@ impl VaneClient {
     ) -> Result<(), VaneError> {
         validate_certificate_pin_host(&host)?;
         validate_certificate_pins(&pins)?;
+        // Stored tickets for this host were minted under the old trust context,
+        // and a resumed handshake would skip the certificate exchange the new
+        // pins need to be checked against. Drops every port and hop role for
+        // the host, since pins are configured per host.
+        self.tls_sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|key, _| key.host != host);
         {
             let mut configured = self
                 .certificate_pins
@@ -939,6 +1116,11 @@ struct PooledHttp3Connection {
     conn: quiche::Connection,
     http3: quiche::h3::Connection,
     last_used: Instant,
+    /// Drive-loop scratch, allocated once per connection instead of being
+    /// zeroed on every iteration. Heap-backed so moving the connection in and
+    /// out of the pool stays a pointer move.
+    send_buf: Vec<u8>,
+    body_buf: Vec<u8>,
 }
 
 impl PooledHttp3Connection {
@@ -956,7 +1138,7 @@ impl PooledHttp3Connection {
     }
 
     fn flush_packets(&mut self) -> Result<(), VaneError> {
-        flush_quic_packets_via(&mut self.io, &mut self.conn)
+        flush_quic_packets_via(&mut self.io, &mut self.send_buf, &mut self.conn)
     }
 }
 
@@ -969,14 +1151,20 @@ struct DirectHttp3Connection {
 }
 
 enum Http3Io {
-    Direct { socket: UdpSocket },
+    Direct {
+        socket: UdpSocket,
+        /// Last value armed on the socket, so an unchanged read deadline does
+        /// not cost a `setsockopt` on every read.
+        last_read_timeout: Option<Duration>,
+        recv_buf: Vec<u8>,
+    },
     Masque(Box<MasqueTunnel>),
 }
 
 impl Http3Io {
     fn set_write_timeout(&self, timeout: Duration) -> Result<(), VaneError> {
         match self {
-            Self::Direct { socket } => socket
+            Self::Direct { socket, .. } => socket
                 .set_write_timeout(Some(timeout))
                 .map_err(|e| VaneError::Generic(format!("Failed to set UDP write timeout: {e}"))),
             Self::Masque(tunnel) => tunnel.socket.set_write_timeout(Some(timeout)).map_err(|e| {
@@ -994,13 +1182,20 @@ struct MasqueTunnel {
     http3: quiche::h3::Connection,
     stream_id: u64,
     flow_id: u64,
+    last_read_timeout: Option<Duration>,
+    /// Same hoist as `PooledHttp3Connection`: the tunnel drives its own socket
+    /// once per outer packet, so these must not be per-call stack buffers.
+    recv_buf: Vec<u8>,
+    send_buf: Vec<u8>,
+    dgram_buf: Vec<u8>,
+    control_buf: Vec<u8>,
 }
 
 impl MasqueTunnel {
     fn send_origin_packet(&mut self, packet: &[u8]) -> Result<(), VaneError> {
         let datagram = encode_h3_datagram(self.flow_id, 0, packet)?;
         self.conn.dgram_send(&datagram)?;
-        flush_quic_packets(&self.socket, &mut self.conn)
+        flush_quic_packets(&self.socket, &mut self.send_buf, &mut self.conn)
     }
 
     fn read_origin_packets(
@@ -1011,15 +1206,22 @@ impl MasqueTunnel {
     ) -> Result<(), VaneError> {
         read_quic_packets(
             &self.socket,
+            &mut self.last_read_timeout,
+            &mut self.recv_buf,
             &mut self.conn,
             self.local_addr,
             self.peer_addr,
         )?;
-        process_masque_control_events(&mut self.http3, &mut self.conn, self.stream_id)?;
+        process_masque_control_events(
+            &mut self.http3,
+            &mut self.conn,
+            &mut self.control_buf,
+            self.stream_id,
+        )?;
 
-        let mut buf = [0; MAX_DATAGRAM_SIZE];
+        let buf = &mut self.dgram_buf;
         loop {
-            match self.conn.dgram_recv(&mut buf) {
+            match self.conn.dgram_recv(&mut buf[..]) {
                 Ok(len) => {
                     let Some((flow_id, context_id, payload_offset)) =
                         decode_h3_datagram(&buf[..len])?
@@ -1281,11 +1483,136 @@ impl MasqueProxyConfig {
     }
 }
 
+/// Hands out a QUIC client connection built from the client's cached config,
+/// rebuilding the config only when the effective idle timeout changes. The lock
+/// is held across `quiche::connect` (cheap and non-blocking) and released well
+/// before the handshake loop.
+fn quic_connect(
+    cache: &QuicConfigCache,
+    server_name: &str,
+    scid: &quiche::ConnectionId<'_>,
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+    timeout: Duration,
+    max_send_udp_payload: usize,
+) -> Result<quiche::Connection, VaneError> {
+    let idle_timeout_millis = timeout.as_millis().try_into().unwrap_or(u64::MAX);
+    // The cache holds no invariant a panicking thread could have broken, so a
+    // poisoned lock must not brick every later request on this client.
+    let mut cached = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    let key = (idle_timeout_millis, max_send_udp_payload);
+    if cached.len() >= MAX_QUIC_CONFIGS && !cached.contains_key(&key) {
+        cached.clear();
+    }
+    let config = match cached.entry(key) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => entry.insert(create_quiche_config(
+            idle_timeout_millis,
+            max_send_udp_payload,
+        )?),
+    };
+
+    quiche::connect(Some(server_name), scid, local_addr, peer_addr, config)
+        .map_err(|e| VaneError::Generic(format!("Failed to create QUIC client: {e}")))
+}
+
+/// Offers a cached ticket for TLS 1.3 resumption.
+///
+/// SECURITY: a resumed TLS 1.3 handshake does not re-run the certificate
+/// exchange. BoringSSL restores the peer chain from the serialized
+/// `SSL_SESSION`, so `peer_cert()` would hand our post-handshake pin check a
+/// certificate cached from an earlier handshake rather than one the server just
+/// proved it holds. Any host with pins configured therefore always does a full
+/// handshake. Ticket reuse only — early data is never enabled.
+fn resume_tls_session(
+    store: &TlsSessionStore,
+    conn: &mut quiche::Connection,
+    key: &TlsSessionKey,
+    certificate_pins: &HashMap<String, Vec<String>>,
+) {
+    if !may_resume_tls_session(&key.host, certificate_pins) {
+        return;
+    }
+    let sessions = store.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(session) = sessions.get(key) {
+        // A stale or rejected ticket just means a full handshake.
+        conn.set_session(session).ok();
+    }
+}
+
+/// The pinned-host gate described on [`resume_tls_session`].
+fn may_resume_tls_session(host: &str, certificate_pins: &HashMap<String, Vec<String>>) -> bool {
+    certificate_pins
+        .get(host)
+        .is_none_or(|pins| pins.is_empty())
+}
+
+/// Largest UDP payload the MASQUE inner connection may emit.
+///
+/// Every inner packet is varint-framed into an HTTP/3 DATAGRAM on the outer
+/// connection, so a full-MTU inner packet plus framing overflows the outer
+/// connection's datagram limit and is dropped — which only shows up as failures
+/// at high throughput. Size the inner connection from the outer connection's
+/// actual datagram capacity; quiche clamps the result up to its 1200-byte
+/// floor, and there is nothing further we can do if the outer link is smaller
+/// than that.
+/// The result is clamped to quiche's own 1200-byte floor before it is returned,
+/// because quiche clamps `set_max_send_udp_payload_size` up to that floor
+/// anyway: without this, every smaller measurement would key a distinct but
+/// byte-identical entry in the config cache.
+fn masque_inner_udp_payload(outer: &quiche::Connection, flow_id: u64) -> usize {
+    let framing = varint_len(flow_id) + varint_len(0);
+    outer
+        .dgram_max_writable_len()
+        .map_or(MASQUE_INNER_FALLBACK_UDP_PAYLOAD, |max| {
+            max.saturating_sub(framing).min(MAX_DATAGRAM_SIZE)
+        })
+        .max(MASQUE_INNER_FALLBACK_UDP_PAYLOAD)
+}
+
+fn store_tls_session(
+    store: &TlsSessionStore,
+    conn: &quiche::Connection,
+    key: &TlsSessionKey,
+    certificate_pins: &HashMap<String, Vec<String>>,
+) {
+    // A ticket resumption would always refuse is dead weight that counts toward
+    // the bound and can evict a host that could actually have resumed.
+    if !may_resume_tls_session(&key.host, certificate_pins) {
+        return;
+    }
+    let Some(session) = conn.session() else {
+        return;
+    };
+    let mut sessions = store.lock().unwrap_or_else(PoisonError::into_inner);
+    if sessions
+        .get(key)
+        .is_some_and(|stored| stored.as_slice() == session)
+    {
+        return;
+    }
+    insert_tls_session(&mut sessions, key, session.to_vec());
+}
+
+fn insert_tls_session(
+    sessions: &mut HashMap<TlsSessionKey, Vec<u8>>,
+    key: &TlsSessionKey,
+    session: Vec<u8>,
+) {
+    if sessions.len() >= MAX_TLS_SESSIONS && !sessions.contains_key(key) {
+        sessions.clear();
+    }
+    sessions.insert(key.clone(), session);
+}
+
 fn connect_quic_h3(
     host: &str,
     peer_addr: SocketAddr,
     timeout: Duration,
     certificate_pins: &HashMap<String, Vec<String>>,
+    quic_config: &QuicConfigCache,
+    tls_sessions: &TlsSessionStore,
+    session_key: &TlsSessionKey,
 ) -> Result<DirectHttp3Connection, VaneError> {
     let bind_addr = match peer_addr {
         SocketAddr::V4(_) => "0.0.0.0:0",
@@ -1300,32 +1627,50 @@ fn connect_quic_h3(
     let local_addr = socket
         .local_addr()
         .map_err(|e| VaneError::Generic(format!("Failed to read UDP local address: {e}")))?;
+    let mut last_read_timeout = Some(Duration::from_millis(10));
     socket
-        .set_read_timeout(Some(Duration::from_millis(10)))
+        .set_read_timeout(last_read_timeout)
         .map_err(|e| VaneError::Generic(format!("Failed to set UDP read timeout: {e}")))?;
     socket
         .set_write_timeout(Some(timeout))
         .map_err(|e| VaneError::Generic(format!("Failed to set UDP write timeout: {e}")))?;
 
-    let mut quic_config = create_quiche_config(timeout)?;
     let mut scid = [0; quiche::MAX_CONN_ID_LEN];
     getrandom::fill(&mut scid)
         .map_err(|e| VaneError::Generic(format!("Failed to generate QUIC connection ID: {e}")))?;
     let scid = quiche::ConnectionId::from_ref(&scid);
-    let mut conn = quiche::connect(Some(host), &scid, local_addr, peer_addr, &mut quic_config)
-        .map_err(|e| VaneError::Generic(format!("Failed to create QUIC client: {e}")))?;
+    let mut conn = quic_connect(
+        quic_config,
+        host,
+        &scid,
+        local_addr,
+        peer_addr,
+        timeout,
+        MAX_DATAGRAM_SIZE,
+    )?;
+    resume_tls_session(tls_sessions, &mut conn, session_key, certificate_pins);
     let mut h3_config = quiche::h3::Config::new()
         .map_err(|e| VaneError::Generic(format!("Failed to create HTTP/3 config: {e}")))?;
     h3_config.enable_extended_connect(true);
 
-    flush_quic_packets(&socket, &mut conn)?;
+    let mut recv_buf = vec![0; UDP_RECV_BUFFER_BYTES];
+    let mut send_buf = vec![0; MAX_DATAGRAM_SIZE];
+    flush_quic_packets(&socket, &mut send_buf, &mut conn)?;
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
-        read_quic_packets(&socket, &mut conn, local_addr, peer_addr)?;
+        read_quic_packets(
+            &socket,
+            &mut last_read_timeout,
+            &mut recv_buf,
+            &mut conn,
+            local_addr,
+            peer_addr,
+        )?;
 
         if conn.is_established() {
             verify_certificate_pins(host, conn.peer_cert(), certificate_pins)?;
+            store_tls_session(tls_sessions, &conn, session_key, certificate_pins);
             let http3 = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
             return Ok(DirectHttp3Connection {
                 socket,
@@ -1336,7 +1681,7 @@ fn connect_quic_h3(
             });
         }
 
-        flush_quic_packets(&socket, &mut conn)?;
+        flush_quic_packets(&socket, &mut send_buf, &mut conn)?;
 
         if conn.is_closed() {
             return Err(VaneError::Generic(
@@ -1378,13 +1723,19 @@ fn establish_connect_udp_tunnel(
     let stream_id = transport
         .http3
         .send_request(&mut transport.conn, &headers, true)?;
-    flush_quic_packets(&transport.socket, &mut transport.conn)?;
+    let mut recv_buf = vec![0; UDP_RECV_BUFFER_BYTES];
+    let mut send_buf = vec![0; MAX_DATAGRAM_SIZE];
+    let mut control_buf = vec![0; MASQUE_CONTROL_BUFFER_BYTES];
+    flush_quic_packets(&transport.socket, &mut send_buf, &mut transport.conn)?;
 
     let deadline = Instant::now() + timeout;
     let mut tunnel_accepted = false;
+    let mut last_read_timeout = None;
     while Instant::now() < deadline {
         read_quic_packets(
             &transport.socket,
+            &mut last_read_timeout,
+            &mut recv_buf,
             &mut transport.conn,
             transport.local_addr,
             transport.peer_addr,
@@ -1392,6 +1743,7 @@ fn establish_connect_udp_tunnel(
         process_connect_udp_events(
             &mut transport.http3,
             &mut transport.conn,
+            &mut control_buf,
             stream_id,
             &mut tunnel_accepted,
         )?;
@@ -1410,7 +1762,7 @@ fn establish_connect_udp_tunnel(
             return Ok(stream_id);
         }
 
-        flush_quic_packets(&transport.socket, &mut transport.conn)?;
+        flush_quic_packets(&transport.socket, &mut send_buf, &mut transport.conn)?;
 
         if transport.conn.is_closed() {
             return Err(VaneError::Generic(
@@ -1427,6 +1779,7 @@ fn establish_connect_udp_tunnel(
 fn process_connect_udp_events(
     http3: &mut quiche::h3::Connection,
     conn: &mut quiche::Connection,
+    buf: &mut [u8],
     tunnel_stream_id: u64,
     tunnel_accepted: &mut bool,
 ) -> Result<(), VaneError> {
@@ -1454,16 +1807,13 @@ fn process_connect_udp_events(
                     )));
                 }
             }
-            Ok((stream_id, quiche::h3::Event::Data)) => {
-                let mut buf = [0; 4096];
-                loop {
-                    match http3.recv_body(conn, stream_id, &mut buf) {
-                        Ok(_) => {}
-                        Err(quiche::h3::Error::Done) => break,
-                        Err(e) => return Err(e.into()),
-                    }
+            Ok((stream_id, quiche::h3::Event::Data)) => loop {
+                match http3.recv_body(conn, stream_id, &mut buf[..]) {
+                    Ok(_) => {}
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(e) => return Err(e.into()),
                 }
-            }
+            },
             Ok((stream_id, quiche::h3::Event::Finished))
                 if stream_id == tunnel_stream_id && !*tunnel_accepted =>
             {
@@ -1496,10 +1846,11 @@ fn process_connect_udp_events(
 fn process_masque_control_events(
     http3: &mut quiche::h3::Connection,
     conn: &mut quiche::Connection,
+    buf: &mut [u8],
     tunnel_stream_id: u64,
 ) -> Result<(), VaneError> {
     let mut accepted = true;
-    process_connect_udp_events(http3, conn, tunnel_stream_id, &mut accepted)
+    process_connect_udp_events(http3, conn, buf, tunnel_stream_id, &mut accepted)
 }
 
 fn read_quic_packets_via(
@@ -1509,22 +1860,33 @@ fn read_quic_packets_via(
     peer_addr: SocketAddr,
 ) -> Result<(), VaneError> {
     match io {
-        Http3Io::Direct { socket } => read_quic_packets(socket, conn, local_addr, peer_addr),
+        Http3Io::Direct {
+            socket,
+            last_read_timeout,
+            recv_buf,
+        } => read_quic_packets(
+            socket,
+            last_read_timeout,
+            recv_buf,
+            conn,
+            local_addr,
+            peer_addr,
+        ),
         Http3Io::Masque(tunnel) => tunnel.read_origin_packets(conn, local_addr, peer_addr),
     }
 }
 
 fn flush_quic_packets_via(
     io: &mut Http3Io,
+    out: &mut [u8],
     conn: &mut quiche::Connection,
 ) -> Result<(), VaneError> {
-    let mut out = [0; MAX_DATAGRAM_SIZE];
     loop {
-        match conn.send(&mut out) {
+        match conn.send(&mut out[..]) {
             Ok((written, send_info)) => {
                 let _ = send_info;
                 match io {
-                    Http3Io::Direct { socket } => {
+                    Http3Io::Direct { socket, .. } => {
                         socket.send(&out[..written]).map_err(|e| {
                             VaneError::Generic(format!("Failed to send UDP packet: {e}"))
                         })?;
@@ -1640,71 +2002,63 @@ struct H3RequestOptions<'a> {
     url: &'a Url,
     max_response_body_bytes: u64,
     response_body_path: Option<&'a str>,
-    cancel_token_id: Option<u64>,
-    progress_id: Option<u64>,
+    cancel_token: Option<&'a AtomicBool>,
+    progress: Option<&'a VaneProgressState>,
 }
 
 fn perform_http3_request(
     transport: &mut PooledHttp3Connection,
     options: H3RequestOptions<'_>,
+    response_started: &mut bool,
 ) -> Result<Http3ResponseParts, VaneError> {
-    let mut request_stream_id = None;
     let mut body_offset = 0usize;
     let deadline = Instant::now() + options.timeout;
     let mut response =
         H3ResponseState::new(options.max_response_body_bytes, options.response_body_path)?;
 
+    // Send before the first read: the read blocks for up to 50 ms, so reading
+    // first delays the request by a full poll interval on every attempt. The
+    // deadline is still checked first so an expired one sends nothing.
+    if Instant::now() >= deadline {
+        return Err(VaneError::Generic("HTTP/3 request timed out".to_string()));
+    }
+    check_cancelled(options.cancel_token)?;
+    let mut stream_id = send_h3_request(transport, &options)?;
+    if let Some(stream_id) = stream_id {
+        send_request_body(transport, stream_id, &options, &mut body_offset)?;
+    }
+    transport.flush_packets()?;
+
     while Instant::now() < deadline {
-        check_cancelled(options.cancel_token_id)?;
+        check_cancelled(options.cancel_token)?;
         transport.read_packets()?;
 
-        if request_stream_id.is_none() {
-            let fin = options.request_body.is_empty();
-            request_stream_id = Some(transport.http3.send_request(
-                &mut transport.conn,
-                options.headers,
-                fin,
-            )?);
+        // Re-issue a request quiche asked us to retry, now that the read above
+        // may have delivered the peer's MAX_STREAMS credit.
+        if stream_id.is_none() {
+            stream_id = send_h3_request(transport, &options)?;
         }
-
-        if let Some(stream_id) = request_stream_id {
-            while body_offset < options.request_body.len() {
-                match transport.http3.send_body(
-                    &mut transport.conn,
-                    stream_id,
-                    &options.request_body[body_offset..],
-                    true,
-                ) {
-                    Ok(written) => {
-                        body_offset += written;
-                        progress_upload(
-                            options.progress_id,
-                            body_offset as u64,
-                            options.request_body.len() as u64,
-                        );
-                    }
-                    Err(quiche::h3::Error::Done) => break,
-                    Err(e) => return Err(e.into()),
-                }
-            }
+        if let Some(stream_id) = stream_id {
+            send_request_body(transport, stream_id, &options, &mut body_offset)?;
         }
 
         process_h3_events(
             &mut transport.http3,
             &mut transport.conn,
+            &mut transport.body_buf,
             &mut response,
-            options.cancel_token_id,
-            options.progress_id,
+            options.cancel_token,
+            options.progress,
+            response_started,
         )?;
-
-        if response.finished {
-            transport.flush_packets()?;
-            break;
-        }
 
         transport.flush_packets()?;
 
-        if transport.conn.is_closed() && !response.finished {
+        if response.finished {
+            break;
+        }
+
+        if transport.conn.is_closed() {
             return Err(VaneError::Generic(
                 "QUIC connection closed before response completed".to_string(),
             ));
@@ -1725,16 +2079,71 @@ fn perform_http3_request(
     })
 }
 
-fn create_quiche_config(timeout: Duration) -> Result<quiche::Config, VaneError> {
+/// Returns `None` when quiche asked us to retry the whole call later. Both
+/// `StreamBlocked` and `TransportError(StreamLimit)` roll the H3 stream state
+/// back without consuming the stream id, and quiche documents that repeating
+/// `send_request` with the same arguments is the required recovery once the
+/// peer grants more stream credit. Every other error stays fatal.
+fn send_h3_request(
+    transport: &mut PooledHttp3Connection,
+    options: &H3RequestOptions<'_>,
+) -> Result<Option<u64>, VaneError> {
+    match transport.http3.send_request(
+        &mut transport.conn,
+        options.headers,
+        options.request_body.is_empty(),
+    ) {
+        Ok(stream_id) => Ok(Some(stream_id)),
+        Err(
+            quiche::h3::Error::StreamBlocked
+            | quiche::h3::Error::TransportError(quiche::Error::StreamLimit),
+        ) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn send_request_body(
+    transport: &mut PooledHttp3Connection,
+    stream_id: u64,
+    options: &H3RequestOptions<'_>,
+    body_offset: &mut usize,
+) -> Result<(), VaneError> {
+    while *body_offset < options.request_body.len() {
+        match transport.http3.send_body(
+            &mut transport.conn,
+            stream_id,
+            &options.request_body[*body_offset..],
+            true,
+        ) {
+            Ok(written) => {
+                *body_offset += written;
+                progress_upload(
+                    options.progress,
+                    *body_offset as u64,
+                    options.request_body.len() as u64,
+                );
+            }
+            Err(quiche::h3::Error::Done) => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(())
+}
+
+fn create_quiche_config(
+    max_idle_timeout_millis: u64,
+    max_send_udp_payload: usize,
+) -> Result<quiche::Config, VaneError> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
     config
         .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
         .map_err(|e| VaneError::Generic(format!("Failed to configure HTTP/3 ALPN: {e:?}")))?;
     config.verify_peer(true);
     load_platform_roots(&mut config)?;
-    config.set_max_idle_timeout(timeout.as_millis().try_into().unwrap_or(u64::MAX));
+    config.set_max_idle_timeout(max_idle_timeout_millis);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
+    config.set_max_send_udp_payload_size(max_send_udp_payload);
     config.enable_dgram(true, 1024, 1024);
     config.set_initial_max_data(10_000_000);
     config.set_initial_max_stream_data_bidi_local(1_000_000);
@@ -1956,7 +2365,7 @@ fn validate_request_body_limit(body: &[u8], max_request_body_bytes: u64) -> Resu
     Ok(())
 }
 
-fn load_request_body(request: &VaneRequest) -> Result<Vec<u8>, VaneError> {
+fn load_request_body(request: &VaneRequest) -> Result<Cow<'_, [u8]>, VaneError> {
     if let Some(path) = &request.body_file_path
         && !path.is_empty()
     {
@@ -1967,9 +2376,9 @@ fn load_request_body(request: &VaneRequest) -> Result<Vec<u8>, VaneError> {
         file.read_to_end(&mut body).map_err(|e| {
             VaneError::Generic(format!("Failed to read request body file {path}: {e}"))
         })?;
-        return Ok(body);
+        return Ok(Cow::Owned(body));
     }
-    Ok(request.body.clone().unwrap_or_default())
+    Ok(Cow::Borrowed(request.body.as_deref().unwrap_or_default()))
 }
 
 fn validate_response_body_limit(
@@ -1986,72 +2395,55 @@ fn validate_response_body_limit(
     Ok(())
 }
 
-fn check_cancelled(cancel_token_id: Option<u64>) -> Result<(), VaneError> {
-    let Some(id) = cancel_token_id else {
-        return Ok(());
-    };
-    let cancelled = CANCEL_TOKENS
-        .lock()
-        .ok()
-        .and_then(|tokens| tokens.get(&id).cloned())
-        .is_some_and(|token| token.load(Ordering::Relaxed));
-    if cancelled {
-        Err(VaneError::Generic("Vane request was cancelled".to_string()))
-    } else {
-        Ok(())
+/// Resolves a cancel token id to its handle once per request; the transfer loop
+/// then only loads the atomic.
+fn cancel_token(cancel_token_id: Option<u64>) -> Option<Arc<AtomicBool>> {
+    let id = cancel_token_id?;
+    CANCEL_TOKENS.lock().ok()?.get(&id).cloned()
+}
+
+fn check_cancelled(cancel_token: Option<&AtomicBool>) -> Result<(), VaneError> {
+    if cancel_token.is_some_and(|token| token.load(Ordering::Relaxed)) {
+        return Err(VaneError::Generic("Vane request was cancelled".to_string()));
+    }
+
+    Ok(())
+}
+
+fn progress_init(progress_id: Option<u64>, upload_total: u64) -> Option<Arc<VaneProgressState>> {
+    let id = progress_id?;
+    let state = PROGRESS_STATES.lock().ok()?.entry(id).or_default().clone();
+    state.reset(upload_total);
+    Some(state)
+}
+
+fn progress_upload(progress: Option<&VaneProgressState>, sent: u64, total: u64) {
+    if let Some(state) = progress {
+        state.upload_sent.store(sent, Ordering::Relaxed);
+        state.upload_total.store(total, Ordering::Relaxed);
     }
 }
 
-fn progress_init(progress_id: Option<u64>, upload_total: u64) {
-    let Some(id) = progress_id else {
-        return;
-    };
-    if let Ok(mut states) = PROGRESS_STATES.lock() {
-        states.insert(
-            id,
-            VaneProgressState {
-                upload_total,
-                ..VaneProgressState::default()
-            },
-        );
+fn progress_download(progress: Option<&VaneProgressState>, received: u64, total: u64) {
+    if let Some(state) = progress {
+        state.download_received.store(received, Ordering::Relaxed);
+        state.download_total.store(total, Ordering::Relaxed);
     }
 }
 
-fn progress_upload(progress_id: Option<u64>, sent: u64, total: u64) {
-    let Some(id) = progress_id else {
-        return;
-    };
-    if let Ok(mut states) = PROGRESS_STATES.lock() {
-        let state = states.entry(id).or_default();
-        state.upload_sent = sent;
-        state.upload_total = total;
-    }
-}
-
-fn progress_download(progress_id: Option<u64>, received: u64, total: u64) {
-    let Some(id) = progress_id else {
-        return;
-    };
-    if let Ok(mut states) = PROGRESS_STATES.lock() {
-        let state = states.entry(id).or_default();
-        state.download_received = received;
-        state.download_total = total;
-    }
-}
-
-fn progress_done(progress_id: Option<u64>) {
-    let Some(id) = progress_id else {
-        return;
-    };
-    if let Ok(mut states) = PROGRESS_STATES.lock() {
-        states.entry(id).or_default().done = true;
+fn progress_done(progress: Option<&VaneProgressState>) {
+    if let Some(state) = progress {
+        // Release pairs with the Acquire load in `progress_snapshot`: a reader
+        // that observes `done` must also observe the final counters, otherwise
+        // a progress bar can latch "done" while still showing 99%.
+        state.done.store(true, Ordering::Release);
     }
 }
 
 fn progress_create() -> u64 {
     let id = NEXT_PROGRESS_ID.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut states) = PROGRESS_STATES.lock() {
-        states.insert(id, VaneProgressState::default());
+        states.insert(id, Arc::default());
     }
     id
 }
@@ -2060,14 +2452,19 @@ fn progress_snapshot(id: u64) -> VaneProgressSnapshot {
     let state = PROGRESS_STATES
         .lock()
         .ok()
-        .and_then(|states| states.get(&id).cloned())
-        .unwrap_or_default();
+        .and_then(|states| states.get(&id).cloned());
+    let Some(state) = state else {
+        return VaneProgressSnapshot::default();
+    };
+    // `done` is read first with Acquire so the counters read after it are at
+    // least as new as the ones the writer published before setting it.
+    let done = state.done.load(Ordering::Acquire);
     VaneProgressSnapshot {
-        upload_sent: state.upload_sent,
-        upload_total: state.upload_total,
-        download_received: state.download_received,
-        download_total: state.download_total,
-        done: state.done,
+        upload_sent: state.upload_sent.load(Ordering::Relaxed),
+        upload_total: state.upload_total.load(Ordering::Relaxed),
+        download_received: state.download_received.load(Ordering::Relaxed),
+        download_total: state.download_total.load(Ordering::Relaxed),
+        done,
     }
 }
 
@@ -2185,18 +2582,25 @@ fn push_regular_header(
 
 fn read_quic_packets(
     socket: &UdpSocket,
+    last_read_timeout: &mut Option<Duration>,
+    buf: &mut [u8],
     conn: &mut quiche::Connection,
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
 ) -> Result<(), VaneError> {
-    let timeout = conn.timeout().unwrap_or(Duration::from_millis(10));
-    socket
-        .set_read_timeout(Some(timeout.min(Duration::from_millis(50))))
-        .map_err(|e| VaneError::Generic(format!("Failed to set UDP read timeout: {e}")))?;
+    let timeout = conn
+        .timeout()
+        .unwrap_or(Duration::from_millis(10))
+        .min(Duration::from_millis(50));
+    if *last_read_timeout != Some(timeout) {
+        socket
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| VaneError::Generic(format!("Failed to set UDP read timeout: {e}")))?;
+        *last_read_timeout = Some(timeout);
+    }
 
-    let mut buf = [0; 65535];
     loop {
-        match socket.recv(&mut buf) {
+        match socket.recv(&mut buf[..]) {
             Ok(len) => {
                 let recv_info = quiche::RecvInfo {
                     from: peer_addr,
@@ -2230,10 +2634,13 @@ fn read_quic_packets(
     Ok(())
 }
 
-fn flush_quic_packets(socket: &UdpSocket, conn: &mut quiche::Connection) -> Result<(), VaneError> {
-    let mut out = [0; MAX_DATAGRAM_SIZE];
+fn flush_quic_packets(
+    socket: &UdpSocket,
+    out: &mut [u8],
+    conn: &mut quiche::Connection,
+) -> Result<(), VaneError> {
     loop {
-        match conn.send(&mut out) {
+        match conn.send(&mut out[..]) {
             Ok((written, send_info)) => {
                 let _ = send_info;
                 socket
@@ -2257,6 +2664,7 @@ struct H3ResponseState {
     finished: bool,
     max_body_bytes: u64,
     body_len: usize,
+    download_total: u64,
 }
 
 impl H3ResponseState {
@@ -2279,7 +2687,25 @@ impl H3ResponseState {
             finished: false,
             max_body_bytes,
             body_len: 0,
+            download_total: 0,
         })
+    }
+
+    /// Records the advertised body size for progress and pre-sizes the
+    /// in-memory body. HEAD and 304 responses carry a `content-length` for an
+    /// entity that never arrives, so the reservation is capped well below the
+    /// configured response limit; unparsable values are ignored.
+    fn on_content_length(&mut self, content_length: &str) {
+        let Ok(len) = content_length.parse::<u64>() else {
+            return;
+        };
+        self.download_total = len;
+        if self.body_file.is_some() {
+            return;
+        }
+        if let Ok(len) = usize::try_from(len.min(self.max_body_bytes).min(MAX_BODY_RESERVE_BYTES)) {
+            self.body.reserve_exact(len);
+        }
     }
 
     fn push_body(&mut self, bytes: &[u8]) -> Result<(), VaneError> {
@@ -2298,15 +2724,16 @@ impl H3ResponseState {
 fn process_h3_events(
     http3: &mut quiche::h3::Connection,
     conn: &mut quiche::Connection,
+    buf: &mut [u8],
     response: &mut H3ResponseState,
-    cancel_token_id: Option<u64>,
-    progress_id: Option<u64>,
+    cancel_token: Option<&AtomicBool>,
+    progress: Option<&VaneProgressState>,
+    response_started: &mut bool,
 ) -> Result<(), VaneError> {
-    let mut buf = [0; 16 * 1024];
-
     loop {
         match http3.poll(conn) {
             Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                *response_started = true;
                 for header in list {
                     let name = String::from_utf8_lossy(header.name()).to_string();
                     let value = String::from_utf8_lossy(header.value()).to_string();
@@ -2315,27 +2742,37 @@ fn process_h3_events(
                     } else if name.eq_ignore_ascii_case("set-cookie") {
                         response.set_cookie_headers.push(value);
                     } else {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            response.on_content_length(&value);
+                        }
                         response.headers.insert(name, value);
                     }
                 }
                 let _ = stream_id;
             }
             Ok((stream_id, quiche::h3::Event::Data)) => loop {
-                check_cancelled(cancel_token_id)?;
-                match http3.recv_body(conn, stream_id, &mut buf) {
+                *response_started = true;
+                check_cancelled(cancel_token)?;
+                match http3.recv_body(conn, stream_id, &mut buf[..]) {
                     Ok(read) => {
                         response.push_body(&buf[..read])?;
-                        progress_download(progress_id, response.body_len as u64, 0);
+                        progress_download(
+                            progress,
+                            response.body_len as u64,
+                            response.download_total,
+                        );
                     }
                     Err(quiche::h3::Error::Done) => break,
                     Err(e) => return Err(e.into()),
                 }
             },
             Ok((_stream_id, quiche::h3::Event::Finished)) => {
+                *response_started = true;
                 response.finished = true;
                 break;
             }
             Ok((_stream_id, quiche::h3::Event::Reset(e))) => {
+                *response_started = true;
                 return Err(VaneError::Generic(format!("HTTP/3 stream reset: {e:?}")));
             }
             Ok((_id, quiche::h3::Event::GoAway)) => {
@@ -3093,7 +3530,7 @@ mod tests {
         assert_eq!(config.protocol_mode, VaneProtocolMode::Http3Only);
         assert_eq!(config.timeout_seconds, Some(30));
         assert!(!config.cookies_enabled);
-        assert!(!config.connection_pool_enabled);
+        assert!(config.connection_pool_enabled);
         assert_eq!(config.max_idle_connections, 4);
         assert_eq!(config.connection_idle_timeout_seconds, 30);
         assert_eq!(config.retry_max_attempts, 1);
@@ -3285,6 +3722,16 @@ mod tests {
         assert_eq!(decoded.0, 64);
         assert_eq!(decoded.1, 0);
         assert_eq!(&encoded[decoded.2..], b"packet");
+
+        // `masque_inner_udp_payload` budgets exactly this many framing bytes;
+        // if the encoder's prefix ever grows, the inner MTU silently overflows
+        // the outer connection's datagram limit.
+        for flow_id in [0, 64, 16_384, 1_073_741_824] {
+            assert_eq!(
+                encode_h3_datagram(flow_id, 0, b"").unwrap().len(),
+                varint_len(flow_id) + varint_len(0)
+            );
+        }
     }
 
     #[test]
@@ -3626,22 +4073,195 @@ mod tests {
     #[test]
     fn cancel_tokens_and_progress_state_are_tracked_by_id() {
         let cancel_id = vane_ffi_cancel_token_create();
-        assert!(check_cancelled(Some(cancel_id)).is_ok());
+        let token = cancel_token(Some(cancel_id)).expect("cancel token should resolve by id");
+        assert!(check_cancelled(Some(&token)).is_ok());
         vane_ffi_cancel_token_cancel(cancel_id);
-        assert!(check_cancelled(Some(cancel_id)).is_err());
+        assert!(check_cancelled(Some(&token)).is_err());
         vane_ffi_cancel_token_free(cancel_id);
 
+        // The handle the transfer loop writes and the id-keyed snapshot API must
+        // observe the same atomics.
         let progress_id = vane_ffi_progress_create();
-        progress_init(Some(progress_id), 10);
-        progress_upload(Some(progress_id), 4, 10);
-        progress_download(Some(progress_id), 8, 0);
-        progress_done(Some(progress_id));
-        let progress = vane_ffi_progress_snapshot(progress_id);
-        assert_eq!(progress.upload_sent, 4);
-        assert_eq!(progress.upload_total, 10);
-        assert_eq!(progress.download_received, 8);
-        assert!(progress.done);
+        let progress = progress_init(Some(progress_id), 10).expect("progress should resolve by id");
+        progress_upload(Some(&progress), 4, 10);
+        progress_download(Some(&progress), 8, 0);
+        progress_done(Some(&progress));
+        let snapshot = vane_ffi_progress_snapshot(progress_id);
+        assert_eq!(snapshot.upload_sent, 4);
+        assert_eq!(snapshot.upload_total, 10);
+        assert_eq!(snapshot.download_received, 8);
+        assert!(snapshot.done);
         vane_ffi_progress_free(progress_id);
+        assert!(!vane_ffi_progress_snapshot(progress_id).done);
+    }
+
+    #[test]
+    fn quiche_config_is_cached_per_idle_timeout_and_udp_payload() {
+        let cache = QuicConfigCache::new(HashMap::new());
+        let scid = quiche::ConnectionId::from_ref(&[7; quiche::MAX_CONN_ID_LEN]);
+        let local = SocketAddr::from(([127, 0, 0, 1], 4433));
+        let peer = SocketAddr::from(([127, 0, 0, 1], 443));
+        let connect = |seconds, payload| {
+            quic_connect(
+                &cache,
+                "example.com",
+                &scid,
+                local,
+                peer,
+                Duration::from_secs(seconds),
+                payload,
+            )
+        };
+        let cached_keys = || {
+            let mut keys = cache.lock().unwrap().keys().copied().collect::<Vec<_>>();
+            keys.sort_unstable();
+            keys
+        };
+
+        // A second connect on the same cached config must still succeed: that is
+        // the property the cache depends on.
+        for _ in 0..2 {
+            connect(30, MAX_DATAGRAM_SIZE).expect("connect should reuse the cached config");
+        }
+        assert_eq!(cached_keys(), vec![(30_000, MAX_DATAGRAM_SIZE)]);
+
+        // Alternating timeouts keep both configs instead of thrashing one slot.
+        connect(5, MAX_DATAGRAM_SIZE).unwrap();
+        connect(30, MAX_DATAGRAM_SIZE).unwrap();
+        assert_eq!(
+            cached_keys(),
+            vec![(5_000, MAX_DATAGRAM_SIZE), (30_000, MAX_DATAGRAM_SIZE)]
+        );
+
+        // The MASQUE inner connection's smaller payload is a separate entry, so
+        // outer and inner configs coexist instead of evicting each other.
+        connect(30, MASQUE_INNER_FALLBACK_UDP_PAYLOAD).unwrap();
+        assert_eq!(
+            cached_keys(),
+            vec![
+                (5_000, MAX_DATAGRAM_SIZE),
+                (30_000, MASQUE_INNER_FALLBACK_UDP_PAYLOAD),
+                (30_000, MAX_DATAGRAM_SIZE)
+            ]
+        );
+
+        // The payload half of the key is measured per connection, so the map
+        // must stay bounded rather than growing one CA-parse per new pair.
+        for seconds in 0..(MAX_QUIC_CONFIGS as u64 + 2) {
+            connect(seconds + 1, MAX_DATAGRAM_SIZE).unwrap();
+        }
+        assert!(cache.lock().unwrap().len() <= MAX_QUIC_CONFIGS);
+    }
+
+    #[test]
+    fn pinned_hosts_never_resume_a_tls_session() {
+        let pinned = HashMap::from([
+            (
+                "pinned.test".to_string(),
+                vec!["sha256/example".to_string()],
+            ),
+            // An empty pin list is not pinning, so it must not block resumption.
+            ("empty.test".to_string(), Vec::new()),
+        ]);
+
+        assert!(!may_resume_tls_session("pinned.test", &pinned));
+        assert!(may_resume_tls_session("empty.test", &pinned));
+        assert!(may_resume_tls_session("other.test", &pinned));
+        assert!(may_resume_tls_session("any.test", &HashMap::new()));
+    }
+
+    #[test]
+    fn tls_session_store_stays_bounded() {
+        let mut sessions = HashMap::new();
+        let first = TlsSessionKey::origin("host0.test", 443);
+        for index in 0..MAX_TLS_SESSIONS {
+            insert_tls_session(
+                &mut sessions,
+                &TlsSessionKey::origin(&format!("host{index}.test"), 443),
+                vec![1],
+            );
+        }
+        assert_eq!(sessions.len(), MAX_TLS_SESSIONS);
+
+        // Refreshing a host already in the store must not trip the bound.
+        insert_tls_session(&mut sessions, &first, vec![2]);
+        assert_eq!(sessions.len(), MAX_TLS_SESSIONS);
+        assert_eq!(sessions.get(&first), Some(&vec![2]));
+
+        // ponytail: the bound clears wholesale rather than evicting an LRU
+        // entry, so a new host past the cap resets the store to just itself.
+        let new = TlsSessionKey::origin("new.test", 443);
+        insert_tls_session(&mut sessions, &new, vec![3]);
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains_key(&new));
+    }
+
+    #[test]
+    fn tls_session_keys_separate_port_and_proxy_hop() {
+        // A resumed TLS 1.3 handshake verifies no certificate, so a ticket must
+        // not carry across a port change or between the proxy hop and origin.
+        let origin = TlsSessionKey::origin("api.example.com", 443);
+        assert_ne!(origin, TlsSessionKey::origin("api.example.com", 8443));
+        assert_ne!(origin, TlsSessionKey::proxy("api.example.com", 443));
+        assert_ne!(origin, TlsSessionKey::origin("other.example.com", 443));
+        assert_eq!(origin, TlsSessionKey::origin("api.example.com", 443));
+
+        let mut sessions = HashMap::new();
+        insert_tls_session(&mut sessions, &origin, vec![1]);
+        insert_tls_session(
+            &mut sessions,
+            &TlsSessionKey::origin("api.example.com", 8443),
+            vec![2],
+        );
+        insert_tls_session(
+            &mut sessions,
+            &TlsSessionKey::proxy("api.example.com", 443),
+            vec![3],
+        );
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions.get(&origin), Some(&vec![1]));
+    }
+
+    #[test]
+    fn changing_certificate_pins_drops_the_stored_tls_session() {
+        let client = VaneClient::new(VaneClientConfig::default()).unwrap();
+        client
+            .tls_sessions
+            .lock()
+            .unwrap()
+            .insert(TlsSessionKey::origin("api.example.com", 443), vec![7]);
+
+        client
+            .set_certificate_pins(
+                "api.example.com".to_string(),
+                vec!["sha256/example".to_string()],
+            )
+            .unwrap();
+
+        assert!(client.tls_sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn content_length_sets_download_total_and_caps_the_reservation() {
+        let mut response = H3ResponseState::new(64 * 1024 * 1024, None).unwrap();
+
+        response.on_content_length("not-a-number");
+        assert_eq!(response.body.capacity(), 0);
+        assert_eq!(response.download_total, 0);
+
+        response.on_content_length("64");
+        assert!(response.body.capacity() >= 64);
+        assert_eq!(response.download_total, 64);
+
+        // A bodiless HEAD/304 response must not pre-allocate the whole limit.
+        response.on_content_length("60000000");
+        assert_eq!(response.download_total, 60_000_000);
+        assert!(response.body.capacity() <= MAX_BODY_RESERVE_BYTES as usize);
+
+        // The configured limit still wins when it is the smaller cap.
+        let mut small = H3ResponseState::new(1_024, None).unwrap();
+        small.on_content_length("999999999999");
+        assert!(small.body.capacity() <= 1_024);
     }
 
     #[test]

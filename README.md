@@ -251,8 +251,18 @@ Vane retries transient transport failures and HTTP status `408`, `425`, `429`,
 `500`, `502`, `503`, and `504` for idempotent methods only. Retrying `POST` and
 `PATCH` requires `retryUnsafeMethods = true`.
 
-Connection pooling defaults to disabled. When enabled, Vane keeps idle HTTP/3
-connections by origin, DNS override, protocol mode, and certificate pin set.
+Connection pooling defaults to enabled. Vane keeps idle HTTP/3 connections by
+origin, DNS override, protocol mode, and certificate pin set, and discards a
+reused connection that turns out to be dead — if the request fails before any
+response byte arrives, it is retried once on a fresh connection regardless of
+`retryMaxAttempts`. Set `connectionPoolEnabled = false` to opt out; consider
+that on mobile, where backgrounding and network transitions leave idle UDP
+sockets behind.
+
+The default lives in `create_default_config()`, so UniFFI (Kotlin/Swift) and
+Dart callers get it for free. The C ABI `VaneFfiClientConfig` struct is raw:
+a zeroed struct means `connection_pool_enabled = false`, so direct C ABI
+callers must set the field themselves.
 
 Proxy configuration uses MASQUE/CONNECT-UDP over HTTP/3. Set `proxyUrl` to an
 HTTPS proxy endpoint such as `https://proxy.example.com:443`; classic
