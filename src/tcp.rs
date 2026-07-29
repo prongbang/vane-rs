@@ -128,6 +128,74 @@ fn pin_lookup_host(server_name: &ServerName<'_>) -> Option<String> {
     }
 }
 
+/// Sends the platform verifier's own `log` output to logcat, in debug builds.
+///
+/// `rustls-platform-verifier` explains why it rejected a certificate through
+/// `log::warn!` — the verbatim message Android handed back, and the only place
+/// the real reason appears, since the crate then discards it and returns a bare
+/// `CertificateError`. With no logger installed the `log` crate drops those
+/// records, which is what turns a one-line diagnosis into a decompiler session.
+///
+/// Debug builds only: release installs nothing, and `log`'s macros in the
+/// dependency compile down to a level check against a filter left at `Off`.
+///
+/// Note that `make build_so` always passes `--release`, so no shipped artifact
+/// carries this. To get the explanation out of a device, rebuild the library
+/// without `--release` (`cargo ndk --target aarch64-linux-android build`), drop
+/// the result into `jniLibs/arm64-v8a/`, and read `logcat` — the records arrive
+/// tagged `rustls_platform_verifier::verification::android`.
+#[cfg(all(target_os = "android", debug_assertions))]
+mod logcat {
+    use std::ffi::{CString, c_char, c_int};
+
+    // liblog is a core system library, present on every device and in every NDK
+    // sysroot; the `android_log-sys` crate exists to declare just this.
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+    }
+
+    struct Logcat;
+
+    impl log::Log for Logcat {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record) {
+            // android_LogPriority: VERBOSE=2 .. ERROR=6.
+            let priority = match record.level() {
+                log::Level::Error => 6,
+                log::Level::Warn => 5,
+                log::Level::Info => 4,
+                log::Level::Debug => 3,
+                log::Level::Trace => 2,
+            };
+            // An interior NUL means there is nothing useful to print anyway.
+            let (Ok(tag), Ok(text)) = (
+                CString::new(record.target()),
+                CString::new(record.args().to_string()),
+            ) else {
+                return;
+            };
+            // SAFETY: both pointers are NUL-terminated and outlive the call.
+            unsafe { __android_log_write(priority, tag.as_ptr(), text.as_ptr()) };
+        }
+
+        fn flush(&self) {}
+    }
+
+    static LOGGER: Logcat = Logcat;
+
+    /// Idempotent: a second call just loses the race and leaves the first
+    /// logger in place, so an app that installed its own keeps it.
+    pub(super) fn install() {
+        if log::set_logger(&LOGGER).is_ok() {
+            log::set_max_level(log::LevelFilter::Warn);
+        }
+    }
+}
+
 /// Set once [`Java_com_inteniquetic_vanekotlin_VaneNative_initAndroid`] has
 /// handed the platform verifier an app `Context`.
 ///
@@ -161,6 +229,10 @@ pub extern "system" fn Java_com_inteniquetic_vanekotlin_VaneNative_initAndroid<'
     context: jni::objects::JObject<'local>,
 ) -> jni::sys::jboolean {
     env.with_env(|env| -> Result<jni::sys::jboolean, jni::errors::Error> {
+        // Before the verifier can reject anything, so its explanation is not
+        // lost. No-op in release.
+        #[cfg(debug_assertions)]
+        logcat::install();
         // A local ref is what this wants: it promotes the `Context` to a global
         // itself, along with the class loader it reads off it.
         rustls_platform_verifier::android::init_with_env(env, context)?;

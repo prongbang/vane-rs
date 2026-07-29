@@ -30,7 +30,7 @@ spki-pinning = ["dep:boring"]
 # for a feature that is off by default. The dot-and-IP-literal guard in
 # `domain_is_assignable` ships in both profiles either way.
 psl = ["dep:psl"]
-tcp-fallback = ["dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier", "dep:jni"]
+tcp-fallback = ["dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier", "dep:jni", "dep:log"]
 
 # Android's trust store is only reachable over JNI, so the TCP path needs one
 # `Context` handshake before its first handshake. Pinned to the same 0.22 the
@@ -40,6 +40,12 @@ tcp-fallback = ["dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier", "de
 # sees it.
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.22", optional = true, default-features = false }
+# Facade only, and already in the tree via rustls-platform-verifier, so this
+# costs no extra crate. Debug builds install a ~20-line logcat sink for it: the
+# verifier reports *why* it rejected a certificate through `log::warn!`, and
+# with no logger the `log` crate drops it. android_logger would do the same job
+# but defaults to pulling in `regex`.
+log = { version = "0.4", optional = true }
 
 [dev-dependencies]
 rcgen = "0.14"

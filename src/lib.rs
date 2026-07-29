@@ -2382,6 +2382,31 @@ fn create_quiche_config(
     Ok(config)
 }
 
+/// Whether a CA directory holds anything BoringSSL could actually load.
+///
+/// `load_verify_locations_from_directory` only registers a lazy hash-based
+/// lookup path — it succeeds for a directory that exists but is empty, and the
+/// consequence surfaces much later as every HTTP/3 connection failing to build
+/// a chain, with nothing pointing at the trust store. An existence check is
+/// therefore not enough: a present but cert-less directory has to count as a
+/// miss so the next candidate still gets its turn.
+fn directory_has_certs(path: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        // Covers "does not exist" too, so this subsumes the old exists() check.
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        // ponytail: the bar is one regular file (or symlink, which is how
+        // /etc/ssl/certs is built), not parsing each candidate — BoringSSL
+        // still validates whatever it ends up loading. Tighten to the OpenSSL
+        // `<8 hex>.<n>` hash-link shape if some platform ever ships a cert
+        // directory full of unrelated files.
+        entry
+            .file_type()
+            .is_ok_and(|kind| kind.is_file() || kind.is_symlink())
+    })
+}
+
 fn load_platform_roots(config: &mut quiche::Config) -> Result<(), VaneError> {
     let cert_files = [
         "/etc/ssl/cert.pem",
@@ -2398,16 +2423,24 @@ fn load_platform_roots(config: &mut quiche::Config) -> Result<(), VaneError> {
         }
     }
 
-    let cert_dirs = ["/etc/ssl/certs", "/system/etc/security/cacerts"];
+    let cert_dirs = [
+        // Android 14+ serves the trust store from the Conscrypt APEX; the
+        // legacy path below is kept for older images, which is why this one
+        // goes first rather than after it.
+        "/apex/com.android.conscrypt/cacerts",
+        "/etc/ssl/certs",
+        "/system/etc/security/cacerts",
+    ];
     for path in cert_dirs {
-        if std::path::Path::new(path).exists() {
-            config
-                .load_verify_locations_from_directory(path)
-                .map_err(|e| {
-                    VaneError::Generic(format!("Failed to load CA directory from {path}: {e}"))
-                })?;
-            return Ok(());
+        if !directory_has_certs(path) {
+            continue;
         }
+        config
+            .load_verify_locations_from_directory(path)
+            .map_err(|e| {
+                VaneError::Generic(format!("Failed to load CA directory from {path}: {e}"))
+            })?;
+        return Ok(());
     }
 
     Err(VaneError::Generic(
