@@ -406,3 +406,142 @@ fn tcp_rejects_plaintext_urls() {
         .to_string();
     assert!(err.contains("only supports https://"), "got {err}");
 }
+
+/// Regression test for the hyper connection-pool checkout race.
+///
+/// A keep-alive peer can close a pooled connection at the moment hyper hands it
+/// to us. By then the request is committed to that connection, so hyper-util's
+/// own retry cannot cover it (that path needs `take_message`, and ours arrives
+/// as `SendRequest`) and the write surfaces as a transport error. The HTTP/3
+/// path has always retried this shape; the TCP path did not.
+///
+/// The server below closes an idle connection without `close_notify` — the
+/// abrupt shape, which only selects the error string. Making rustls tolerate
+/// EOF would rename this bug and mask genuine truncation, so the fix is the
+/// retry, and this test is what proves it is still there.
+mod pool_checkout_race {
+    use super::*;
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::{ServerConfig, ServerConnection, StreamOwned};
+
+    // The window is narrow and sits where the client's pool checkout coincides
+    // with the server's close, so the delay tracks the idle timeout rather than
+    // exceeding it: measured here, delay == idle fails ~20-27% of requests
+    // without the retry, while delay = idle + 5ms fails 0% because hyper has
+    // already reaped the dead connection by then.
+    const SERVER_IDLE_MS: u64 = 60;
+    /// Offsets around the server's close, in milliseconds. The window is only a
+    /// few milliseconds wide and its exact position moves with machine speed,
+    /// so the run sweeps across it instead of betting on one delay.
+    const DELAY_OFFSETS_MS: [i64; 4] = [-2, -1, 0, 1];
+    const ROUNDS: usize = 14;
+
+    fn serve(tcp: TcpStream, config: Arc<ServerConfig>) {
+        tcp.set_nodelay(true).ok();
+        let Ok(conn) = ServerConnection::new(config) else {
+            return;
+        };
+        let mut tls = StreamOwned::new(conn, tcp);
+        let mut buf = [0u8; 8192];
+        let mut pending = Vec::new();
+        loop {
+            tls.sock
+                .set_read_timeout(Some(Duration::from_millis(SERVER_IDLE_MS)))
+                .ok();
+            match std::io::Read::read(&mut tls, &mut buf) {
+                Ok(0) => return,
+                Ok(read) => pending.extend_from_slice(&buf[..read]),
+                // Idle past the keep-alive window: bare TCP FIN, no
+                // close_notify. This is what a real server does to us.
+                Err(_) => return,
+            }
+            while let Some(end) = pending
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|p| p + 4)
+            {
+                pending.drain(..end);
+                let response =
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+                if tls.write_all(response).is_err() {
+                    return;
+                }
+                tls.flush().ok();
+            }
+        }
+    }
+
+    #[test]
+    fn a_stale_pooled_connection_is_retried_rather_than_failing_the_request() {
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let ca_der = ca.der().clone();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+        let leaf_der = leaf.der().clone();
+        let leaf_pkcs8 = PrivateKeyDer::try_from(leaf_key.serialize_der()).unwrap();
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut server_config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![leaf_der], leaf_pkcs8)
+            .unwrap();
+        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let server_config = Arc::new(server_config);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let config = server_config.clone();
+                std::thread::spawn(move || serve(stream, config));
+            }
+        });
+
+        // Serialized against the other tests that build a TCP client, since the
+        // trust anchor and the client cache are process-wide.
+        let _guard = crate::tcp_test_lock();
+        *super::TEST_ROOT.lock().unwrap() = Some(ca_der);
+
+        let client = client_with(VaneClientConfig {
+            base_url: Some(format!("https://localhost:{port}")),
+            protocol_mode: VaneProtocolMode::Http1Only,
+            timeout_seconds: Some(10),
+            ..VaneClientConfig::default()
+        });
+
+        let mut failures = Vec::new();
+        let mut attempts = 0usize;
+        for round in 0..ROUNDS {
+            for offset in DELAY_OFFSETS_MS {
+                if attempts > 0 {
+                    let delay = (SERVER_IDLE_MS as i64 + offset).max(1) as u64;
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
+                attempts += 1;
+                match client.execute(crate::test_request("/")) {
+                    Ok(response) => assert_eq!(response.status_code, 200),
+                    Err(err) => failures.push(format!("round {round} offset {offset}ms: {err}")),
+                }
+            }
+        }
+
+        *super::TEST_ROOT.lock().unwrap() = None;
+        assert!(
+            failures.is_empty(),
+            "{} of {attempts} requests failed on a stale pooled connection: {failures:?}",
+            failures.len()
+        );
+    }
+}

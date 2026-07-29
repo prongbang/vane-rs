@@ -458,7 +458,11 @@ impl Default for VaneClientConfig {
             cookie_persistence_path: None,
             connection_pool_enabled: true,
             max_idle_connections: 4,
-            connection_idle_timeout_seconds: 30,
+            // Under a real server's: measured keep-alive close at ~28.9 s on
+            // github.com, and servers do not advertise `Keep-Alive: timeout=N`
+            // in practice. Sitting above the peer's timeout is the worst place
+            // to be — every pooled checkout races the peer's close.
+            connection_idle_timeout_seconds: 25,
             retry_max_attempts: 1,
             retry_initial_delay_millis: 100,
             retry_max_delay_millis: 1_000,
@@ -476,33 +480,132 @@ impl Default for VaneClientConfig {
 }
 
 // ---------- Error ----------
+/// The variant is the machine-readable kind; every one carries the same
+/// human-readable message the caller has always seen, so `Display` output and
+/// catch-all handling are unchanged. `Generic` means "not classified", not
+/// "internal" — new call sites may land there and callers must treat it as
+/// unknown rather than as any particular failure.
+///
+/// No variant carries structured detail beyond the message: a `Tls` mismatch
+/// deliberately exposes no host or pin field, so error handling cannot become a
+/// pin oracle.
 #[derive(Debug, Clone, Error, uniffi::Error)]
 pub enum VaneError {
     #[error("{0}")]
     Generic(String),
+    /// The caller's request or configuration is wrong — URL, scheme, method,
+    /// header, body file, pin or proxy setting. Fails identically on every
+    /// transport.
+    #[error("{0}")]
+    InvalidRequest(String),
+    /// The request's cancel token was set.
+    #[error("{0}")]
+    Cancelled(String),
+    /// The connection could not be established within the deadline. Nothing
+    /// reached the peer, so the request is safe to replay.
+    #[error("{0}")]
+    ConnectTimeout(String),
+    /// The deadline expired with the connection already up.
+    #[error("{0}")]
+    Timeout(String),
+    /// Network or protocol failure: DNS, socket, QUIC, HTTP/3 framing, proxy.
+    #[error("{0}")]
+    Transport(String),
+    /// Certificate verification failed, including a pin mismatch.
+    #[error("{0}")]
+    Tls(String),
+    /// A request or response body exceeded the configured limit.
+    #[error("{0}")]
+    BodyLimitExceeded(String),
+    /// The requested protocol is not available in this build.
+    #[error("{0}")]
+    ProtocolUnsupported(String),
+}
+
+impl VaneError {
+    /// Whether another transport could plausibly do better. A request or config
+    /// error fails the same way over TCP, a pin mismatch fails the same way by
+    /// design, and a cancelled request must stay cancelled. `Generic` is
+    /// included because it means "unclassified": excluding it would silently
+    /// drop the fallback for every call site not yet classified.
+    fn is_transport_failure(&self) -> bool {
+        matches!(
+            self,
+            VaneError::Generic(_)
+                | VaneError::ConnectTimeout(_)
+                | VaneError::Timeout(_)
+                | VaneError::Transport(_)
+        )
+    }
+
+    /// The attempt provably never put the request on the wire, so replaying it
+    /// on another transport is safe even for a non-idempotent method.
+    ///
+    /// ponytail: only the handshake deadline qualifies. A handshake that failed
+    /// for another reason ("QUIC connection closed before handshake completed")
+    /// also sent nothing, but classifying that needs a `Connect` variant no
+    /// caller would branch on. Add it if POST-over-blocked-UDP shows up as
+    /// something other than a timeout.
+    fn never_left_the_client(&self) -> bool {
+        matches!(self, VaneError::ConnectTimeout(_))
+    }
+
+    /// Same kind, different message. Used where two failures are reported as
+    /// one so the surviving kind is the one the caller can act on.
+    fn with_message(self, message: String) -> Self {
+        match self {
+            VaneError::Generic(_) => VaneError::Generic(message),
+            VaneError::InvalidRequest(_) => VaneError::InvalidRequest(message),
+            VaneError::Cancelled(_) => VaneError::Cancelled(message),
+            VaneError::ConnectTimeout(_) => VaneError::ConnectTimeout(message),
+            VaneError::Timeout(_) => VaneError::Timeout(message),
+            VaneError::Transport(_) => VaneError::Transport(message),
+            VaneError::Tls(_) => VaneError::Tls(message),
+            VaneError::BodyLimitExceeded(_) => VaneError::BodyLimitExceeded(message),
+            VaneError::ProtocolUnsupported(_) => VaneError::ProtocolUnsupported(message),
+        }
+    }
+
+    /// Stable numeric kind for the C ABI. These values are part of that ABI:
+    /// append only, never renumber. 0 doubles as "no error" on a successful
+    /// response, which is unambiguous because callers only read the kind when
+    /// the error buffer is non-empty.
+    fn ffi_kind(&self) -> u32 {
+        match self {
+            VaneError::Generic(_) => 0,
+            VaneError::InvalidRequest(_) => 1,
+            VaneError::Cancelled(_) => 2,
+            VaneError::ConnectTimeout(_) => 3,
+            VaneError::Timeout(_) => 4,
+            VaneError::Transport(_) => 5,
+            VaneError::Tls(_) => 6,
+            VaneError::BodyLimitExceeded(_) => 7,
+            VaneError::ProtocolUnsupported(_) => 8,
+        }
+    }
 }
 
 impl From<quiche::Error> for VaneError {
     fn from(err: quiche::Error) -> Self {
-        VaneError::Generic(format!("QUIC error: {err:?}"))
+        VaneError::Transport(format!("QUIC error: {err:?}"))
     }
 }
 
 impl From<quiche::h3::Error> for VaneError {
     fn from(err: quiche::h3::Error) -> Self {
-        VaneError::Generic(format!("HTTP/3 error: {err:?}"))
+        VaneError::Transport(format!("HTTP/3 error: {err:?}"))
     }
 }
 
 impl From<io::Error> for VaneError {
     fn from(err: io::Error) -> Self {
-        VaneError::Generic(format!("I/O error: {err}"))
+        VaneError::Transport(format!("I/O error: {err}"))
     }
 }
 
 #[cfg(not(feature = "tcp-fallback"))]
 fn unsupported_tcp_backend_error() -> VaneError {
-    VaneError::Generic(
+    VaneError::ProtocolUnsupported(
         "This Vane build supports HTTP/3 only; HTTP/1.1 and HTTP/2 fallback were removed"
             .to_string(),
     )
@@ -573,13 +676,13 @@ impl VaneClient {
         // so the proxy posture must not.
         if let Some(proxy_url) = config.proxy_url.as_deref() {
             let proxy = Url::parse(proxy_url).map_err(|e| {
-                VaneError::Generic(format!(
+                VaneError::InvalidRequest(format!(
                     "Invalid proxyUrl {}: {e}",
                     redact_url_userinfo(proxy_url)
                 ))
             })?;
             if proxy.scheme() != "https" {
-                return Err(VaneError::Generic(
+                return Err(VaneError::InvalidRequest(
                     "proxyUrl must use https://: a plaintext proxy exposes the CONNECT target \
                      and proxyAuthorization on the local network"
                         .to_string(),
@@ -651,16 +754,23 @@ impl VaneClient {
                 match http3 {
                     Ok(response) => Ok(response),
                     Err(err) if !self.tcp_fallback_enabled() => Err(err),
+                    // A body over the limit, a missing body file or a pin
+                    // mismatch fails exactly the same way over TCP, so trying
+                    // costs a second full timeout and changes nothing.
+                    Err(err) if !err.is_transport_failure() => Err(err),
                     // A method the retry policy refuses to replay must not be
                     // replayed by the fallback either. HTTP/3 can fail *after*
-                    // the server accepted the request — response over the body
-                    // limit, connection lost mid-response — so re-sending a
-                    // POST here would create the resource a second time.
+                    // the server accepted the request — connection lost
+                    // mid-response — so re-sending a POST here would create the
+                    // resource a second time. A handshake that never completed
+                    // put nothing on the wire, which is the case that matters:
+                    // on a UDP-blocked network that is how every request fails.
                     Err(err)
-                        if !is_retryable_method(
-                            &request.method,
-                            self.config.retry_unsafe_methods,
-                        ) =>
+                        if !err.never_left_the_client()
+                            && !is_retryable_method(
+                                &request.method,
+                                self.config.retry_unsafe_methods,
+                            ) =>
                     {
                         Err(err)
                     }
@@ -670,19 +780,16 @@ impl VaneClient {
                         {
                             return Err(err);
                         }
-                        // ponytail: `VaneError` is one opaque variant, so a
-                        // non-transport failure (body limit, bad body file)
-                        // also costs one wasted TCP attempt. Classifying needs
-                        // an error-shape change, which is an ABI change.
                         self.execute_tcp(request, url, body).map_err(|tcp_err| {
                             // Both transports failed: reporting only one of
                             // them sends whoever debugs this down the wrong
-                            // path. Still a single opaque variant, so the
-                            // error shape callers see is unchanged.
-                            VaneError::Generic(format!(
+                            // path. The kind kept is the TCP one — that is the
+                            // attempt the caller's request actually died on.
+                            let message = format!(
                                 "HTTP/3 transport failed ({err}); TCP fallback also failed \
                                  ({tcp_err})"
-                            ))
+                            );
+                            tcp_err.with_message(message)
                         })
                     }
                 }
@@ -736,15 +843,15 @@ impl VaneClient {
         let url = &request.url;
         if let Some(base) = &self.config.base_url {
             let base_url = Url::parse(base)
-                .map_err(|e| VaneError::Generic(format!("Invalid base URL: {e}")))?;
+                .map_err(|e| VaneError::InvalidRequest(format!("Invalid base URL: {e}")))?;
             let mut url = base_url
                 .join(url)
-                .map_err(|e| VaneError::Generic(format!("Failed to join URL: {e}")))?;
+                .map_err(|e| VaneError::InvalidRequest(format!("Failed to join URL: {e}")))?;
             append_query_params(&mut url, &request.query_params);
             Ok(url)
         } else {
-            let mut url =
-                Url::parse(url).map_err(|e| VaneError::Generic(format!("Invalid URL: {e}")))?;
+            let mut url = Url::parse(url)
+                .map_err(|e| VaneError::InvalidRequest(format!("Invalid URL: {e}")))?;
             append_query_params(&mut url, &request.query_params);
             Ok(url)
         }
@@ -800,13 +907,13 @@ impl VaneClient {
         request_body: &[u8],
     ) -> Result<VaneResponse, VaneError> {
         if url.scheme() != "https" {
-            return Err(VaneError::Generic(
+            return Err(VaneError::InvalidRequest(
                 "quiche backend only supports https:// URLs over HTTP/3".to_string(),
             ));
         }
         let host = url
             .host_str()
-            .ok_or_else(|| VaneError::Generic("URL is missing host".to_string()))?;
+            .ok_or_else(|| VaneError::InvalidRequest("URL is missing host".to_string()))?;
         if let Some(proxy_url) = self.config.proxy_url.as_deref() {
             MasqueProxyConfig::parse(proxy_url)?;
         }
@@ -1071,13 +1178,15 @@ impl VaneClient {
             flush_quic_packets_via(&mut io, &mut send_buf, &mut conn)?;
 
             if conn.is_closed() {
-                return Err(VaneError::Generic(
+                return Err(VaneError::Transport(
                     "QUIC connection closed before handshake completed".to_string(),
                 ));
             }
         }
 
-        Err(VaneError::Generic("HTTP/3 handshake timed out".to_string()))
+        Err(VaneError::ConnectTimeout(
+            "HTTP/3 handshake timed out".to_string(),
+        ))
     }
 
     fn take_pooled_connection(
@@ -1683,19 +1792,19 @@ struct MasqueProxyConfig {
 impl MasqueProxyConfig {
     fn parse(proxy_url: &str) -> Result<Self, VaneError> {
         let url = Url::parse(proxy_url).map_err(|e| {
-            VaneError::Generic(format!(
+            VaneError::InvalidRequest(format!(
                 "Invalid proxyUrl {}: {e}",
                 redact_url_userinfo(proxy_url)
             ))
         })?;
         if url.scheme() != "https" {
-            return Err(VaneError::Generic(
+            return Err(VaneError::InvalidRequest(
                 "HTTP/3 proxyUrl must use https:// for MASQUE/CONNECT-UDP".to_string(),
             ));
         }
         let host = url
             .host_str()
-            .ok_or_else(|| VaneError::Generic("proxyUrl is missing host".to_string()))?
+            .ok_or_else(|| VaneError::InvalidRequest("proxyUrl is missing host".to_string()))?
             .to_string();
         let port = url.port_or_known_default().unwrap_or(443);
         let authority = match url.port() {
@@ -1911,13 +2020,15 @@ fn connect_quic_h3(
         flush_quic_packets(&socket, &mut send_buf, &mut conn)?;
 
         if conn.is_closed() {
-            return Err(VaneError::Generic(
+            return Err(VaneError::Transport(
                 "QUIC connection closed before handshake completed".to_string(),
             ));
         }
     }
 
-    Err(VaneError::Generic("HTTP/3 handshake timed out".to_string()))
+    Err(VaneError::ConnectTimeout(
+        "HTTP/3 handshake timed out".to_string(),
+    ))
 }
 
 fn establish_connect_udp_tunnel(
@@ -1977,12 +2088,12 @@ fn establish_connect_udp_tunnel(
 
         if tunnel_accepted {
             if !transport.http3.extended_connect_enabled_by_peer() {
-                return Err(VaneError::Generic(
+                return Err(VaneError::Transport(
                     "MASQUE proxy did not advertise Extended CONNECT support".to_string(),
                 ));
             }
             if !transport.http3.dgram_enabled_by_peer(&transport.conn) {
-                return Err(VaneError::Generic(
+                return Err(VaneError::Transport(
                     "MASQUE proxy did not advertise HTTP/3 DATAGRAM support".to_string(),
                 ));
             }
@@ -1992,13 +2103,13 @@ fn establish_connect_udp_tunnel(
         flush_quic_packets(&transport.socket, &mut send_buf, &mut transport.conn)?;
 
         if transport.conn.is_closed() {
-            return Err(VaneError::Generic(
+            return Err(VaneError::Transport(
                 "MASQUE proxy connection closed before CONNECT-UDP completed".to_string(),
             ));
         }
     }
 
-    Err(VaneError::Generic(
+    Err(VaneError::ConnectTimeout(
         "MASQUE CONNECT-UDP establishment timed out".to_string(),
     ))
 }
@@ -2022,14 +2133,14 @@ fn process_connect_udp_events(
                     }
                 }
                 let Some(status) = status else {
-                    return Err(VaneError::Generic(
+                    return Err(VaneError::Transport(
                         "MASQUE proxy CONNECT-UDP response is missing :status".to_string(),
                     ));
                 };
                 if status.starts_with('2') {
                     *tunnel_accepted = true;
                 } else {
-                    return Err(VaneError::Generic(format!(
+                    return Err(VaneError::Transport(format!(
                         "MASQUE proxy rejected CONNECT-UDP with status {status}"
                     )));
                 }
@@ -2044,12 +2155,12 @@ fn process_connect_udp_events(
             Ok((stream_id, quiche::h3::Event::Finished))
                 if stream_id == tunnel_stream_id && !*tunnel_accepted =>
             {
-                return Err(VaneError::Generic(
+                return Err(VaneError::Transport(
                     "MASQUE proxy closed CONNECT-UDP before accepting it".to_string(),
                 ));
             }
             Ok((stream_id, quiche::h3::Event::Reset(e))) if stream_id == tunnel_stream_id => {
-                return Err(VaneError::Generic(format!(
+                return Err(VaneError::Transport(format!(
                     "MASQUE proxy reset CONNECT-UDP stream: {e:?}"
                 )));
             }
@@ -2058,7 +2169,7 @@ fn process_connect_udp_events(
             | Ok((_stream_id, quiche::h3::Event::Reset(_)))
             | Ok((_stream_id, quiche::h3::Event::PriorityUpdate)) => {}
             Ok((_id, quiche::h3::Event::GoAway)) => {
-                return Err(VaneError::Generic(
+                return Err(VaneError::Transport(
                     "MASQUE proxy sent HTTP/3 GOAWAY".to_string(),
                 ));
             }
@@ -2115,7 +2226,7 @@ fn flush_quic_packets_via(
                 match io {
                     Http3Io::Direct { socket, .. } => {
                         socket.send(&out[..written]).map_err(|e| {
-                            VaneError::Generic(format!("Failed to send UDP packet: {e}"))
+                            VaneError::Transport(format!("Failed to send UDP packet: {e}"))
                         })?;
                     }
                     Http3Io::Masque(tunnel) => {
@@ -2247,7 +2358,7 @@ fn perform_http3_request(
     // first delays the request by a full poll interval on every attempt. The
     // deadline is still checked first so an expired one sends nothing.
     if Instant::now() >= deadline {
-        return Err(VaneError::Generic("HTTP/3 request timed out".to_string()));
+        return Err(VaneError::Timeout("HTTP/3 request timed out".to_string()));
     }
     check_cancelled(options.cancel_token)?;
     let mut stream_id = send_h3_request(transport, &options)?;
@@ -2286,14 +2397,14 @@ fn perform_http3_request(
         }
 
         if transport.conn.is_closed() {
-            return Err(VaneError::Generic(
+            return Err(VaneError::Transport(
                 "QUIC connection closed before response completed".to_string(),
             ));
         }
     }
 
     if !response.finished {
-        return Err(VaneError::Generic("HTTP/3 request timed out".to_string()));
+        return Err(VaneError::Timeout("HTTP/3 request timed out".to_string()));
     }
 
     Ok(Http3ResponseParts {
@@ -2465,7 +2576,7 @@ fn resolve_peer_addr(
 ) -> Result<SocketAddr, VaneError> {
     if let Some(override_addr) = dns_overrides.get(host) {
         let ip = override_addr.parse::<IpAddr>().map_err(|e| {
-            VaneError::Generic(format!(
+            VaneError::InvalidRequest(format!(
                 "Invalid DNS override for {host}: expected IP address, got {override_addr}: {e}"
             ))
         })?;
@@ -2474,9 +2585,9 @@ fn resolve_peer_addr(
 
     (host, port)
         .to_socket_addrs()
-        .map_err(|e| VaneError::Generic(format!("Failed to resolve {host}:{port}: {e}")))?
+        .map_err(|e| VaneError::Transport(format!("Failed to resolve {host}:{port}: {e}")))?
         .next()
-        .ok_or_else(|| VaneError::Generic(format!("Failed to resolve {host}:{port}")))
+        .ok_or_else(|| VaneError::Transport(format!("Failed to resolve {host}:{port}")))
 }
 
 fn verify_certificate_pins(
@@ -2493,7 +2604,7 @@ fn verify_certificate_pins(
     }
 
     let cert_der = peer_cert_der.ok_or_else(|| {
-        VaneError::Generic(format!(
+        VaneError::Tls(format!(
             "Certificate pinning configured for {host}, but peer certificate was unavailable"
         ))
     })?;
@@ -2507,7 +2618,7 @@ fn verify_certificate_pins(
         return Ok(());
     }
 
-    Err(VaneError::Generic(format!(
+    Err(VaneError::Tls(format!(
         "Certificate pin mismatch for {host}"
     )))
 }
@@ -2527,17 +2638,17 @@ fn redact_url_userinfo(url: &str) -> String {
 
 fn validate_certificate_pin_host(host: &str) -> Result<(), VaneError> {
     if host.is_empty() {
-        return Err(VaneError::Generic(
+        return Err(VaneError::InvalidRequest(
             "Certificate pin host must not be empty".to_string(),
         ));
     }
     if host.contains("://") || host.contains('/') {
-        return Err(VaneError::Generic(
+        return Err(VaneError::InvalidRequest(
             "Certificate pin host must be a hostname without scheme or path".to_string(),
         ));
     }
     if !host.is_ascii() {
-        return Err(VaneError::Generic(
+        return Err(VaneError::InvalidRequest(
             "Certificate pin host must be ASCII; use punycode for IDN hosts".to_string(),
         ));
     }
@@ -2545,7 +2656,7 @@ fn validate_certificate_pin_host(host: &str) -> Result<(), VaneError> {
     // host, so accepting it would silently leave the host unpinned.
     let bare = host.strip_prefix('[').and_then(|r| r.split_once(']'));
     if bare.map_or(host, |(_, after)| after).contains(':') {
-        return Err(VaneError::Generic(
+        return Err(VaneError::InvalidRequest(
             "Certificate pin host must not include a port".to_string(),
         ));
     }
@@ -2555,7 +2666,7 @@ fn validate_certificate_pin_host(host: &str) -> Result<(), VaneError> {
 fn validate_certificate_pins(pins: &[String]) -> Result<(), VaneError> {
     for pin in pins {
         if !(pin.starts_with("sha256/") || pin.starts_with("sha256-cert/")) {
-            return Err(VaneError::Generic(format!(
+            return Err(VaneError::InvalidRequest(format!(
                 "Unsupported certificate pin format: {pin}"
             )));
         }
@@ -2584,13 +2695,13 @@ fn certificate_pin_values(cert_der: &[u8]) -> Vec<String> {
 #[cfg(feature = "spki-pinning")]
 fn spki_sha256_pin(cert_der: &[u8]) -> Result<String, VaneError> {
     let cert = X509::from_der(cert_der)
-        .map_err(|e| VaneError::Generic(format!("Failed to parse peer certificate: {e}")))?;
+        .map_err(|e| VaneError::Tls(format!("Failed to parse peer certificate: {e}")))?;
     let public_key = cert
         .public_key()
-        .map_err(|e| VaneError::Generic(format!("Failed to read peer public key: {e}")))?;
+        .map_err(|e| VaneError::Tls(format!("Failed to read peer public key: {e}")))?;
     let spki_der = public_key
         .public_key_to_der()
-        .map_err(|e| VaneError::Generic(format!("Failed to encode peer public key SPKI: {e}")))?;
+        .map_err(|e| VaneError::Tls(format!("Failed to encode peer public key SPKI: {e}")))?;
 
     Ok(sha256_pin("sha256", &spki_der))
 }
@@ -2671,7 +2782,7 @@ fn path_matches(request_path: &str, cookie_path: &str) -> bool {
 
 fn validate_request_body_limit(body: &[u8], max_request_body_bytes: u64) -> Result<(), VaneError> {
     if body.len() as u64 > max_request_body_bytes {
-        return Err(VaneError::Generic(format!(
+        return Err(VaneError::BodyLimitExceeded(format!(
             "Request body exceeded {max_request_body_bytes} bytes"
         )));
     }
@@ -2684,11 +2795,11 @@ fn load_request_body(request: &VaneRequest) -> Result<Cow<'_, [u8]>, VaneError> 
         && !path.is_empty()
     {
         let mut file = File::open(path).map_err(|e| {
-            VaneError::Generic(format!("Failed to open request body file {path}: {e}"))
+            VaneError::InvalidRequest(format!("Failed to open request body file {path}: {e}"))
         })?;
         let mut body = Vec::new();
         file.read_to_end(&mut body).map_err(|e| {
-            VaneError::Generic(format!("Failed to read request body file {path}: {e}"))
+            VaneError::InvalidRequest(format!("Failed to read request body file {path}: {e}"))
         })?;
         return Ok(Cow::Owned(body));
     }
@@ -2701,7 +2812,7 @@ fn validate_response_body_limit(
     max_response_body_bytes: u64,
 ) -> Result<(), VaneError> {
     if current_len as u64 + read_len as u64 > max_response_body_bytes {
-        return Err(VaneError::Generic(format!(
+        return Err(VaneError::BodyLimitExceeded(format!(
             "Response body exceeded {max_response_body_bytes} bytes"
         )));
     }
@@ -2718,7 +2829,9 @@ fn cancel_token(cancel_token_id: Option<u64>) -> Option<Arc<AtomicBool>> {
 
 fn check_cancelled(cancel_token: Option<&AtomicBool>) -> Result<(), VaneError> {
     if cancel_token.is_some_and(|token| token.load(Ordering::Relaxed)) {
-        return Err(VaneError::Generic("Vane request was cancelled".to_string()));
+        return Err(VaneError::Cancelled(
+            "Vane request was cancelled".to_string(),
+        ));
     }
 
     Ok(())
@@ -2841,7 +2954,7 @@ fn build_h3_headers(
     let method = request.method.to_ascii_uppercase();
     let host = url
         .host_str()
-        .ok_or_else(|| VaneError::Generic("URL is missing host".to_string()))?;
+        .ok_or_else(|| VaneError::InvalidRequest("URL is missing host".to_string()))?;
     let authority = match url.port() {
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
@@ -2892,7 +3005,7 @@ fn for_each_regular_header(
 ) -> Result<(), VaneError> {
     let mut push_checked = |key: &str, value: &str| -> Result<(), VaneError> {
         if key.starts_with(':') {
-            return Err(VaneError::Generic(format!(
+            return Err(VaneError::InvalidRequest(format!(
                 "HTTP/3 pseudo-header cannot be set by callers: {key}"
             )));
         }
@@ -2904,7 +3017,7 @@ fn for_each_regular_header(
             .iter()
             .any(|reserved| key.eq_ignore_ascii_case(reserved))
         {
-            return Err(VaneError::Generic(format!(
+            return Err(VaneError::InvalidRequest(format!(
                 "Header cannot be set by callers: {key}"
             )));
         }
@@ -2965,7 +3078,7 @@ fn read_quic_packets(
                 break;
             }
             Err(e) => {
-                return Err(VaneError::Generic(format!(
+                return Err(VaneError::Transport(format!(
                     "Failed to receive UDP packet: {e}"
                 )));
             }
@@ -2986,7 +3099,7 @@ fn flush_quic_packets(
                 let _ = send_info;
                 socket
                     .send(&out[..written])
-                    .map_err(|e| VaneError::Generic(format!("Failed to send UDP packet: {e}")))?;
+                    .map_err(|e| VaneError::Transport(format!("Failed to send UDP packet: {e}")))?;
             }
             Err(quiche::Error::Done) => break,
             Err(e) => return Err(e.into()),
@@ -3012,7 +3125,9 @@ impl ResponseState {
     fn new(max_body_bytes: u64, body_file_path: Option<&str>) -> Result<Self, VaneError> {
         let body_file = match body_file_path {
             Some(path) if !path.is_empty() => Some(File::create(path).map_err(|e| {
-                VaneError::Generic(format!("Failed to create response body file {path}: {e}"))
+                VaneError::InvalidRequest(format!(
+                    "Failed to create response body file {path}: {e}"
+                ))
             })?),
             _ => None,
         };
@@ -3114,10 +3229,10 @@ fn process_h3_events(
             }
             Ok((_stream_id, quiche::h3::Event::Reset(e))) => {
                 *response_started = true;
-                return Err(VaneError::Generic(format!("HTTP/3 stream reset: {e:?}")));
+                return Err(VaneError::Transport(format!("HTTP/3 stream reset: {e:?}")));
             }
             Ok((_id, quiche::h3::Event::GoAway)) => {
-                return Err(VaneError::Generic("HTTP/3 GOAWAY received".to_string()));
+                return Err(VaneError::Transport("HTTP/3 GOAWAY received".to_string()));
             }
             Ok((_id, quiche::h3::Event::PriorityUpdate)) => {}
             Err(quiche::h3::Error::Done) => break,
@@ -3309,6 +3424,10 @@ pub struct VaneFfiHeaderArray {
 pub struct VaneFfiResponse {
     pub status_code: u16,
     pub is_success: bool,
+    /// `VaneError::ffi_kind` for `error`; 0 when `error` is empty. Sits here
+    /// rather than at the end because it fits the padding after `is_success`,
+    /// so the struct does not grow.
+    pub error_kind: u32,
     pub headers: VaneFfiHeaderArray,
     pub body: VaneFfiBuffer,
     pub body_file_path: VaneFfiBuffer,
@@ -3443,7 +3562,9 @@ pub extern "C" fn vane_ffi_execute(
     let response = match result {
         Ok(Ok(response)) => ffi_response_from_vane(response),
         Ok(Err(error)) => ffi_error_response(error),
-        Err(_) => ffi_error_response("Rust panic while executing Vane request".to_string()),
+        Err(_) => ffi_error_response(VaneError::Generic(
+            "Rust panic while executing Vane request".to_string(),
+        )),
     };
     Box::into_raw(Box::new(response))
 }
@@ -3488,23 +3609,28 @@ fn ffi_execute(
     request: *const VaneFfiRequest,
     body_data: *const u8,
     body_len: usize,
-) -> Result<VaneResponse, String> {
+) -> Result<VaneResponse, VaneError> {
     let client = {
         let clients = FFI_CLIENTS
             .lock()
-            .map_err(|_| "Vane FFI client registry lock was poisoned".to_string())?;
-        clients
-            .get(&handle)
-            .cloned()
-            .ok_or_else(|| format!("No Vane client exists for handle {handle}"))?
+            .map_err(|_| VaneError::Generic("Vane FFI client registry lock was poisoned".into()))?;
+        clients.get(&handle).cloned().ok_or_else(|| {
+            VaneError::InvalidRequest(format!("No Vane client exists for handle {handle}"))
+        })?
     };
-    let mut request = ffi_request(request)?;
+    // The decoding helpers report plain strings; nothing about a malformed
+    // request struct is transport-related, so they all land on InvalidRequest.
+    let mut request = ffi_request(request).map_err(VaneError::InvalidRequest)?;
     if body_len > 0 {
-        request.body = Some(ffi_bytes(body_data, body_len)?.to_vec());
+        request.body = Some(
+            ffi_bytes(body_data, body_len)
+                .map_err(VaneError::InvalidRequest)?
+                .to_vec(),
+        );
     } else {
         request.body = None;
     }
-    client.execute(request).map_err(|error| error.to_string())
+    client.execute(request)
 }
 
 fn ffi_set_certificate_pins(
@@ -3532,6 +3658,7 @@ fn ffi_response_from_vane(response: VaneResponse) -> VaneFfiResponse {
     VaneFfiResponse {
         status_code: response.status_code,
         is_success: response.is_success,
+        error_kind: 0,
         headers: ffi_header_array_from_map(response.headers),
         body: ffi_buffer_from_vec(response.body),
         body_file_path: ffi_buffer_from_vec(
@@ -3542,15 +3669,16 @@ fn ffi_response_from_vane(response: VaneResponse) -> VaneFfiResponse {
     }
 }
 
-fn ffi_error_response(error: String) -> VaneFfiResponse {
+fn ffi_error_response(error: VaneError) -> VaneFfiResponse {
     VaneFfiResponse {
         status_code: 0,
         is_success: false,
+        error_kind: error.ffi_kind(),
         headers: ffi_header_array_empty(),
         body: ffi_buffer_from_vec(Vec::new()),
         body_file_path: ffi_buffer_from_vec(Vec::new()),
         url: ffi_buffer_from_vec(Vec::new()),
-        error: ffi_buffer_from_vec(error.into_bytes()),
+        error: ffi_buffer_from_vec(error.to_string().into_bytes()),
     }
 }
 
@@ -3823,6 +3951,13 @@ fn ffi_bytes<'a>(data: *const u8, len: usize) -> Result<&'a [u8], String> {
     Ok(unsafe { std::slice::from_raw_parts(data, len) })
 }
 
+/// Serializes tests that install a process-wide TLS trust anchor.
+#[cfg(all(test, feature = "tcp-fallback"))]
+pub(crate) fn tcp_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Shared by the unit tests in this file and in `tcp::tests`.
 #[cfg(all(test, feature = "tcp-fallback"))]
 fn test_request(url: &str) -> VaneRequest {
@@ -3891,7 +4026,7 @@ mod tests {
         assert!(!config.cookies_enabled);
         assert!(config.connection_pool_enabled);
         assert_eq!(config.max_idle_connections, 4);
-        assert_eq!(config.connection_idle_timeout_seconds, 30);
+        assert_eq!(config.connection_idle_timeout_seconds, 25);
         assert_eq!(config.retry_max_attempts, 1);
         assert_eq!(config.retry_initial_delay_millis, 100);
         assert_eq!(config.retry_max_delay_millis, 1_000);
@@ -4273,6 +4408,71 @@ mod tests {
                 "{method} (retry_unsafe_methods={unsafe_methods}) fallback decision wrong: {err}"
             );
         }
+    }
+
+    /// The fallback rule reads two predicates off the error kind; both are
+    /// safety-relevant, so pin the mapping rather than the six-line `match`
+    /// that consumes it.
+    #[test]
+    fn error_kinds_drive_the_fallback_decision() {
+        let msg = || "x".to_string();
+        for (error, transport, never_sent) in [
+            (VaneError::Generic(msg()), true, false),
+            (VaneError::Transport(msg()), true, false),
+            (VaneError::Timeout(msg()), true, false),
+            (VaneError::ConnectTimeout(msg()), true, true),
+            (VaneError::InvalidRequest(msg()), false, false),
+            (VaneError::Cancelled(msg()), false, false),
+            (VaneError::Tls(msg()), false, false),
+            (VaneError::BodyLimitExceeded(msg()), false, false),
+            (VaneError::ProtocolUnsupported(msg()), false, false),
+        ] {
+            assert_eq!(error.is_transport_failure(), transport, "{error:?}");
+            assert_eq!(error.never_left_the_client(), never_sent, "{error:?}");
+        }
+    }
+
+    /// `ffi_kind` values are baked into `VaneFfiResponse.error_kind` and
+    /// mirrored by `VaneErrorKind` in Dart. Renumbering silently mislabels
+    /// every error on that binding, so nail the wire values down.
+    #[test]
+    fn ffi_error_kind_codes_are_stable() {
+        let msg = || "x".to_string();
+        assert_eq!(VaneError::Generic(msg()).ffi_kind(), 0);
+        assert_eq!(VaneError::InvalidRequest(msg()).ffi_kind(), 1);
+        assert_eq!(VaneError::Cancelled(msg()).ffi_kind(), 2);
+        assert_eq!(VaneError::ConnectTimeout(msg()).ffi_kind(), 3);
+        assert_eq!(VaneError::Timeout(msg()).ffi_kind(), 4);
+        assert_eq!(VaneError::Transport(msg()).ffi_kind(), 5);
+        assert_eq!(VaneError::Tls(msg()).ffi_kind(), 6);
+        assert_eq!(VaneError::BodyLimitExceeded(msg()).ffi_kind(), 7);
+        assert_eq!(VaneError::ProtocolUnsupported(msg()).ffi_kind(), 8);
+        // Fourth byte in, filling the padding after `is_success` on both 32-
+        // and 64-bit, which is why the field cost no struct growth. Dart
+        // derives the same offset from its own field order, so a field
+        // inserted above this one silently desyncs the two.
+        assert_eq!(std::mem::offset_of!(VaneFfiResponse, error_kind), 4);
+    }
+
+    /// The reason the kind exists at all: an `http://` URL is rejected by both
+    /// transports, so before the kind landed this burned a whole TCP attempt
+    /// (and a second timeout) to arrive at the same answer.
+    #[cfg(feature = "tcp-fallback")]
+    #[test]
+    fn non_transport_failures_never_reach_the_fallback() {
+        let client = VaneClient::new(VaneClientConfig {
+            protocol_mode: VaneProtocolMode::Http3ThenHttp2ThenHttp1,
+            ..VaneClientConfig::default()
+        })
+        .unwrap();
+
+        let err = client.execute(request("http://example.com/")).unwrap_err();
+
+        assert!(matches!(err, VaneError::InvalidRequest(_)), "{err:?}");
+        assert!(
+            !err.to_string().contains("TCP fallback"),
+            "the TCP fallback should not have been tried: {err}"
+        );
     }
 
     /// An HTTP status is a completed exchange. Falling back on one would send

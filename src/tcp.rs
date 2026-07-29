@@ -13,7 +13,7 @@ use std::sync::atomic::AtomicBool;
 #[cfg(target_os = "android")]
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -275,16 +275,15 @@ fn tls_config(
     check_android_trust_ready()?;
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let inner = rustls_platform_verifier::Verifier::new(provider.clone())
-        .map_err(|e| VaneError::Generic(format!("Failed to build TLS verifier: {e}")))?;
+    let inner = inner_verifier(&provider)?;
 
     // `with_safe_default_protocol_versions` is TLS 1.2 + 1.3.
     let mut config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .map_err(|e| VaneError::Generic(format!("Failed to configure TLS versions: {e}")))?
+        .map_err(|e| VaneError::Tls(format!("Failed to configure TLS versions: {e}")))?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedServerCertVerifier {
-            inner: Arc::new(inner),
+            inner,
             certificate_pins,
         }))
         .with_no_client_auth();
@@ -299,6 +298,51 @@ fn tls_config(
     };
 
     Ok(config)
+}
+
+/// The platform's own verifier, which is what "trusted" has to mean on
+/// SecTrust and Android.
+#[cfg(not(test))]
+fn inner_verifier(
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+) -> Result<Arc<dyn ServerCertVerifier>, VaneError> {
+    Ok(Arc::new(
+        rustls_platform_verifier::Verifier::new(provider.clone())
+            .map_err(|e| VaneError::Tls(format!("Failed to build TLS verifier: {e}")))?,
+    ))
+}
+
+/// Test-only trust anchor. The suite runs against a local server whose CA is
+/// generated per run and therefore can never be in the platform store; without
+/// this the reuse-retry regression test could not reach vane's own code path.
+#[cfg(test)]
+pub(crate) static TEST_ROOT: std::sync::Mutex<Option<CertificateDer<'static>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn inner_verifier(
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+) -> Result<Arc<dyn ServerCertVerifier>, VaneError> {
+    let root = TEST_ROOT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let Some(root) = root else {
+        return Ok(Arc::new(
+            rustls_platform_verifier::Verifier::new(provider.clone())
+                .map_err(|e| VaneError::Tls(format!("Failed to build TLS verifier: {e}")))?,
+        ));
+    };
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(root)
+        .map_err(|e| VaneError::Tls(format!("Invalid test root: {e}")))?;
+    Ok(rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .build()
+    .map_err(|e| VaneError::Tls(format!("Failed to build TLS verifier: {e}")))?)
 }
 
 fn build_client(
@@ -333,7 +377,7 @@ fn build_client(
 
     for (host, address) in &config.dns_overrides {
         let ip = address.parse::<IpAddr>().map_err(|e| {
-            VaneError::Generic(format!(
+            VaneError::InvalidRequest(format!(
                 "Invalid DNS override for {host}: expected IP address, got {address}: {e}"
             ))
         })?;
@@ -346,7 +390,7 @@ fn build_client(
         // Per-transport reading of one setting: MASQUE/CONNECT-UDP on HTTP/3,
         // HTTP CONNECT here.
         let mut proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
-            VaneError::Generic(format!(
+            VaneError::InvalidRequest(format!(
                 "Invalid proxyUrl {}: {e}",
                 redact_url_userinfo(proxy_url)
             ))
@@ -356,8 +400,9 @@ fn build_client(
             .as_deref()
             .filter(|value| !value.is_empty())
         {
-            let value = HeaderValue::from_str(authorization)
-                .map_err(|_| VaneError::Generic("Invalid proxyAuthorization header".to_string()))?;
+            let value = HeaderValue::from_str(authorization).map_err(|_| {
+                VaneError::InvalidRequest("Invalid proxyAuthorization header".to_string())
+            })?;
             proxy = proxy.custom_http_auth(value);
         }
         builder = builder.proxy(proxy);
@@ -421,9 +466,9 @@ fn build_headers(
             return Ok(());
         }
         let name = HeaderName::from_bytes(lower.as_bytes())
-            .map_err(|e| VaneError::Generic(format!("Invalid header name {key}: {e}")))?;
+            .map_err(|e| VaneError::InvalidRequest(format!("Invalid header name {key}: {e}")))?;
         let value = HeaderValue::from_str(value)
-            .map_err(|_| VaneError::Generic(format!("Invalid value for header {key}")))?;
+            .map_err(|_| VaneError::InvalidRequest(format!("Invalid value for header {key}")))?;
         // Append rather than insert: the HTTP/3 path sends every occurrence,
         // and replacing would silently drop a caller's second value.
         headers.append(name, value);
@@ -436,7 +481,7 @@ fn build_headers(
         headers.insert(
             reqwest::header::USER_AGENT,
             HeaderValue::from_str(user_agent)
-                .map_err(|_| VaneError::Generic("Invalid userAgent".to_string()))?,
+                .map_err(|_| VaneError::InvalidRequest("Invalid userAgent".to_string()))?,
         );
     }
 
@@ -447,7 +492,7 @@ fn build_headers(
         headers.insert(
             reqwest::header::COOKIE,
             HeaderValue::from_str(cookie_header)
-                .map_err(|_| VaneError::Generic("Invalid cookie header".to_string()))?,
+                .map_err(|_| VaneError::InvalidRequest("Invalid cookie header".to_string()))?,
         );
     }
 
@@ -469,7 +514,7 @@ pub(crate) fn execute_tcp_once(
     // the HTTP/3 https-only rejection is exactly what would have routed us
     // here, turning a hard failure into a silent cleartext send.
     if url.scheme() != "https" {
-        return Err(VaneError::Generic(
+        return Err(VaneError::InvalidRequest(
             "Vane only supports https:// URLs".to_string(),
         ));
     }
@@ -521,43 +566,85 @@ fn follow_and_read(
 
     let mut current = url.clone();
     let mut method = reqwest::Method::from_bytes(request.method.to_ascii_uppercase().as_bytes())
-        .map_err(|_| VaneError::Generic(format!("Invalid HTTP method {}", request.method)))?;
+        .map_err(|_| {
+            VaneError::InvalidRequest(format!("Invalid HTTP method {}", request.method))
+        })?;
     let mut body = request_body;
     let mut body_dropped = false;
     let mut hops = 0usize;
+    // Once per request, not per redirect hop: the race below is a property of
+    // checking a connection out of the pool, so one retry covers the request.
+    let mut allow_reuse_retry = true;
 
     let response = loop {
         check_cancelled(cancel_token)?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(VaneError::Generic("HTTP request timed out".to_string()));
+            return Err(VaneError::Timeout("HTTP request timed out".to_string()));
         }
-        let cookie_header = if client.config.cookies_enabled {
-            // Re-derived per hop: cookies are scoped by host and path, so the
-            // header built for the first URL is wrong for a redirect target.
-            Some(client.cookie_header(&current)?)
-        } else {
-            None
+        // Rebuilt rather than `try_clone`d for the retry below: cloning up
+        // front would copy the request body on every single request to cover a
+        // path that is almost never taken.
+        let build = |remaining: Duration| -> Result<reqwest::blocking::RequestBuilder, VaneError> {
+            let cookie_header = if client.config.cookies_enabled {
+                // Re-derived per hop: cookies are scoped by host and path, so
+                // the header built for the first URL is wrong for a redirect
+                // target.
+                Some(client.cookie_header(&current)?)
+            } else {
+                None
+            };
+            let mut builder = http
+                .request(method.clone(), current.to_string())
+                .headers(build_headers(
+                    client,
+                    request,
+                    &current,
+                    (&origin.0, origin.1),
+                    cookie_header.as_deref(),
+                    body_dropped,
+                )?)
+                .timeout(remaining);
+            if !body.is_empty() {
+                // reqwest owns the body; the HTTP/3 path can borrow, this
+                // cannot.
+                builder = builder.body(body.to_vec());
+            }
+            Ok(builder)
         };
-        let mut builder = http
-            .request(method.clone(), current.to_string())
-            .headers(build_headers(
-                client,
-                request,
-                &current,
-                (&origin.0, origin.1),
-                cookie_header.as_deref(),
-                body_dropped,
-            )?)
-            .timeout(remaining);
-        if !body.is_empty() {
-            // reqwest owns the body; the HTTP/3 path can borrow, this cannot.
-            builder = builder.body(body.to_vec());
-        }
 
-        let response = builder
-            .send()
-            .map_err(|e| VaneError::Generic(format!("HTTP request failed: {}", describe(e))))?;
+        let response = match build(remaining)?.send() {
+            Ok(response) => response,
+            Err(error) => {
+                // The same rule the HTTP/3 path applies to a pooled connection
+                // that died silently. hyper can hand us a keep-alive
+                // connection at the instant the peer closes it; by then the
+                // request is already committed to that connection, so
+                // hyper-util's own retry (which needs `take_message`) cannot
+                // cover it and the write surfaces as a transport error.
+                //
+                // Nothing was read back, so the request was not processed and
+                // one retry on a fresh connection is safe for any method.
+                // Timeouts and connect failures are excluded because they are
+                // genuine failures, not a stale checkout — `is_connect` is
+                // checked directly since `classify_send_error` folds
+                // connect-without-timeout into `Transport`.
+                let stale_pooled_connection = allow_reuse_retry
+                    && client.config.connection_pool_enabled
+                    && !error.is_timeout()
+                    && !error.is_connect()
+                    && check_cancelled(cancel_token).is_ok();
+                if !stale_pooled_connection {
+                    return Err(classify_send_error(error));
+                }
+                allow_reuse_retry = false;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(VaneError::Timeout("HTTP request timed out".to_string()));
+                }
+                build(remaining)?.send().map_err(classify_send_error)?
+            }
+        };
         // Belt and braces for the host we based every security decision on:
         // reqwest re-parses the URL with its own parser, so if the two ever
         // disagree about the host, fail closed instead of acting on ours.
@@ -626,6 +713,27 @@ fn follow_and_read(
         is_success: (200..=299).contains(&status_code),
         url: current.to_string(),
     })
+}
+
+/// Maps a send failure onto a kind using reqwest's own predicates, so the
+/// classification never depends on parsing English error text.
+///
+/// ponytail: a TLS failure — including a pin mismatch raised by
+/// `PinnedServerCertVerifier` — reports `Transport`, not `Tls`. reqwest folds
+/// it into `is_connect()`, and the `rustls::Error` underneath is not reachable
+/// through `source()` because `io::Error` skips its own inner error there.
+/// Upgrade path if a caller needs it: have the verifier record the rejection on
+/// the client and read it back here. The HTTP/3 path, where Vane's own pin code
+/// runs, does report `Tls`.
+fn classify_send_error(error: reqwest::Error) -> VaneError {
+    let timeout = error.is_timeout();
+    let connect = error.is_connect();
+    let message = format!("HTTP request failed: {}", describe(error));
+    match (timeout, connect) {
+        (true, true) => VaneError::ConnectTimeout(message),
+        (true, false) => VaneError::Timeout(message),
+        _ => VaneError::Transport(message),
+    }
 }
 
 /// Renders a reqwest error with its whole source chain.
@@ -737,7 +845,7 @@ fn read_body(
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => {
-                return Err(VaneError::Generic(format!(
+                return Err(VaneError::Transport(format!(
                     "Failed to read HTTP response body: {e}"
                 )));
             }

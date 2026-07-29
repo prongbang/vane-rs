@@ -1,4 +1,5 @@
 /target
+vane-bindgen/target
 .DS_Store
 .build
 generated
