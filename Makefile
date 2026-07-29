@@ -39,12 +39,16 @@ build_kotlin:
 	cd vane-bindgen && sh generate.sh
 	make build_so
 
+# 32-bit x86 is dropped: Android 12+ system images are 64-bit only and Google
+# no longer ships 32-bit x86 emulator images, so it cost ~5.8 MB uncompressed
+# for no reachable consumer. x86_64 stays — dropping it would break
+# System.loadLibrary at runtime on Intel-host emulators, most cloud CI, and
+# ChromeOS, which runs Android apps on x86_64 natively.
 build_so:
 	rm -rf ../VaneKotlin/library/src/main/jniLibs
 	cargo ndk build --release \
 	    --target aarch64-linux-android \
         --target armv7-linux-androideabi \
-        --target i686-linux-android \
         --target x86_64-linux-android \
         -o ../VaneKotlin/library/src/main/jniLibs
 	find ../VaneKotlin/library/src/main/jniLibs -name ".DS_Store" -delete
