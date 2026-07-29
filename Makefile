@@ -51,3 +51,9 @@ build_so:
         --target x86_64-linux-android \
         -o ../VaneKotlin/library/src/main/jniLibs
 	find ../VaneKotlin/library/src/main/jniLibs -name ".DS_Store" -delete
+# quiche declares crate-type = ["lib", "staticlib", "cdylib"], so Cargo emits a
+# libquiche-<hash>.so byproduct that cargo-ndk copies alongside ours. Nothing
+# loads it: vane links quiche's rlib statically, libvane.so carries no NEEDED
+# entry for it, and the only System.loadLibrary/Native.register call names
+# "vane". Shipping it added ~659 KB of dead weight across the ABI set.
+	find ../VaneKotlin/library/src/main/jniLibs -name 'libquiche-*.so' -delete
