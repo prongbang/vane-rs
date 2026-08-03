@@ -51,6 +51,24 @@ const MAX_TLS_SESSIONS: usize = 8;
 const MAX_QUIC_CONFIGS: usize = 8;
 /// Flat ceiling on the cookie jar; see `store_response_cookies`.
 const MAX_COOKIES: usize = 512;
+/// Ceiling on the body of a 3xx that is still a candidate for following.
+///
+/// The TCP path never reads an intermediate body at all (reqwest drops it), so
+/// without this a hostile origin answering ten 302s with a 64 MiB body each
+/// would cost ~700 MiB of metered data over HTTP/3 and nothing over TCP. A
+/// redirect stub does not need more than this; a 3xx that exceeds it fails the
+/// request rather than being followed.
+const MAX_INTERMEDIATE_BODY_BYTES: u64 = 64 * 1024;
+/// Redirect hops allowed when `follow_redirects` is on. Shared by both
+/// transports: the hop cap is a security bound, not a transport detail.
+const MAX_REDIRECTS: usize = 10;
+/// Caller-supplied headers allowed to survive a redirect to a different origin.
+///
+/// Everything else — API keys, bearer tokens, tenant ids — is dropped: reqwest
+/// strips only a fixed list of well-known auth headers, so a custom
+/// `X-Api-Key` would otherwise be handed straight to the redirect target.
+const CROSS_ORIGIN_SAFE_HEADERS: [&str; 4] =
+    ["accept", "accept-language", "content-type", "user-agent"];
 /// Headers the transport owns. Hop-by-hop names are illegal on HTTP/3
 /// (RFC 9114 4.2), and a caller-supplied framing header lets a request be
 /// framed differently by us and by an intermediary.
@@ -806,7 +824,59 @@ impl VaneClient {
         url: &Url,
         body: &[u8],
     ) -> Result<VaneResponse, VaneError> {
-        self.execute_with_retry(request, || self.execute_http3_once(request, url, body))
+        self.execute_with_retry(request, || self.follow_http3_redirects(request, url, body))
+    }
+
+    /// One attempt: the redirect chain. Each hop is a full HTTP/3 request
+    /// (`execute_http3_once`, which owns the stale-pooled-connection retry), so
+    /// the retry policy, the redirect chain and the connection-reuse retry stay
+    /// three separate loops.
+    ///
+    /// Mirrors `tcp::follow_and_read`, including every rule in it.
+    fn follow_http3_redirects(
+        &self,
+        request: &VaneRequest,
+        url: &Url,
+        request_body: &[u8],
+    ) -> Result<VaneResponse, VaneError> {
+        let timeout = Duration::from_secs(
+            request
+                .timeout_seconds
+                .or(self.config.timeout_seconds)
+                .unwrap_or(30),
+        );
+        let cancel_token = cancel_token(request.cancel_token_id);
+        // Once per attempt, not per hop: resetting the counters mid-chain would
+        // walk a progress bar backwards. `execute` marks the request done once
+        // the whole dispatch resolves.
+        let progress = progress_init(request.progress_id, request_body.len() as u64);
+        // Snapshotted once so a concurrent `set_certificate_pins` cannot change
+        // what the hop gate allows halfway down a chain.
+        let certificate_pins = self.certificate_pins_snapshot()?;
+
+        RedirectChain {
+            request,
+            certificate_pins: &certificate_pins,
+            cancel_token: cancel_token.as_deref(),
+            progress: progress.as_deref(),
+            timeouts: HopTimeouts {
+                // One deadline for the whole chain, shared by every stage of
+                // every hop. Applying the timeout per hop would let a hostile
+                // server hold a caller thread for hop-cap times the requested
+                // timeout, and the retry loop multiplies that again.
+                deadline: Instant::now() + timeout,
+                idle: timeout,
+            },
+        }
+        .run(url, request_body, |hop| {
+            self.execute_http3_once(
+                request,
+                hop,
+                &certificate_pins,
+                cancel_token.as_deref(),
+                progress.as_deref(),
+            )
+        })
     }
 
     #[cfg(feature = "tcp-fallback")]
@@ -900,12 +970,19 @@ impl VaneClient {
         }))
     }
 
+    /// One hop. Everything here is keyed off `hop.url`, so a redirect to another
+    /// host gets its own pool key, its own TLS session key and its own resolved
+    /// address without any of them having to know a chain is in progress.
     fn execute_http3_once(
         &self,
         request: &VaneRequest,
-        url: &Url,
-        request_body: &[u8],
-    ) -> Result<VaneResponse, VaneError> {
+        hop: &Http3Hop<'_>,
+        certificate_pins: &HashMap<String, Vec<String>>,
+        cancel_token: Option<&AtomicBool>,
+        progress: Option<&VaneProgressState>,
+    ) -> Result<(VaneResponse, u64), VaneError> {
+        let url = hop.url;
+        let request_body = hop.body;
         if url.scheme() != "https" {
             return Err(VaneError::InvalidRequest(
                 "quiche backend only supports https:// URLs over HTTP/3".to_string(),
@@ -922,27 +999,32 @@ impl VaneClient {
             url.port_or_known_default().unwrap_or(443),
             &self.config.dns_overrides,
         )?;
-        let timeout = Duration::from_secs(
-            request
-                .timeout_seconds
-                .or(self.config.timeout_seconds)
-                .unwrap_or(30),
-        );
         let cookie_header = if self.config.cookies_enabled {
+            // Re-derived per hop: cookies are scoped by host and path, so the
+            // header built for the first URL is wrong for a redirect target.
             Some(self.cookie_header(url)?)
         } else {
             None
         };
-        let headers = build_h3_headers(url, request, &self.config, cookie_header.as_deref())?;
-        let cancel_token = cancel_token(request.cancel_token_id);
-        let progress = progress_init(request.progress_id, request_body.len() as u64);
-        let certificate_pins = self.certificate_pins_snapshot()?;
-        let pool_key = PoolKey::new(url, &self.config, &certificate_pins);
+        let headers = build_h3_headers(
+            url,
+            request,
+            &self.config,
+            hop.method,
+            hop.origin,
+            cookie_header.as_deref(),
+            hop.body_dropped,
+        )?;
+        let pool_key = PoolKey::new(url, &self.config, certificate_pins);
         let mut allow_pooled = self.config.connection_pool_enabled;
 
         loop {
+            // Re-derived each time round: the stale-connection retry below runs
+            // a second full connect and request, and must not get a fresh
+            // budget for them.
+            let remaining = hop.timeouts.remaining("request")?;
             let pooled = if allow_pooled {
-                self.take_pooled_connection(&pool_key, timeout)?
+                self.take_pooled_connection(&pool_key, remaining)?
             } else {
                 None
             };
@@ -953,9 +1035,9 @@ impl VaneClient {
                     .connect_http3(
                         host,
                         peer_addr,
-                        timeout,
+                        hop.timeouts,
                         pool_key.clone(),
-                        &certificate_pins,
+                        certificate_pins,
                     )
                     .inspect_err(|_| {
                         self.drop_closed_connections();
@@ -968,12 +1050,14 @@ impl VaneClient {
                 H3RequestOptions {
                     headers: &headers,
                     request_body,
-                    timeout,
+                    deadline: hop.timeouts.deadline,
                     url,
                     max_response_body_bytes: self.config.max_response_body_bytes,
                     response_body_path: request.response_body_path.as_deref(),
-                    cancel_token: cancel_token.as_deref(),
-                    progress: progress.as_deref(),
+                    cancel_token,
+                    progress,
+                    report_upload: hop.report_upload,
+                    redirect_possible: hop.redirect_possible,
                 },
                 &mut response_started,
             );
@@ -989,9 +1073,10 @@ impl VaneClient {
                         &self.tls_sessions,
                         &transport.conn,
                         &TlsSessionKey::origin(host, peer_addr.port()),
-                        &certificate_pins,
+                        certificate_pins,
                     );
 
+                    let body_len = response.body_len;
                     let public_response = response.into_public_response();
                     if self.config.connection_pool_enabled && !transport.conn.is_closed() {
                         self.return_pooled_connection(transport)?;
@@ -1000,7 +1085,7 @@ impl VaneClient {
                         transport.flush_packets().ok();
                     }
 
-                    return Ok(public_response);
+                    return Ok((public_response, body_len));
                 }
                 Err(err) => {
                     transport.conn.close(true, 0x01, b"request failed").ok();
@@ -1013,10 +1098,7 @@ impl VaneClient {
                     // safe even for non-idempotent methods. `allow_pooled` is
                     // cleared first, so this can happen at most once. A cancelled
                     // request must not pay for another handshake to fail again.
-                    if reused
-                        && !response_started
-                        && check_cancelled(cancel_token.as_deref()).is_ok()
-                    {
+                    if reused && !response_started && check_cancelled(cancel_token).is_ok() {
                         allow_pooled = false;
                         continue;
                     }
@@ -1031,7 +1113,7 @@ impl VaneClient {
         &self,
         host: &str,
         peer_addr: SocketAddr,
-        timeout: Duration,
+        timeouts: HopTimeouts,
         key: PoolKey,
         certificate_pins: &HashMap<String, Vec<String>>,
     ) -> Result<PooledHttp3Connection, VaneError> {
@@ -1040,7 +1122,7 @@ impl VaneClient {
                 host,
                 peer_addr,
                 proxy_url,
-                timeout,
+                timeouts,
                 key,
                 certificate_pins,
             );
@@ -1049,7 +1131,7 @@ impl VaneClient {
         let direct = connect_quic_h3(
             host,
             peer_addr,
-            timeout,
+            timeouts,
             certificate_pins,
             &self.quic_config,
             &self.tls_sessions,
@@ -1077,7 +1159,7 @@ impl VaneClient {
         host: &str,
         peer_addr: SocketAddr,
         proxy_url: &str,
-        timeout: Duration,
+        timeouts: HopTimeouts,
         key: PoolKey,
         certificate_pins: &HashMap<String, Vec<String>>,
     ) -> Result<PooledHttp3Connection, VaneError> {
@@ -1086,7 +1168,7 @@ impl VaneClient {
         let mut outer = connect_quic_h3(
             &proxy.host,
             proxy_addr,
-            timeout,
+            timeouts,
             certificate_pins,
             &self.quic_config,
             &self.tls_sessions,
@@ -1098,7 +1180,7 @@ impl VaneClient {
             host,
             peer_addr.port(),
             self.config.proxy_authorization.as_deref(),
-            timeout,
+            timeouts.remaining("proxy tunnel setup")?,
         )?;
         // The proxy's ticket usually only arrives during tunnel establishment,
         // after `connect_quic_h3` already returned.
@@ -1120,7 +1202,7 @@ impl VaneClient {
             &scid,
             outer.local_addr,
             peer_addr,
-            timeout,
+            timeouts.idle,
             masque_inner_udp_payload(&outer.conn, stream_id / 4),
         )?;
         resume_tls_session(
@@ -1148,7 +1230,7 @@ impl VaneClient {
 
         let mut send_buf = vec![0; MAX_DATAGRAM_SIZE];
         flush_quic_packets_via(&mut io, &mut send_buf, &mut conn)?;
-        let deadline = Instant::now() + timeout;
+        let deadline = timeouts.deadline;
 
         while Instant::now() < deadline {
             read_quic_packets_via(&mut io, &mut conn, outer.local_addr, peer_addr)?;
@@ -1402,6 +1484,189 @@ impl VaneClient {
     }
 }
 
+/// The two clocks one hop runs on.
+#[derive(Debug, Clone, Copy)]
+struct HopTimeouts {
+    /// The whole request's deadline, shared by every hop and every stage inside
+    /// a hop. An `Instant`, not a `Duration`: a duration gets re-anchored to
+    /// `Instant::now()` by each stage that receives it, so handshake, tunnel
+    /// setup and request would each get a full budget and a hostile peer could
+    /// hold a caller for several multiples of the requested timeout.
+    deadline: Instant,
+    /// The caller's configured timeout, which becomes the connection's QUIC idle
+    /// timeout. Deliberately not `remaining`: the quiche config cache is keyed on
+    /// it, so a value that shrinks per hop would rebuild the config — reloading
+    /// the platform roots — and evict the cache on every hop. It is also a
+    /// property of the connection, which outlives the request in the pool.
+    idle: Duration,
+}
+
+impl HopTimeouts {
+    /// Time left before the shared deadline, or `Err(Timeout)` once it is gone.
+    /// Every stage that arms a socket or starts a loop asks for this rather than
+    /// carrying a budget of its own.
+    fn remaining(&self, what: &str) -> Result<Duration, VaneError> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(VaneError::Timeout(format!("HTTP/3 {what} timed out")));
+        }
+        Ok(remaining)
+    }
+}
+
+/// Everything a redirect chain needs that does not change between hops.
+///
+/// Split from the hop executor so the loop — hop counting, the method and body
+/// rewrites, the shared deadline, the refusal reporting and the replay-safety
+/// downgrade — is drivable with a stub and therefore testable without a
+/// network. Every finding that reached production in this loop was in the part
+/// only a live server could reach.
+struct RedirectChain<'a> {
+    request: &'a VaneRequest,
+    certificate_pins: &'a HashMap<String, Vec<String>>,
+    cancel_token: Option<&'a AtomicBool>,
+    progress: Option<&'a VaneProgressState>,
+    timeouts: HopTimeouts,
+}
+
+impl RedirectChain<'_> {
+    /// `hop` performs one request and reports how many body bytes it read (the
+    /// body itself may have gone to a file, so the response cannot be asked).
+    fn run(
+        &self,
+        url: &Url,
+        request_body: &[u8],
+        mut hop: impl FnMut(&Http3Hop<'_>) -> Result<(VaneResponse, u64), VaneError>,
+    ) -> Result<VaneResponse, VaneError> {
+        let origin = (
+            url.host_str().unwrap_or_default().to_string(),
+            origin_port(url),
+        );
+        let mut current = url.clone();
+        let mut method = self.request.method.clone();
+        let mut body = request_body;
+        let mut body_dropped = false;
+        let mut hops = 0usize;
+
+        loop {
+            check_cancelled(self.cancel_token)?;
+            self.timeouts.remaining("request")?;
+
+            let (response, downloaded) = hop(&Http3Hop {
+                url: &current,
+                method: &method,
+                body,
+                body_dropped,
+                origin: (&origin.0, origin.1),
+                timeouts: self.timeouts,
+                // The caller's body is uploaded once, on the first hop.
+                // Reporting a replayed body's bytes from zero again would walk
+                // the upload counter backwards.
+                report_upload: hops == 0,
+                redirect_possible: self.request.follow_redirects && hops < MAX_REDIRECTS,
+            })
+            .map_err(|err| withdraw_replay_safety(err, hops))?;
+
+            let next = match next_redirect_url(
+                response.status_code,
+                header_value(&response.headers, "location"),
+                &current,
+                self.request,
+                hops,
+                self.certificate_pins,
+            ) {
+                RedirectDecision::Stop => return Ok(self.finish(response, downloaded)),
+                RedirectDecision::Refused(reason) => {
+                    return Ok(self.finish(refused_redirect(response, reason), downloaded));
+                }
+                RedirectDecision::Follow(next) => next,
+            };
+
+            let cross_origin = (next.host_str().unwrap_or_default(), origin_port(&next))
+                != (
+                    current.host_str().unwrap_or_default(),
+                    origin_port(&current),
+                );
+            match redirect_rewrite(
+                response.status_code,
+                &method,
+                !body.is_empty(),
+                cross_origin,
+            ) {
+                RedirectRewrite::Refuse => {
+                    return Ok(self.finish(
+                        refused_redirect(response, REDIRECT_REFUSED_CROSS_ORIGIN_BODY),
+                        downloaded,
+                    ));
+                }
+                RedirectRewrite::ToGet => {
+                    method = "GET".to_string();
+                    body = &[];
+                    body_dropped = true;
+                }
+                RedirectRewrite::Keep => {}
+            }
+            current = next;
+            hops += 1;
+        }
+    }
+
+    /// Publishes the download figure for the hop that turned out to be the
+    /// final one. Streaming progress is suppressed while a 3xx could still be
+    /// followed, so a 3xx the gate then refuses would otherwise be handed to
+    /// the caller having reported nothing at all before `done` latches.
+    fn finish(&self, response: VaneResponse, downloaded: u64) -> VaneResponse {
+        progress_download(self.progress, downloaded, downloaded);
+        response
+    }
+}
+
+/// Withdraws the "this attempt provably never left the client" claim once a hop
+/// has been answered.
+///
+/// `ConnectTimeout` is only produced by a handshake deadline, which `dispatch`
+/// reads as "nothing was sent, so the TCP fallback may replay it even for a
+/// non-idempotent method". That is true of hop 0 and false of every hop after
+/// it: hop 0's request was delivered and answered, so replaying the chain from
+/// the start would submit it twice. `Timeout` is still a transport failure, so
+/// an idempotent request still falls back.
+fn withdraw_replay_safety(err: VaneError, hops: usize) -> VaneError {
+    match err {
+        VaneError::ConnectTimeout(message) if hops > 0 => VaneError::Timeout(message),
+        err => err,
+    }
+}
+
+/// Marks a 3xx that Vane refused to follow, so a caller cannot mistake it for
+/// "the server simply sent a redirect" and re-follow the `Location` by hand —
+/// which would defeat the pin or the downgrade rule that stopped it here.
+fn refused_redirect(mut response: VaneResponse, reason: &str) -> VaneResponse {
+    response
+        .headers
+        .insert(REDIRECT_REFUSED_HEADER.to_string(), reason.to_string());
+    response
+}
+
+/// One hop of an HTTP/3 request: everything a redirect chain changes between
+/// hops. A request that never redirects is simply a chain of one.
+struct Http3Hop<'a> {
+    url: &'a Url,
+    /// Uppercased; a 303 rewrites it to GET.
+    method: &'a str,
+    body: &'a [u8],
+    /// Set once a rewrite dropped the body, so a caller `content-type` goes too.
+    body_dropped: bool,
+    /// Host and port the caller addressed. Caller headers are cut to
+    /// [`CROSS_ORIGIN_SAFE_HEADERS`] once this hop leaves it.
+    origin: (&'a str, u16),
+    timeouts: HopTimeouts,
+    /// False after the first hop: the caller's body is uploaded once.
+    report_upload: bool,
+    /// True while a 3xx from this hop could still be followed, which makes its
+    /// body an intermediate the caller never asked for.
+    redirect_possible: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PoolKey {
     scheme: String,
@@ -1579,6 +1844,9 @@ impl MasqueTunnel {
 }
 
 struct Http3ResponseParts {
+    /// Bytes read for this response, whether they went to memory or to the
+    /// caller's file. The public response cannot be asked once a file was used.
+    body_len: u64,
     status_code: u16,
     headers: HashMap<String, String>,
     set_cookie_headers: Vec<String>,
@@ -1941,10 +2209,13 @@ fn insert_tls_session(
     sessions.insert(key.clone(), session);
 }
 
+/// `timeout` bounds the handshake; `idle_timeout` becomes the connection's QUIC
+/// idle timeout and keys the config cache, so it must not shrink per redirect
+/// hop.
 fn connect_quic_h3(
     host: &str,
     peer_addr: SocketAddr,
-    timeout: Duration,
+    timeouts: HopTimeouts,
     certificate_pins: &HashMap<String, Vec<String>>,
     quic_config: &QuicConfigCache,
     tls_sessions: &TlsSessionStore,
@@ -1968,7 +2239,7 @@ fn connect_quic_h3(
         .set_read_timeout(last_read_timeout)
         .map_err(|e| VaneError::Generic(format!("Failed to set UDP read timeout: {e}")))?;
     socket
-        .set_write_timeout(Some(timeout))
+        .set_write_timeout(Some(timeouts.remaining("handshake")?))
         .map_err(|e| VaneError::Generic(format!("Failed to set UDP write timeout: {e}")))?;
 
     let mut scid = [0; quiche::MAX_CONN_ID_LEN];
@@ -1981,7 +2252,7 @@ fn connect_quic_h3(
         &scid,
         local_addr,
         peer_addr,
-        timeout,
+        timeouts.idle,
         MAX_DATAGRAM_SIZE,
     )?;
     resume_tls_session(tls_sessions, &mut conn, session_key, certificate_pins);
@@ -1992,7 +2263,7 @@ fn connect_quic_h3(
     let mut recv_buf = vec![0; UDP_RECV_BUFFER_BYTES];
     let mut send_buf = vec![0; MAX_DATAGRAM_SIZE];
     flush_quic_packets(&socket, &mut send_buf, &mut conn)?;
-    let deadline = Instant::now() + timeout;
+    let deadline = timeouts.deadline;
 
     while Instant::now() < deadline {
         read_quic_packets(
@@ -2336,12 +2607,15 @@ fn masque_path_component(value: &str) -> String {
 struct H3RequestOptions<'a> {
     headers: &'a [quiche::h3::Header],
     request_body: &'a [u8],
-    timeout: Duration,
+    /// Shared with every other stage of the request; see [`HopTimeouts`].
+    deadline: Instant,
     url: &'a Url,
     max_response_body_bytes: u64,
     response_body_path: Option<&'a str>,
     cancel_token: Option<&'a AtomicBool>,
     progress: Option<&'a VaneProgressState>,
+    report_upload: bool,
+    redirect_possible: bool,
 }
 
 fn perform_http3_request(
@@ -2350,15 +2624,19 @@ fn perform_http3_request(
     response_started: &mut bool,
 ) -> Result<Http3ResponseParts, VaneError> {
     let mut body_offset = 0usize;
-    let deadline = Instant::now() + options.timeout;
+    let deadline = options.deadline;
     let mut response =
         ResponseState::new(options.max_response_body_bytes, options.response_body_path)?;
+    response.redirect_possible = options.redirect_possible;
 
     // Send before the first read: the read blocks for up to 50 ms, so reading
     // first delays the request by a full poll interval on every attempt. The
     // deadline is still checked first so an expired one sends nothing.
     if Instant::now() >= deadline {
-        return Err(VaneError::Timeout("HTTP/3 request timed out".to_string()));
+        return Err(VaneError::Timeout(format!(
+            "HTTP/3 request to {} timed out",
+            redact_url_userinfo(&options.url.to_string())
+        )));
     }
     check_cancelled(options.cancel_token)?;
     let mut stream_id = send_h3_request(transport, &options)?;
@@ -2404,10 +2682,14 @@ fn perform_http3_request(
     }
 
     if !response.finished {
-        return Err(VaneError::Timeout("HTTP/3 request timed out".to_string()));
+        return Err(VaneError::Timeout(format!(
+            "HTTP/3 request to {} timed out",
+            redact_url_userinfo(&options.url.to_string())
+        )));
     }
 
     Ok(Http3ResponseParts {
+        body_len: response.body_len as u64,
         status_code: response.status_code,
         headers: response.headers,
         set_cookie_headers: response.set_cookie_headers,
@@ -2455,11 +2737,13 @@ fn send_request_body(
         ) {
             Ok(written) => {
                 *body_offset += written;
-                progress_upload(
-                    options.progress,
-                    *body_offset as u64,
-                    options.request_body.len() as u64,
-                );
+                if options.report_upload {
+                    progress_upload(
+                        options.progress,
+                        *body_offset as u64,
+                        options.request_body.len() as u64,
+                    );
+                }
             }
             Err(quiche::h3::Error::Done) => break,
             Err(e) => return Err(e.into()),
@@ -2945,13 +3229,23 @@ fn sleep_before_retry(attempt: u64, config: &VaneClientConfig) {
     }
 }
 
+/// Builds the header list for one hop. `origin` is the origin the caller
+/// addressed; once a redirect has moved us to a different one, caller-supplied
+/// headers are cut down to [`CROSS_ORIGIN_SAFE_HEADERS`]. `method` is passed in
+/// rather than read off the request because a 303 rewrites it to GET.
 fn build_h3_headers(
     url: &Url,
     request: &VaneRequest,
     config: &VaneClientConfig,
+    method: &str,
+    origin: (&str, u16),
     cookie_header: Option<&str>,
+    body_dropped: bool,
 ) -> Result<Vec<quiche::h3::Header>, VaneError> {
-    let method = request.method.to_ascii_uppercase();
+    // Port is part of the origin: app.example.com and app.example.com:8443 are
+    // different security origins on multi-tenant and dev/staging hosts.
+    let same_origin = (url.host_str().unwrap_or_default(), origin_port(url)) == origin;
+    let method = method.to_ascii_uppercase();
     let host = url
         .host_str()
         .ok_or_else(|| VaneError::InvalidRequest("URL is missing host".to_string()))?;
@@ -2975,32 +3269,49 @@ fn build_h3_headers(
         quiche::h3::Header::new(b":path", path.as_bytes()),
     ];
 
-    let user_agent = config.user_agent.as_deref().unwrap_or("Vane/0.1.0");
-    headers.push(quiche::h3::Header::new(
-        b"user-agent",
-        user_agent.as_bytes(),
-    ));
-
-    for_each_regular_header(request, config, cookie_header, |key, value| {
-        headers.push(quiche::h3::Header::new(
-            key.to_ascii_lowercase().as_bytes(),
-            value.as_bytes(),
-        ));
+    for_each_regular_header(request, config, |key, value| {
+        let lower = key.to_ascii_lowercase();
+        if !same_origin && !header_survives_origin_change(&lower) {
+            return Ok(());
+        }
+        // A 303 rewrite drops the body, so a caller content-type would describe
+        // a payload that is no longer being sent.
+        if body_dropped && lower == "content-type" {
+            return Ok(());
+        }
+        headers.push(quiche::h3::Header::new(lower.as_bytes(), value.as_bytes()));
         Ok(())
     })?;
+
+    // Only when the caller did not set one, so we never send two User-Agents.
+    if !headers.iter().any(|header| header.name() == b"user-agent") {
+        let user_agent = config.user_agent.as_deref().unwrap_or("Vane/0.1.0");
+        headers.push(quiche::h3::Header::new(
+            b"user-agent",
+            user_agent.as_bytes(),
+        ));
+    }
+
+    // Appended after the allowlist, which exists to govern *caller* headers: the
+    // jar's cookies are already scoped to this hop's host and path, so running
+    // them through the cross-origin filter would just discard them.
+    if let Some(cookie_header) = cookie_header.filter(|header| !header.is_empty()) {
+        headers.push(quiche::h3::Header::new(b"cookie", cookie_header.as_bytes()));
+    }
 
     Ok(headers)
 }
 
 /// Walks the non-pseudo request headers in the order both transports must send
-/// them: client defaults, then per-request overrides, then the cookie jar.
+/// them: client defaults, then per-request overrides. The cookie jar's header is
+/// appended by each transport afterwards, because it must not be filtered by the
+/// cross-origin allowlist the way caller headers are.
 ///
 /// Shared so the TCP backend cannot drift from the HTTP/3 backend on which
 /// headers a request carries or which ones callers are allowed to set.
 fn for_each_regular_header(
     request: &VaneRequest,
     config: &VaneClientConfig,
-    cookie_header: Option<&str>,
     mut push: impl FnMut(&str, &str) -> Result<(), VaneError>,
 ) -> Result<(), VaneError> {
     let mut push_checked = |key: &str, value: &str| -> Result<(), VaneError> {
@@ -3027,11 +3338,138 @@ fn for_each_regular_header(
     for (key, value) in config.default_headers.iter().chain(&request.headers) {
         push_checked(key, value)?;
     }
-    if let Some(cookie_header) = cookie_header.filter(|header| !header.is_empty()) {
-        push_checked("cookie", cookie_header)?;
-    }
 
     Ok(())
+}
+
+/// Whether a caller-supplied header may follow a redirect to a different
+/// origin. Lowercase name in, so both transports ask the same question.
+fn header_survives_origin_change(lowercase_name: &str) -> bool {
+    CROSS_ORIGIN_SAFE_HEADERS.contains(&lowercase_name)
+}
+
+fn origin_port(url: &Url) -> u16 {
+    url.port_or_known_default().unwrap_or(443)
+}
+
+/// Case-insensitive lookup over a response header map. HTTP/3 field names are
+/// lowercase by protocol, but the response is peer-controlled and the redirect
+/// gate must not be skippable by spelling `Location` differently.
+fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+/// Response header naming why Vane stopped following a redirect chain.
+const REDIRECT_REFUSED_HEADER: &str = "vane-redirect-refused";
+const REDIRECT_REFUSED_DOWNGRADE: &str = "downgrade";
+const REDIRECT_REFUSED_PINNED_HOST: &str = "pinned-host";
+const REDIRECT_REFUSED_HOP_CAP: &str = "hop-cap";
+const REDIRECT_REFUSED_CROSS_ORIGIN_BODY: &str = "cross-origin-body";
+
+/// What the redirect gate decided about one response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RedirectDecision {
+    Follow(Url),
+    /// Not a redirect to follow: not a 3xx, no usable `Location`, or the caller
+    /// opted out. The response is final and nothing was refused.
+    Stop,
+    /// A redirect Vane refused for the caller's safety; the reason is reported
+    /// on the response.
+    Refused(&'static str),
+}
+
+/// Decides whether a response is a redirect worth following, and to where.
+///
+/// Shared by both transports on purpose: a rule that lives on one of them is a
+/// rule that decides what a URL does based on whether UDP happens to work.
+fn next_redirect_url(
+    status_code: u16,
+    location: Option<&str>,
+    current: &Url,
+    request: &VaneRequest,
+    hops: usize,
+    certificate_pins: &HashMap<String, Vec<String>>,
+) -> RedirectDecision {
+    if !request.follow_redirects || !(300..400).contains(&status_code) {
+        return RedirectDecision::Stop;
+    }
+    if hops >= MAX_REDIRECTS {
+        return RedirectDecision::Refused(REDIRECT_REFUSED_HOP_CAP);
+    }
+    // An empty Location means "no redirect" rather than the site root.
+    let Some(location) = location.filter(|value| !value.is_empty()) else {
+        return RedirectDecision::Stop;
+    };
+    // Resolved with Vane's own parser, which is stricter than the one reqwest
+    // uses (no userinfo, ASCII hosts only). An unparsable or unsupported target
+    // stops the chain rather than being guessed at or attributed to `current`.
+    let Ok(next) = current.join(location) else {
+        return RedirectDecision::Stop;
+    };
+    // Never downgrade to cleartext. Refusing rather than erroring is deliberate:
+    // an error here would make an http:// Location mean "3xx" over TCP and
+    // "failed request" over HTTP/3, which is the transport divergence this
+    // whole change exists to remove. HTTP/3 refuses plaintext regardless, so
+    // nothing insecure can be reached either way.
+    if next.scheme() != "https" {
+        return RedirectDecision::Refused(REDIRECT_REFUSED_DOWNGRADE);
+    }
+    // A pin only constrains the hop it was checked on, so leaving a pinned host
+    // means leaving the pin behind: stop instead. Host-scoped, like the pins
+    // themselves — a port change on the same host stays covered.
+    let current_host = current.host_str().unwrap_or_default();
+    if next.host_str() != Some(current_host)
+        && certificate_pins
+            .get(current_host)
+            .is_some_and(|pins| !pins.is_empty())
+    {
+        return RedirectDecision::Refused(REDIRECT_REFUSED_PINNED_HOST);
+    }
+
+    RedirectDecision::Follow(next)
+}
+
+/// What a redirect does to the method and body of the next hop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirectRewrite {
+    /// Keep the method, replay the body.
+    Keep,
+    /// Bodyless GET; a caller `content-type` goes with the body.
+    ToGet,
+    /// Refuse the hop and hand the 3xx back to the caller.
+    Refuse,
+}
+
+/// A hop that would replay a request body at a different origin is refused: the
+/// credential is as often in the payload as in a header, and stripping headers
+/// does not cover it.
+///
+/// The guard is on "a body still to send", not on the status: 307 and 308 keep
+/// the body by definition, but so does a 301/302 on a GET, and nothing strips a
+/// body from a GET (GraphQL-over-GET and Elasticsearch `_search` are the real
+/// shapes). The rewriting statuses below drop the body first, so they never
+/// reach this.
+fn redirect_rewrite(
+    status_code: u16,
+    method: &str,
+    has_body: bool,
+    cross_origin: bool,
+) -> RedirectRewrite {
+    if has_body && cross_origin && !rewrites_to_get(status_code, method) {
+        return RedirectRewrite::Refuse;
+    }
+    if rewrites_to_get(status_code, method) {
+        return RedirectRewrite::ToGet;
+    }
+    RedirectRewrite::Keep
+}
+
+/// 303, and 301/302 on a non-idempotent method, become a bodyless GET.
+fn rewrites_to_get(status_code: u16, method: &str) -> bool {
+    status_code == 303 || (matches!(status_code, 301 | 302) && !method.eq_ignore_ascii_case("GET"))
 }
 
 fn read_quic_packets(
@@ -3119,6 +3557,13 @@ struct ResponseState {
     max_body_bytes: u64,
     body_len: usize,
     download_total: u64,
+    /// Set by the HTTP/3 path while a 3xx from this response could still be
+    /// followed. Such a body is an intermediate the caller never asked for: its
+    /// bytes must not reach the progress counters (the next hop would restart
+    /// from zero and walk the bar backwards) and it is capped hard. It is still
+    /// read and kept, because a hop the redirect gate then refuses is returned
+    /// to the caller in full.
+    redirect_possible: bool,
 }
 
 impl ResponseState {
@@ -3144,7 +3589,24 @@ impl ResponseState {
             max_body_bytes,
             body_len: 0,
             download_total: 0,
+            redirect_possible: false,
         })
+    }
+
+    /// True while this response is a 3xx that could still be followed, which
+    /// makes its body an intermediate rather than the caller's download.
+    fn is_intermediate_redirect(&self) -> bool {
+        self.redirect_possible && (300..400).contains(&self.status_code)
+    }
+
+    /// The limit this body is held to. An intermediate redirect gets the small
+    /// one; see [`MAX_INTERMEDIATE_BODY_BYTES`].
+    fn effective_max_body_bytes(&self) -> u64 {
+        if self.is_intermediate_redirect() {
+            MAX_INTERMEDIATE_BODY_BYTES.min(self.max_body_bytes)
+        } else {
+            self.max_body_bytes
+        }
     }
 
     /// Records the advertised body size for progress and pre-sizes the
@@ -3165,7 +3627,18 @@ impl ResponseState {
     }
 
     fn push_body(&mut self, bytes: &[u8]) -> Result<(), VaneError> {
-        validate_response_body_limit(self.body_len, bytes.len(), self.max_body_bytes)?;
+        validate_response_body_limit(self.body_len, bytes.len(), self.effective_max_body_bytes())
+            // Says which limit was hit: "exceeded 65536 bytes" against a
+            // configured 64 MiB reads as a bug in Vane otherwise.
+            .map_err(|err| {
+                if self.is_intermediate_redirect() {
+                    VaneError::BodyLimitExceeded(format!(
+                        "Redirect response body exceeded {MAX_INTERMEDIATE_BODY_BYTES} bytes"
+                    ))
+                } else {
+                    err
+                }
+            })?;
         self.body_len += bytes.len();
         if let Some(file) = &mut self.body_file {
             file.write_all(bytes)
@@ -3191,17 +3664,22 @@ fn process_h3_events(
             Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                 *response_started = true;
                 for header in list {
-                    let name = String::from_utf8_lossy(header.name()).to_string();
+                    // Lowercased before it is keyed: HTTP/3 field names are
+                    // lowercase by protocol, but the peer controls them, and
+                    // `Location` plus `location` as two map entries would make
+                    // the redirect gate's lookup nondeterministic. First
+                    // occurrence wins, matching the TCP path's `get`.
+                    let name = String::from_utf8_lossy(header.name()).to_ascii_lowercase();
                     let value = String::from_utf8_lossy(header.value()).to_string();
                     if name == ":status" {
                         response.status_code = value.parse::<u16>().unwrap_or_default();
-                    } else if name.eq_ignore_ascii_case("set-cookie") {
+                    } else if name == "set-cookie" {
                         response.set_cookie_headers.push(value);
                     } else {
-                        if name.eq_ignore_ascii_case("content-length") {
+                        if name == "content-length" {
                             response.on_content_length(&value);
                         }
-                        response.headers.insert(name, value);
+                        response.headers.entry(name).or_insert(value);
                     }
                 }
                 let _ = stream_id;
@@ -3212,11 +3690,13 @@ fn process_h3_events(
                 match http3.recv_body(conn, stream_id, &mut buf[..]) {
                     Ok(read) => {
                         response.push_body(&buf[..read])?;
-                        progress_download(
-                            progress,
-                            response.body_len as u64,
-                            response.download_total,
-                        );
+                        if !response.is_intermediate_redirect() {
+                            progress_download(
+                                progress,
+                                response.body_len as u64,
+                                response.download_total,
+                            );
+                        }
                     }
                     Err(quiche::h3::Error::Done) => break,
                     Err(e) => return Err(e.into()),
@@ -4156,6 +4636,36 @@ mod tests {
     }
 
     #[test]
+    fn live_http3_follows_a_redirect_chain_when_base_url_is_set() {
+        let Some(base_url) = live_https_base_url() else {
+            return;
+        };
+
+        let client = VaneClient::new(VaneClientConfig {
+            base_url: Some(base_url.clone()),
+            protocol_mode: VaneProtocolMode::Http3Only,
+            timeout_seconds: Some(30),
+            ..VaneClientConfig::default()
+        })
+        .unwrap();
+
+        // Three hops, and the reported URL is the last one, not the first.
+        let followed = client
+            .get_request("/redirect/3".to_string())
+            .expect("HTTP/3 redirect chain should be followed");
+        assert!(followed.is_success, "status {}", followed.status_code);
+        assert_eq!(followed.url, format!("{base_url}/get"));
+
+        // Opting out returns the 3xx itself — the same thing the TCP path does.
+        let mut opted_out = request("/redirect/3");
+        opted_out.follow_redirects = false;
+        let opted_out = client
+            .execute(opted_out)
+            .expect("HTTP/3 GET should succeed");
+        assert_eq!(opted_out.status_code, 302);
+    }
+
+    #[test]
     fn live_http3_certificate_pin_when_env_pin_is_set() {
         let Some(base_url) = live_https_base_url() else {
             return;
@@ -4700,8 +5210,8 @@ mod tests {
         req.headers
             .insert(":authority".to_string(), "example.com".to_string());
 
-        let err = for_each_regular_header(&req, &VaneClientConfig::default(), None, |_, _| Ok(()))
-            .unwrap_err();
+        let err =
+            for_each_regular_header(&req, &VaneClientConfig::default(), |_, _| Ok(())).unwrap_err();
 
         assert!(err.to_string().contains("pseudo-header"));
     }
@@ -4717,7 +5227,16 @@ mod tests {
             .insert("X-Trace-ID".to_string(), "abc123".to_string());
 
         let url = Url::parse("https://example.com/items").unwrap();
-        let headers = build_h3_headers(&url, &req, &config, None).unwrap();
+        let headers = build_h3_headers(
+            &url,
+            &req,
+            &config,
+            "GET",
+            ("example.com", 443),
+            None,
+            false,
+        )
+        .unwrap();
         let pairs: Vec<(String, String)> = headers
             .iter()
             .map(|h| {
@@ -4736,14 +5255,475 @@ mod tests {
         assert!(pairs.contains(&("x-trace-id".to_string(), "abc123".to_string())));
     }
 
+    /// Drives the shipped decision function rather than a copy of its logic, so
+    /// the test cannot pass while the code diverges.
+    fn redirect(
+        status: u16,
+        location: &str,
+        from: &Url,
+        hops: usize,
+        pins: &HashMap<String, Vec<String>>,
+    ) -> RedirectDecision {
+        let request = request(&from.to_string());
+        next_redirect_url(status, Some(location), from, &request, hops, pins)
+    }
+
+    fn followed(decision: RedirectDecision) -> Option<String> {
+        match decision {
+            RedirectDecision::Follow(url) => Some(url.to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn h3_redirect_gate_refuses_downgrades_pinned_hops_and_bad_locations() {
+        use RedirectDecision::{Refused, Stop};
+
+        let from = Url::parse("https://api.example.com/login").unwrap();
+        let unpinned = HashMap::new();
+        let pinned = HashMap::from([(
+            "api.example.com".to_string(),
+            vec!["sha256/example".to_string()],
+        )]);
+
+        // Same host, still https: fine.
+        assert_eq!(
+            followed(redirect(302, "/home", &from, 0, &pinned)),
+            Some("https://api.example.com/home".to_string())
+        );
+        // Downgrade to cleartext: never. Refused rather than errored, so both
+        // transports return the same 3xx for the same URL.
+        assert_eq!(
+            redirect(302, "http://api.example.com/home", &from, 0, &pinned),
+            Refused(REDIRECT_REFUSED_DOWNGRADE)
+        );
+        // Leaving a pinned host: the pin does not cover the next hop.
+        assert_eq!(
+            redirect(302, "https://cdn.example.net/home", &from, 0, &pinned),
+            Refused(REDIRECT_REFUSED_PINNED_HOST)
+        );
+        // A port change on a pinned host stays covered by the pin.
+        assert_eq!(
+            followed(redirect(
+                302,
+                "https://api.example.com:8443/home",
+                &from,
+                0,
+                &pinned
+            )),
+            Some("https://api.example.com:8443/home".to_string())
+        );
+        // Unpinned origin may cross hosts.
+        assert_eq!(
+            followed(redirect(
+                302,
+                "https://cdn.example.net/home",
+                &from,
+                0,
+                &unpinned
+            )),
+            Some("https://cdn.example.net/home".to_string())
+        );
+        // A Location our parser rejects stops the chain; it is never attributed
+        // to the URL we are on. The last one is rejected by the scheme gate
+        // instead, which stops the chain just the same.
+        for hostile in [
+            "https://attacker.test\\.api.example.com/y",
+            "https://attacker.test\t.api.example.com/y",
+            "https://attacker%2etest/y",
+            "https://evil@other.example/",
+            "gopher://api.example.com/home",
+        ] {
+            assert_eq!(
+                redirect(302, hostile, &from, 0, &unpinned),
+                Stop,
+                "{hostile} must not resolve"
+            );
+        }
+        // Hop cap, enforced on the last allowed hop and the one after it.
+        assert!(matches!(
+            redirect(302, "/home", &from, MAX_REDIRECTS - 1, &unpinned),
+            RedirectDecision::Follow(_)
+        ));
+        assert_eq!(
+            redirect(302, "/home", &from, MAX_REDIRECTS, &unpinned),
+            Refused(REDIRECT_REFUSED_HOP_CAP)
+        );
+        // Not a redirect status, empty Location, no Location, opted out: all
+        // plain stops, and none of them is reported as a refusal.
+        assert_eq!(redirect(200, "/home", &from, 0, &unpinned), Stop);
+        assert_eq!(redirect(302, "", &from, 0, &unpinned), Stop);
+        assert_eq!(
+            next_redirect_url(
+                302,
+                None,
+                &from,
+                &request("https://api.example.com/login"),
+                0,
+                &unpinned
+            ),
+            Stop
+        );
+        let mut no_follow = request("https://api.example.com/login");
+        no_follow.follow_redirects = false;
+        assert_eq!(
+            next_redirect_url(302, Some("/home"), &from, &no_follow, 0, &unpinned),
+            Stop
+        );
+    }
+
+    fn h3_response(status: u16, location: Option<&str>, body: &str) -> VaneResponse {
+        let mut headers = HashMap::new();
+        if let Some(location) = location {
+            headers.insert("location".to_string(), location.to_string());
+        }
+        VaneResponse {
+            status_code: status,
+            headers,
+            body: body.as_bytes().to_vec(),
+            body_file_path: None,
+            is_success: (200..=299).contains(&status),
+            url: String::new(),
+        }
+    }
+
+    /// What one hop was asked to send.
+    #[derive(Debug, PartialEq, Eq)]
+    struct SeenHop {
+        url: String,
+        method: String,
+        has_body: bool,
+        body_dropped: bool,
+    }
+
+    /// Drives the shipped chain loop with a stub hop executor. Hop counting,
+    /// the method and body rewrites, the shared deadline, refusal reporting and
+    /// the replay-safety downgrade are only reachable here without a live
+    /// HTTP/3 server, and every one of them is a rule with teeth.
+    fn run_chain(
+        request: &VaneRequest,
+        request_body: &[u8],
+        certificate_pins: &HashMap<String, Vec<String>>,
+        progress: Option<&VaneProgressState>,
+        deadline: Instant,
+        mut respond: impl FnMut(usize) -> Result<(VaneResponse, u64), VaneError>,
+    ) -> (Result<VaneResponse, VaneError>, Vec<SeenHop>) {
+        let mut seen = Vec::new();
+        let url = Url::parse(&request.url).unwrap();
+        let result = RedirectChain {
+            request,
+            certificate_pins,
+            cancel_token: None,
+            progress,
+            timeouts: HopTimeouts {
+                deadline,
+                idle: Duration::from_secs(30),
+            },
+        }
+        .run(&url, request_body, |hop| {
+            seen.push(SeenHop {
+                url: hop.url.to_string(),
+                method: hop.method.to_string(),
+                has_body: !hop.body.is_empty(),
+                body_dropped: hop.body_dropped,
+            });
+            respond(seen.len() - 1)
+        });
+        (result, seen)
+    }
+
+    fn post_request(url: &str) -> VaneRequest {
+        let mut request = request(url);
+        request.method = "POST".to_string();
+        request
+    }
+
+    fn in_30s() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    #[test]
+    fn redirect_chain_rewrites_to_get_and_stops_at_the_hop_cap() {
+        let request = post_request("https://api.example.com/a");
+        let (result, seen) = run_chain(
+            &request,
+            b"secret=1",
+            &HashMap::new(),
+            None,
+            in_30s(),
+            |hop| {
+                Ok((
+                    h3_response(302, Some(&format!("/hop{}", hop + 1)), "moved"),
+                    5,
+                ))
+            },
+        );
+
+        // The cap allows MAX_REDIRECTS hops, so MAX_REDIRECTS + 1 requests.
+        assert_eq!(seen.len(), MAX_REDIRECTS + 1);
+        let response = result.unwrap();
+        assert_eq!(response.status_code, 302);
+        assert_eq!(
+            response.headers.get(REDIRECT_REFUSED_HEADER).map(|s| &**s),
+            Some(REDIRECT_REFUSED_HOP_CAP)
+        );
+
+        // Hop 0 sends the caller's POST body; the 302 rewrites it to a bodyless
+        // GET and every later hop stays that way.
+        assert_eq!(
+            seen[0],
+            SeenHop {
+                url: "https://api.example.com/a".to_string(),
+                method: "POST".to_string(),
+                has_body: true,
+                body_dropped: false,
+            }
+        );
+        assert_eq!(
+            seen[1],
+            SeenHop {
+                url: "https://api.example.com/hop1".to_string(),
+                method: "GET".to_string(),
+                has_body: false,
+                body_dropped: true,
+            }
+        );
+        assert!(
+            seen[2..]
+                .iter()
+                .all(|hop| hop.method == "GET" && !hop.has_body)
+        );
+    }
+
+    #[test]
+    fn redirect_chain_refuses_a_cross_origin_body_and_returns_the_response() {
+        let progress = VaneProgressState::default();
+        let paying = post_request("https://api.example.com/pay");
+        let (result, seen) = run_chain(
+            &paying,
+            b"card=4111",
+            &HashMap::new(),
+            Some(&progress),
+            in_30s(),
+            |_| Ok((h3_response(307, Some("https://evil.test/pay"), "moved"), 9)),
+        );
+
+        // Refused before the second hop is ever dialed.
+        assert_eq!(seen.len(), 1);
+        let response = result.unwrap();
+        assert_eq!(response.status_code, 307);
+        assert_eq!(
+            response.headers.get(REDIRECT_REFUSED_HEADER).map(|s| &**s),
+            Some(REDIRECT_REFUSED_CROSS_ORIGIN_BODY)
+        );
+        // The refused response reaches the caller in full, and its bytes are
+        // reported: streaming progress is suppressed while a 3xx might still be
+        // followed, so without the final publish this would report zero.
+        assert_eq!(response.body, b"moved");
+        assert_eq!(progress.download_received.load(Ordering::Relaxed), 9);
+
+        // A pinned host that a redirect tries to leave is refused the same way.
+        let pins = HashMap::from([(
+            "api.example.com".to_string(),
+            vec!["sha256/example".to_string()],
+        )]);
+        let pinned_get = request("https://api.example.com/x");
+        let (result, seen) = run_chain(&pinned_get, b"", &pins, None, in_30s(), |_| {
+            Ok((
+                h3_response(302, Some("https://cdn.example.net/x"), "moved"),
+                5,
+            ))
+        });
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            result
+                .unwrap()
+                .headers
+                .get(REDIRECT_REFUSED_HEADER)
+                .map(|s| &**s),
+            Some(REDIRECT_REFUSED_PINNED_HOST)
+        );
+    }
+
+    #[test]
+    fn redirect_chain_withdraws_replay_safety_after_the_first_hop() {
+        // Hop 0's handshake never left the client, so the TCP fallback may
+        // replay even a POST.
+        let (result, _) = run_chain(
+            &post_request("https://api.example.com/orders"),
+            b"item=1",
+            &HashMap::new(),
+            None,
+            in_30s(),
+            |_| Err(VaneError::ConnectTimeout("handshake".to_string())),
+        );
+        let err = result.unwrap_err();
+        assert!(matches!(err, VaneError::ConnectTimeout(_)));
+        assert!(err.never_left_the_client());
+
+        // Once hop 0 has been answered, the same handshake failure on hop 1 must
+        // not claim that: the POST was delivered, and a fallback that replayed
+        // the chain from the start would submit it twice.
+        let (result, seen) = run_chain(
+            &post_request("https://api.example.com/orders"),
+            b"item=1",
+            &HashMap::new(),
+            None,
+            in_30s(),
+            |hop| match hop {
+                0 => Ok((h3_response(303, Some("/orders/42"), ""), 0)),
+                _ => Err(VaneError::ConnectTimeout("handshake".to_string())),
+            },
+        );
+        assert_eq!(seen.len(), 2);
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, VaneError::Timeout(_)),
+            "expected the claim to be withdrawn, got {err:?}"
+        );
+        assert!(!err.never_left_the_client());
+        // Still a transport failure, so an idempotent request keeps its fallback.
+        assert!(err.is_transport_failure());
+    }
+
+    #[test]
+    fn an_intermediate_redirect_body_is_capped_far_below_the_configured_limit() {
+        let big = vec![0u8; MAX_INTERMEDIATE_BODY_BYTES as usize];
+
+        // The TCP path never reads an intermediate body at all, so HTTP/3 must
+        // not let a hostile 302 cost the caller the full body limit per hop.
+        let mut intermediate = ResponseState::new(64 * 1024 * 1024, None).unwrap();
+        intermediate.redirect_possible = true;
+        intermediate.status_code = 302;
+        assert!(intermediate.push_body(&big).is_ok());
+        let err = intermediate.push_body(b"x").unwrap_err();
+        assert!(
+            err.to_string().contains("Redirect response body exceeded"),
+            "{err}"
+        );
+        // Suppressed from progress too: the next hop restarts from zero.
+        assert!(intermediate.is_intermediate_redirect());
+
+        // A 3xx that can no longer be followed is the caller's own response and
+        // gets the configured limit and the progress counters.
+        let mut last = ResponseState::new(64 * 1024 * 1024, None).unwrap();
+        last.status_code = 302;
+        assert!(last.push_body(&big).is_ok());
+        assert!(last.push_body(b"x").is_ok());
+        assert!(!last.is_intermediate_redirect());
+    }
+
+    #[test]
+    fn redirect_chain_honours_one_deadline_for_the_whole_chain() {
+        let (result, seen) = run_chain(
+            &request("https://api.example.com/a"),
+            b"",
+            &HashMap::new(),
+            None,
+            Instant::now() - Duration::from_secs(1),
+            |_| panic!("no hop may be dialed after the deadline"),
+        );
+
+        assert!(seen.is_empty());
+        assert!(matches!(result.unwrap_err(), VaneError::Timeout(_)));
+    }
+
+    #[test]
+    fn redirect_rewrite_refuses_cross_origin_bodies_and_rewrites_to_get() {
+        use RedirectRewrite::{Keep, Refuse, ToGet};
+
+        // A body that would be replayed at a different origin is refused,
+        // whatever status carries it: stripping headers does not protect the
+        // payload, and a 301/302 on a GET keeps its body too (GraphQL-over-GET).
+        assert_eq!(redirect_rewrite(307, "POST", true, true), Refuse);
+        assert_eq!(redirect_rewrite(308, "POST", true, true), Refuse);
+        assert_eq!(redirect_rewrite(302, "GET", true, true), Refuse);
+        assert_eq!(redirect_rewrite(301, "GET", true, true), Refuse);
+        // A rewrite to GET drops the body first, so it never replays one.
+        assert_eq!(redirect_rewrite(303, "POST", true, true), ToGet);
+        assert_eq!(redirect_rewrite(302, "POST", true, true), ToGet);
+        // Same origin, or nothing to replay: the hop is safe.
+        assert_eq!(redirect_rewrite(307, "POST", true, false), Keep);
+        assert_eq!(redirect_rewrite(308, "POST", false, true), Keep);
+        // 303 always becomes a GET; 301/302 do on a non-GET method.
+        assert_eq!(redirect_rewrite(303, "POST", true, false), ToGet);
+        assert_eq!(redirect_rewrite(303, "GET", false, false), ToGet);
+        assert_eq!(redirect_rewrite(301, "POST", true, false), ToGet);
+        assert_eq!(redirect_rewrite(302, "put", true, false), ToGet);
+        assert_eq!(redirect_rewrite(302, "GET", false, false), Keep);
+    }
+
+    #[test]
+    fn h3_cross_origin_hop_drops_caller_headers() {
+        let config = VaneClientConfig {
+            default_headers: HashMap::from([("X-Api-Key".to_string(), "secret".to_string())]),
+            ..VaneClientConfig::default()
+        };
+        let mut req = request("https://api.example.com/x");
+        req.headers
+            .insert("Authorization".to_string(), "Bearer live".to_string());
+        req.headers
+            .insert("Accept".to_string(), "application/json".to_string());
+        req.headers
+            .insert("Content-Type".to_string(), "application/json".to_string());
+
+        let names = |url: &str, body_dropped: bool| -> Vec<String> {
+            let url = Url::parse(url).unwrap();
+            build_h3_headers(
+                &url,
+                &req,
+                &config,
+                "GET",
+                ("api.example.com", 443),
+                Some("session=abc"),
+                body_dropped,
+            )
+            .unwrap()
+            .iter()
+            .map(|h| String::from_utf8_lossy(h.name()).to_string())
+            .collect()
+        };
+
+        let same = names("https://api.example.com/x", false);
+        assert!(same.contains(&"authorization".to_string()));
+        assert!(same.contains(&"x-api-key".to_string()));
+
+        // Different host: only the safe list survives.
+        let other_host = names("https://cdn.example.net/x", false);
+        assert!(!other_host.contains(&"authorization".to_string()));
+        assert!(!other_host.contains(&"x-api-key".to_string()));
+        assert!(other_host.contains(&"accept".to_string()));
+        // The jar's cookies are scoped to the hop's own host, so they are not
+        // subject to the caller-header allowlist.
+        assert!(other_host.contains(&"cookie".to_string()));
+
+        // Same host, different port: still a different origin.
+        let other_port = names("https://api.example.com:8443/x", false);
+        assert!(!other_port.contains(&"authorization".to_string()));
+        assert!(!other_port.contains(&"x-api-key".to_string()));
+
+        // A rewrite to GET drops the body, so the content-type goes with it.
+        let dropped = names("https://api.example.com/x", true);
+        assert!(!dropped.contains(&"content-type".to_string()));
+        assert!(names("https://api.example.com/x", false).contains(&"content-type".to_string()));
+    }
+
     #[test]
     fn h3_headers_include_cookie_jar_header_when_present() {
         let config = VaneClientConfig::default();
         let req = request("https://example.com/items");
         let url = Url::parse("https://example.com/items").unwrap();
 
-        let headers =
-            build_h3_headers(&url, &req, &config, Some("session=abc; theme=dark")).unwrap();
+        let headers = build_h3_headers(
+            &url,
+            &req,
+            &config,
+            "GET",
+            ("example.com", 443),
+            Some("session=abc; theme=dark"),
+            false,
+        )
+        .unwrap();
         let pairs: Vec<(String, String)> = headers
             .iter()
             .map(|h| {

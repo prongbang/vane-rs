@@ -292,7 +292,12 @@ fn target(
     let response = reqwest::blocking::Response::from(raw.body(Vec::new()).unwrap());
     let mut request = crate::test_request(&current.to_string());
     request.follow_redirects = true;
-    redirect_target(&response, current, &request, 0, pins)
+    match redirect_target(&response, current, &request, 0, pins) {
+        RedirectDecision::Follow(url) => Some(url),
+        // The reasons are asserted in the shared gate's own tests; here only
+        // "did the TCP adapter hand back a hop" matters.
+        RedirectDecision::Stop | RedirectDecision::Refused(_) => None,
+    }
 }
 
 #[test]

@@ -23,22 +23,13 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 
 use super::{
-    H3_BODY_BUFFER_BYTES, ResponseState, Url, VaneClient, VaneError, VaneProgressState,
-    VaneProtocolMode, VaneRequest, VaneResponse, cancel_token, check_cancelled,
-    for_each_regular_header, progress_download, progress_init, progress_upload,
-    redact_url_userinfo, verify_certificate_pins,
+    H3_BODY_BUFFER_BYTES, REDIRECT_REFUSED_CROSS_ORIGIN_BODY, REDIRECT_REFUSED_HEADER,
+    RedirectDecision, RedirectRewrite, ResponseState, Url, VaneClient, VaneError,
+    VaneProgressState, VaneProtocolMode, VaneRequest, VaneResponse, cancel_token, check_cancelled,
+    for_each_regular_header, header_survives_origin_change, next_redirect_url, origin_port,
+    progress_download, progress_init, progress_upload, redact_url_userinfo, redirect_rewrite,
+    verify_certificate_pins,
 };
-
-/// Redirect hops allowed when `follow_redirects` is on.
-const MAX_REDIRECTS: usize = 10;
-
-/// Caller-supplied headers allowed to survive a redirect to a different
-/// origin.
-/// Everything else — API keys, bearer tokens, tenant ids — is dropped: reqwest
-/// strips only a fixed list of well-known auth headers, so a custom
-/// `X-Api-Key` would otherwise be handed straight to the redirect target.
-const CROSS_ORIGIN_SAFE_HEADERS: [&str; 4] =
-    ["accept", "accept-language", "content-type", "user-agent"];
 
 /// Wraps the platform's own certificate verifier and adds Vane's host-scoped
 /// pins.
@@ -441,7 +432,7 @@ fn shared_client(client: &VaneClient) -> Result<(Client, HashMap<String, Vec<Str
 
 /// Builds the header map for one hop. `origin` is the origin the caller
 /// addressed; once a redirect has moved us to a different one, caller-supplied
-/// headers are cut down to [`CROSS_ORIGIN_SAFE_HEADERS`].
+/// headers are cut down to the shared cross-origin allowlist.
 fn build_headers(
     client: &VaneClient,
     request: &VaneRequest,
@@ -455,9 +446,9 @@ fn build_headers(
     let same_origin = (url.host_str().unwrap_or_default(), origin_port(url)) == origin;
     let mut headers = HeaderMap::new();
 
-    for_each_regular_header(request, &client.config, None, |key, value| {
+    for_each_regular_header(request, &client.config, |key, value| {
         let lower = key.to_ascii_lowercase();
-        if !same_origin && !CROSS_ORIGIN_SAFE_HEADERS.contains(&lower.as_str()) {
+        if !same_origin && !header_survives_origin_change(&lower) {
             return Ok(());
         }
         // A 303 rewrite drops the body, so a caller content-type would describe
@@ -497,10 +488,6 @@ fn build_headers(
     }
 
     Ok(headers)
-}
-
-fn origin_port(url: &Url) -> u16 {
-    url.port_or_known_default().unwrap_or(443)
 }
 
 pub(crate) fn execute_tcp_once(
@@ -572,6 +559,9 @@ fn follow_and_read(
     let mut body = request_body;
     let mut body_dropped = false;
     let mut hops = 0usize;
+    // Names why a redirect chain stopped, so a caller cannot mistake a refusal
+    // for a plain 3xx and re-follow the Location by hand.
+    let mut refused: Option<&'static str> = None;
     // Once per request, not per redirect hop: the race below is a property of
     // checking a connection out of the pool, so one retry covers the request.
     let mut allow_reuse_retry = true;
@@ -673,36 +663,48 @@ fn follow_and_read(
             }
         }
 
-        let Some(next) = redirect_target(&response, &current, request, hops, &certificate_pins)
-        else {
-            break response;
+        let next = match redirect_target(&response, &current, request, hops, &certificate_pins) {
+            RedirectDecision::Stop => break response,
+            RedirectDecision::Refused(reason) => {
+                refused = Some(reason);
+                break response;
+            }
+            RedirectDecision::Follow(next) => next,
         };
-        // 307 and 308 keep the method and body by definition, so a cross-origin
-        // hop would hand the request payload — where the credential usually
-        // lives — to the new origin. Header stripping does not cover that, so
-        // the hop is refused and the 3xx goes back to the caller.
-        let status = response.status().as_u16();
-        if matches!(status, 307 | 308)
-            && !body.is_empty()
-            && (next.host_str().unwrap_or_default(), origin_port(&next))
-                != (
-                    current.host_str().unwrap_or_default(),
-                    origin_port(&current),
-                )
-        {
-            break response;
-        }
-        // 303, and 301/302 on a non-idempotent method, become a bodyless GET.
-        if status == 303 || (matches!(status, 301 | 302) && method != reqwest::Method::GET) {
-            method = reqwest::Method::GET;
-            body = &[];
-            body_dropped = true;
+        let cross_origin = (next.host_str().unwrap_or_default(), origin_port(&next))
+            != (
+                current.host_str().unwrap_or_default(),
+                origin_port(&current),
+            );
+        match redirect_rewrite(
+            response.status().as_u16(),
+            method.as_str(),
+            !body.is_empty(),
+            cross_origin,
+        ) {
+            // The hop would replay the body at a different origin.
+            RedirectRewrite::Refuse => {
+                refused = Some(REDIRECT_REFUSED_CROSS_ORIGIN_BODY);
+                break response;
+            }
+            RedirectRewrite::ToGet => {
+                method = reqwest::Method::GET;
+                body = &[];
+                body_dropped = true;
+            }
+            RedirectRewrite::Keep => {}
         }
         current = next;
         hops += 1;
     };
 
     read_body(response, &mut state, cancel_token, progress)?;
+
+    if let Some(reason) = refused {
+        state
+            .headers
+            .insert(REDIRECT_REFUSED_HEADER.to_string(), reason.to_string());
+    }
 
     let status_code = state.status_code;
     Ok(VaneResponse {
@@ -765,50 +767,32 @@ fn collect_set_cookie(response: &reqwest::blocking::Response) -> Vec<String> {
         .collect()
 }
 
-/// Decides whether a response is a redirect worth following, and to where.
-/// `None` means "treat this as the final response" — which hands the 3xx back
-/// to the caller exactly as the HTTP/3 path would.
+/// Reads the redirect target off a reqwest response and hands the decision to
+/// the rule both transports share. `None` means "treat this as the final
+/// response" — which hands the 3xx back to the caller exactly as the HTTP/3
+/// path would.
 fn redirect_target(
     response: &reqwest::blocking::Response,
     current: &Url,
     request: &VaneRequest,
     hops: usize,
     certificate_pins: &HashMap<String, Vec<String>>,
-) -> Option<Url> {
-    if !request.follow_redirects || !response.status().is_redirection() || hops >= MAX_REDIRECTS {
-        return None;
-    }
+) -> RedirectDecision {
     // `get` takes the first Location if a server sent several; a response with
     // conflicting Location headers is malformed either way and the hop is
-    // gated by the scheme/pin/origin rules below regardless of which we pick.
+    // gated by the scheme/pin/origin rules regardless of which we pick.
     let location = response
         .headers()
         .get(reqwest::header::LOCATION)
-        .and_then(|value| value.to_str().ok())?;
-    // Resolved with Vane's own parser, which is stricter than the URL crate
-    // reqwest uses (no userinfo, ASCII hosts only). An unparsable or
-    // unsupported target stops the chain rather than being guessed at.
-    // An empty Location means "no redirect" rather than the site root.
-    if location.is_empty() {
-        return None;
-    }
-    let next = current.join(location).ok()?;
-    // Never downgrade to cleartext.
-    if next.scheme() != "https" {
-        return None;
-    }
-    // A pin only constrains the hop it was checked on, so leaving a pinned
-    // host means leaving the pin behind: stop instead.
-    let current_host = current.host_str().unwrap_or_default();
-    if next.host_str() != Some(current_host)
-        && certificate_pins
-            .get(current_host)
-            .is_some_and(|pins| !pins.is_empty())
-    {
-        return None;
-    }
-
-    Some(next)
+        .and_then(|value| value.to_str().ok());
+    next_redirect_url(
+        response.status().as_u16(),
+        location,
+        current,
+        request,
+        hops,
+        certificate_pins,
+    )
 }
 
 fn read_body(

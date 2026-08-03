@@ -298,15 +298,20 @@ all and those modes return an explicit "fallback unavailable" error. On the TCP
 path, TLS is rustls (TLS 1.2 and 1.3), certificate pins are enforced by the same
 pin set and the same fail-closed check as HTTP/3, and the cookie jar, retry
 policy, body limits, progress and cancellation are the shared implementations.
-Redirects are followed there (up to 10 hops) when the request's
-`followRedirects` is set; the HTTP/3 path does not follow redirects. A hop is
-refused — and the 3xx handed back to the caller — if it would downgrade to
-`http://`, or if it would leave a host that has certificate pins configured,
-since a pin only constrains the hop it was checked on. Caller-supplied headers
-are dropped when a hop changes host (only `accept`, `accept-language`,
-`content-type` and `user-agent` survive), so an API key cannot follow a
-redirect to another origin. Cookies are re-derived per hop and `Set-Cookie` is
-stored from intermediate responses, scoped to the host that sent it.
+Redirects are followed on **both** paths (up to 10 hops) when the request's
+`followRedirects` is set, through one shared set of rules, so the same URL
+behaves the same way whether or not UDP is available. A hop is refused — and
+the 3xx handed back to the caller, carrying a `vane-redirect-refused` header
+naming the reason — if it would downgrade to `http://`, if it would leave a
+host that has certificate pins configured (a pin only constrains the hop it was
+checked on), if it would replay a request body at a different origin, or if the
+hop cap is reached. Caller-supplied headers are dropped when a hop changes
+origin — host *and* port (only `accept`, `accept-language`, `content-type` and
+`user-agent` survive) — so an API key cannot follow a redirect to another
+origin. 303, and 301/302 on a non-GET, become bodyless GETs. Cookies are
+re-derived per hop and `Set-Cookie` is stored from intermediate responses,
+scoped to the host that sent it. One deadline covers the whole chain, and the
+final URL is reported on the response.
 
 Neither path does transparent response decompression, and neither lets callers
 set connection-management or framing headers (`connection`, `content-length`,
