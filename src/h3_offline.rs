@@ -1,0 +1,582 @@
+//! In-process quiche HTTP/3 server, so tests can drive the real H3 transport
+//! without `VANE_TEST_BASE_URL` or a network. Exists above all to prove TLS
+//! session resumption end to end: it terminates real QUIC+TLS, issues
+//! NewSessionTickets, and records per connection whether the handshake was a
+//! resumption (`SSL_session_reused` via `quiche::Connection::is_resumed`).
+//!
+//! The client trusts the per-process test CA through the `#[cfg(test)]` seam
+//! in `create_quiche_config` — the H3 twin of the TCP path's `TEST_ROOT`.
+//! That seam is additive (platform roots and `verify_peer(true)` stay in
+//! force) and compiled out of every non-test build.
+//!
+//! ponytail: a focused test server, not a framework — connections are keyed
+//! by peer address (no CID routing, no migration; the client disables it), no
+//! Retry, no version negotiation (the client is this same quiche build), and
+//! responses are buffered whole. Grow those only if a test actually needs it.
+
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::net::{SocketAddr, UdpSocket};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
+
+use quiche::h3::NameValue;
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+
+/// Hostname every test server answers as; tests point it at 127.0.0.1 through
+/// `dns_overrides`, so resolution never leaves the process's control.
+pub(crate) const TEST_HOST: &str = "h3.test";
+
+/// One CA and one leaf per test process, shared by every server instance.
+/// Sharing one PKI keeps the trust seam a set-once `OnceLock` — tests never
+/// swap anchors, so they need no serializing lock and can run in parallel.
+pub(crate) struct TestPki {
+    ca_pem_path: PathBuf,
+    cert_pem_path: PathBuf,
+    key_pem_path: PathBuf,
+    /// Leaf DER, so tests can compute the pin the server actually presents.
+    pub(crate) leaf_der: Vec<u8>,
+}
+
+static TEST_PKI: OnceLock<TestPki> = OnceLock::new();
+
+/// The extra trust anchor `create_quiche_config`'s test-only seam loads.
+/// `None` until a test starts a server, so suites that never touch the
+/// offline server keep a byte-identical trust path.
+pub(crate) fn test_ca_pem_path() -> Option<&'static str> {
+    TEST_PKI.get().and_then(|pki| pki.ca_pem_path.to_str())
+}
+
+pub(crate) fn test_pki() -> &'static TestPki {
+    TEST_PKI.get_or_init(|| {
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        // rcgen's default gives CA and leaf the identical subject DN, and
+        // BoringSSL then treats the leaf (subject == issuer) as self-signed
+        // and never builds the chain — webpki on the TCP path tolerates it,
+        // X509 verification does not. Distinct CNs keep BoringSSL honest.
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "vane offline test CA");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let ca_pem = ca.pem();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let mut leaf_params = CertificateParams::new(vec![TEST_HOST.to_string()]).unwrap();
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, TEST_HOST);
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+
+        // quiche only loads trust anchors and keys from files. One tiny
+        // pid-named trio in the OS temp dir, never deleted: the path must
+        // outlive every quiche config built in this process.
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let write = |name: &str, contents: &str| -> PathBuf {
+            let path = dir.join(format!("vane-h3-offline-{pid}-{name}"));
+            std::fs::write(&path, contents).unwrap();
+            path
+        };
+        TestPki {
+            ca_pem_path: write("ca.pem", &ca_pem),
+            cert_pem_path: write("cert.pem", &leaf.pem()),
+            key_pem_path: write("key.pem", &leaf_key.serialize_pem()),
+            leaf_der: leaf.der().to_vec(),
+        }
+    })
+}
+
+/// A localhost HTTP/3 origin on an ephemeral port, served from one background
+/// thread until dropped. `handshakes` records, in accept order, whether each
+/// connection's TLS handshake resumed a previous session.
+pub(crate) struct TestH3Server {
+    port: u16,
+    handshakes: Arc<Mutex<Vec<bool>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TestH3Server {
+    pub(crate) fn start() -> Self {
+        let pki = test_pki();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // The tick that bounds every loop below: recv wakes at least this
+        // often to fire QUIC timers and check the stop flag.
+        socket
+            .set_read_timeout(Some(Duration::from_millis(5)))
+            .unwrap();
+        let port = socket.local_addr().unwrap().port();
+
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file(pki.cert_pem_path.to_str().unwrap())
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file(pki.key_pem_path.to_str().unwrap())
+            .unwrap();
+        config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        config.set_max_idle_timeout(10_000);
+        config.set_max_recv_udp_payload_size(MAX_SERVER_DATAGRAM);
+        config.set_max_send_udp_payload_size(MAX_SERVER_DATAGRAM);
+        config.enable_dgram(true, 16, 16);
+        config.set_initial_max_data(10_000_000);
+        config.set_initial_max_stream_data_bidi_local(1_000_000);
+        config.set_initial_max_stream_data_bidi_remote(1_000_000);
+        config.set_initial_max_stream_data_uni(1_000_000);
+        config.set_initial_max_streams_bidi(100);
+        config.set_initial_max_streams_uni(100);
+
+        let handshakes = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = std::thread::spawn({
+            let handshakes = Arc::clone(&handshakes);
+            let stop = Arc::clone(&stop);
+            move || serve(&socket, config, &handshakes, &stop)
+        });
+        Self {
+            port,
+            handshakes,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    pub(crate) fn url(&self, path: &str) -> String {
+        format!("https://{TEST_HOST}:{}{path}", self.port)
+    }
+
+    /// Snapshot of the per-connection resumption log, in accept order.
+    pub(crate) fn handshakes(&self) -> Vec<bool> {
+        self.handshakes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Drop for TestH3Server {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            thread.join().ok();
+        }
+    }
+}
+
+const MAX_SERVER_DATAGRAM: usize = 1350;
+
+struct ServerConn {
+    conn: quiche::Connection,
+    h3: Option<quiche::h3::Connection>,
+    requests: HashMap<u64, PendingRequest>,
+}
+
+#[derive(Default)]
+struct PendingRequest {
+    path: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+fn serve(
+    socket: &UdpSocket,
+    mut config: quiche::Config,
+    handshakes: &Mutex<Vec<bool>>,
+    stop: &AtomicBool,
+) {
+    let local_addr = socket.local_addr().unwrap();
+    let h3_config = quiche::h3::Config::new().unwrap();
+    let mut conns: HashMap<SocketAddr, ServerConn> = HashMap::new();
+    let mut buf = [0u8; 65_535];
+    let mut out = [0u8; MAX_SERVER_DATAGRAM];
+
+    while !stop.load(Ordering::Relaxed) {
+        match socket.recv_from(&mut buf) {
+            Ok((len, from)) => {
+                let pkt = &mut buf[..len];
+                let server_conn = match conns.entry(from) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(entry) => {
+                        let Some(scid) = accepted_scid(pkt) else {
+                            continue;
+                        };
+                        let scid = quiche::ConnectionId::from_ref(&scid);
+                        let Ok(conn) = quiche::accept(&scid, None, local_addr, from, &mut config)
+                        else {
+                            continue;
+                        };
+                        entry.insert(ServerConn {
+                            conn,
+                            h3: None,
+                            requests: HashMap::new(),
+                        })
+                    }
+                };
+                server_conn
+                    .conn
+                    .recv(
+                        pkt,
+                        quiche::RecvInfo {
+                            to: local_addr,
+                            from,
+                        },
+                    )
+                    .ok();
+            }
+            // WouldBlock/TimedOut is the 5 ms tick; anything else means the
+            // socket died and the thread should exit rather than spin.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+        }
+
+        for (peer, server_conn) in conns.iter_mut() {
+            if server_conn.conn.timeout().is_some_and(|t| t.is_zero()) {
+                server_conn.conn.on_timeout();
+            }
+            if server_conn.conn.is_established() && server_conn.h3.is_none() {
+                handshakes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(server_conn.conn.is_resumed());
+                // A failure here poisons only this connection; the client's
+                // request deadline turns it into a loud test failure.
+                server_conn.h3 =
+                    quiche::h3::Connection::with_transport(&mut server_conn.conn, &h3_config).ok();
+            }
+            if let Some(h3) = server_conn.h3.as_mut() {
+                poll_h3(h3, &mut server_conn.conn, &mut server_conn.requests);
+            }
+            loop {
+                match server_conn.conn.send(&mut out) {
+                    Ok((written, _info)) => {
+                        socket.send_to(&out[..written], *peer).ok();
+                    }
+                    Err(quiche::Error::Done) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        conns.retain(|_, server_conn| !server_conn.conn.is_closed());
+    }
+}
+
+/// The DCID a fresh Initial packet was sent to, which becomes our SCID —
+/// mirroring quiche's server example, minus retry. `None` for anything that
+/// is not an acceptable first packet.
+fn accepted_scid(pkt: &mut [u8]) -> Option<Vec<u8>> {
+    let hdr = quiche::Header::from_slice(pkt, quiche::MAX_CONN_ID_LEN).ok()?;
+    if hdr.ty != quiche::Type::Initial || !quiche::version_is_supported(hdr.version) {
+        return None;
+    }
+    Some(hdr.dcid.as_ref().to_vec())
+}
+
+fn poll_h3(
+    h3: &mut quiche::h3::Connection,
+    conn: &mut quiche::Connection,
+    requests: &mut HashMap<u64, PendingRequest>,
+) {
+    loop {
+        match h3.poll(conn) {
+            Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                let mut request = PendingRequest::default();
+                for header in &list {
+                    let name = String::from_utf8_lossy(header.name()).into_owned();
+                    let value = String::from_utf8_lossy(header.value()).into_owned();
+                    if name == ":path" {
+                        request.path = value.clone();
+                    }
+                    request.headers.push((name, value));
+                }
+                requests.insert(stream_id, request);
+            }
+            Ok((stream_id, quiche::h3::Event::Data)) => {
+                let mut chunk = [0u8; 4096];
+                while let Ok(read) = h3.recv_body(conn, stream_id, &mut chunk) {
+                    if let Some(request) = requests.get_mut(&stream_id) {
+                        request.body.extend_from_slice(&chunk[..read]);
+                    }
+                }
+            }
+            Ok((stream_id, quiche::h3::Event::Finished)) => {
+                if let Some(request) = requests.remove(&stream_id) {
+                    respond(h3, conn, stream_id, &request);
+                }
+            }
+            Ok(_) => {}
+            Err(quiche::h3::Error::Done) => break,
+            Err(_) => break,
+        }
+    }
+}
+
+fn respond(
+    h3: &mut quiche::h3::Connection,
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    request: &PendingRequest,
+) {
+    let (status, extra_headers, body) = route(request);
+    let content_length = body.len().to_string();
+    let mut headers = vec![
+        quiche::h3::Header::new(b":status", status.as_bytes()),
+        quiche::h3::Header::new(b"content-length", content_length.as_bytes()),
+    ];
+    for (name, value) in &extra_headers {
+        headers.push(quiche::h3::Header::new(name.as_bytes(), value.as_bytes()));
+    }
+    if h3
+        .send_response(conn, stream_id, &headers, body.is_empty())
+        .is_err()
+    {
+        return;
+    }
+    let mut offset = 0;
+    while offset < body.len() {
+        match h3.send_body(conn, stream_id, &body[offset..], true) {
+            Ok(written) => offset += written,
+            // ponytail: includes Done (stream blocked). Unreachable for these
+            // bodies under 1 MB stream windows, and content-length makes a
+            // truncation a loud client-side error, never a silent pass.
+            Err(_) => return,
+        }
+    }
+}
+
+/// httpbin-shaped routing, just deep enough for the offline twins of the live
+/// tests: echo endpoints, the cookie set/read pair, and a redirect chain.
+fn route(request: &PendingRequest) -> (String, Vec<(String, String)>, Vec<u8>) {
+    let (path, query) = match request.path.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (request.path.as_str(), ""),
+    };
+
+    if path == "/get" || path == "/post" {
+        return ("200".to_string(), Vec::new(), echo_body(request, query));
+    }
+    if let Some(pair) = path.strip_prefix("/cookies/set/") {
+        let (name, value) = pair.split_once('/').unwrap_or((pair, ""));
+        return (
+            "302".to_string(),
+            vec![
+                ("location".to_string(), "/cookies".to_string()),
+                ("set-cookie".to_string(), format!("{name}={value}; Path=/")),
+            ],
+            Vec::new(),
+        );
+    }
+    if path == "/cookies" {
+        let cookies = request
+            .headers
+            .iter()
+            .filter(|(name, _)| name == "cookie")
+            .flat_map(|(_, value)| value.split("; "))
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(name, value)| format!("\"{name}\": \"{value}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return (
+            "200".to_string(),
+            Vec::new(),
+            format!("{{\"cookies\": {{{cookies}}}}}").into_bytes(),
+        );
+    }
+    if let Some(count) = path.strip_prefix("/redirect/") {
+        let remaining: u32 = count.parse().unwrap_or(1);
+        let target = if remaining <= 1 {
+            "/get".to_string()
+        } else {
+            format!("/redirect/{}", remaining - 1)
+        };
+        return (
+            "302".to_string(),
+            vec![("location".to_string(), target)],
+            Vec::new(),
+        );
+    }
+    ("404".to_string(), Vec::new(), Vec::new())
+}
+
+/// Loose JSON echo in httpbin's shape — tests assert with `contains`, so the
+/// exact framing only has to be stable, not parseable.
+fn echo_body(request: &PendingRequest, query: &str) -> Vec<u8> {
+    let headers = request
+        .headers
+        .iter()
+        .filter(|(name, _)| !name.starts_with(':'))
+        .map(|(name, value)| format!("\"{name}\": \"{value}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let data = String::from_utf8_lossy(&request.body);
+    format!("{{\"args\": \"{query}\", \"headers\": {{{headers}}}, \"data\": \"{data}\"}}")
+        .into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::{TEST_HOST, TestH3Server, test_pki};
+    use crate::{VaneClient, VaneClientConfig, sha256_pin, test_request};
+
+    fn offline_client(config: VaneClientConfig) -> VaneClient {
+        VaneClient::new(VaneClientConfig {
+            dns_overrides: HashMap::from([(TEST_HOST.to_string(), "127.0.0.1".to_string())]),
+            timeout_seconds: Some(10),
+            ..config
+        })
+        .unwrap()
+    }
+
+    /// The batch-2 flagship, finally end to end: the second connection to a
+    /// non-pinned origin must reuse the NewSessionTicket the server issued on
+    /// the first, not run a full handshake.
+    #[test]
+    fn second_connection_resumes_tls_session() {
+        let server = TestH3Server::start();
+        // Pooling off: each request must dial (and handshake) its own
+        // connection, otherwise the second request never reaches TLS.
+        let client = offline_client(VaneClientConfig {
+            connection_pool_enabled: false,
+            ..VaneClientConfig::default()
+        });
+
+        let first = client.execute(test_request(&server.url("/get"))).unwrap();
+        assert!(first.is_success);
+        assert_eq!(
+            client.tls_sessions.lock().unwrap().len(),
+            1,
+            "client should have captured the server's NewSessionTicket after the first response"
+        );
+
+        let second = client.execute(test_request(&server.url("/get"))).unwrap();
+        assert!(second.is_success);
+        assert_eq!(
+            server.handshakes(),
+            vec![false, true],
+            "second handshake should have resumed the first connection's TLS session"
+        );
+    }
+
+    /// The batch-2 security rule: a resumed handshake restores the cached
+    /// peer chain instead of proving the current one, so a pinned host must
+    /// always full-handshake — no ticket stored, none offered.
+    #[test]
+    fn pinned_host_never_resumes() {
+        let server = TestH3Server::start();
+        // The whole-cert pin works in every feature set, and it must match:
+        // the rule under test is "pinned hosts skip resumption", not "pin
+        // mismatches fail" — both requests have to succeed.
+        let pin = sha256_pin("sha256-cert", &test_pki().leaf_der);
+        let client = offline_client(VaneClientConfig {
+            connection_pool_enabled: false,
+            certificate_pins: HashMap::from([(TEST_HOST.to_string(), vec![pin])]),
+            ..VaneClientConfig::default()
+        });
+
+        assert!(
+            client
+                .execute(test_request(&server.url("/get")))
+                .unwrap()
+                .is_success
+        );
+        assert!(
+            client
+                .execute(test_request(&server.url("/get")))
+                .unwrap()
+                .is_success
+        );
+
+        assert_eq!(
+            server.handshakes(),
+            vec![false, false],
+            "a pinned host must never resume a TLS session"
+        );
+        assert!(
+            client.tls_sessions.lock().unwrap().is_empty(),
+            "no ticket may be stored for a pinned host"
+        );
+    }
+
+    /// Offline twin of the live `/get`+`/post` echo test.
+    #[test]
+    fn get_and_post_echo() {
+        let server = TestH3Server::start();
+        let client = offline_client(VaneClientConfig::default());
+
+        let mut get = test_request(&server.url("/get"));
+        get.headers
+            .insert("X-Vane-Trace".to_string(), "trace-offline".to_string());
+        get.query_params
+            .insert("vane_query".to_string(), "query-offline".to_string());
+        let response = client.execute(get).unwrap();
+        assert!(response.is_success);
+        let body = String::from_utf8_lossy(&response.body).into_owned();
+        assert!(
+            body.contains("trace-offline"),
+            "headers echo missing: {body}"
+        );
+        assert!(body.contains("query-offline"), "query echo missing: {body}");
+
+        let mut post = test_request(&server.url("/post"));
+        post.method = "POST".to_string();
+        post.body = Some(b"offline-h3-body".to_vec());
+        let response = client.execute(post).unwrap();
+        assert!(response.is_success);
+        let body = String::from_utf8_lossy(&response.body).into_owned();
+        assert!(
+            body.contains("offline-h3-body"),
+            "body echo missing: {body}"
+        );
+    }
+
+    /// Multi-hop redirect chain on the wire — previously only reachable
+    /// against live pie.dev.
+    #[test]
+    fn multi_hop_redirect_lands_on_final_target() {
+        let server = TestH3Server::start();
+        let client = offline_client(VaneClientConfig::default());
+
+        let response = client
+            .execute(test_request(&server.url("/redirect/3")))
+            .unwrap();
+        assert!(response.is_success);
+        assert!(
+            response.url.ends_with("/get"),
+            "redirect chain should end on /get, got {}",
+            response.url
+        );
+    }
+
+    /// Offline twin of the live cookie test: a `Set-Cookie` on a 302 hop is
+    /// stored and replayed on the follow-up request.
+    #[test]
+    fn cookie_set_on_redirect_is_sent_back() {
+        let server = TestH3Server::start();
+        let client = offline_client(VaneClientConfig {
+            cookies_enabled: true,
+            ..VaneClientConfig::default()
+        });
+
+        let response = client
+            .execute(test_request(&server.url("/cookies/set/vane/offline")))
+            .unwrap();
+        assert!(response.is_success);
+        let body = String::from_utf8_lossy(&response.body).into_owned();
+        assert!(
+            body.contains("\"vane\": \"offline\""),
+            "cookie jar round-trip missing: {body}"
+        );
+    }
+}

@@ -3,6 +3,11 @@ uniffi::setup_scaffolding!();
 #[cfg(feature = "tcp-fallback")]
 mod tcp;
 
+/// In-process HTTP/3 test server plus its offline tests; also owns the test
+/// CA that `create_quiche_config`'s test-only seam trusts.
+#[cfg(test)]
+mod h3_offline;
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -2831,6 +2836,16 @@ fn create_quiche_config(
         .map_err(|e| VaneError::Generic(format!("Failed to configure HTTP/3 ALPN: {e:?}")))?;
     config.verify_peer(true);
     load_platform_roots(&mut config)?;
+    // Test-only twin of the TCP path's `TEST_ROOT`: trust the in-process
+    // HTTP/3 test server's CA. Strictly additive — `verify_peer(true)` above
+    // and the platform roots stay in force — and compiled out of every
+    // non-test build, so no release configuration can reach it.
+    #[cfg(test)]
+    if let Some(test_ca) = crate::h3_offline::test_ca_pem_path() {
+        config
+            .load_verify_locations_from_file(test_ca)
+            .map_err(|e| VaneError::Generic(format!("Failed to load test CA: {e}")))?;
+    }
     config.set_max_idle_timeout(max_idle_timeout_millis);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(max_send_udp_payload);
