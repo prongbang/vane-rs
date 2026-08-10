@@ -52,6 +52,11 @@ rcgen = "0.14"
 # Lets the redirect tests synthesize a response so they can drive the real
 # `redirect_target` instead of a copy of its logic.
 http = "1"
+# Randomized enforcement of the parser/decision invariants (src/proptests.rs).
+# The release profile is `panic = "abort"`, so a panic reachable from
+# peer-controlled bytes is a remote crash; these tests keep that class extinct
+# on every `cargo test`. Dev-only — must never enter the shipping graph.
+proptest = "1"
 
 [lib]
 crate-type = [

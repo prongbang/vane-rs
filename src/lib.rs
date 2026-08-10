@@ -298,7 +298,12 @@ fn parse_authority(authority: &str) -> Result<(String, Option<u16>), String> {
         if host.parse::<std::net::Ipv6Addr>().is_err() {
             return Err("bracketed host must be an IPv6 address".to_string());
         }
-        return Ok((format!("[{host}]"), port));
+        // Hex case is meaningless in an IPv6 literal, and every host-keyed
+        // security lookup stores lowercase (`set_certificate_pins_internal`
+        // lowercases on write; cookies lowercase on compare) — a case-preserved
+        // "[2001:DB8::A]" would silently miss a pin registered for the same
+        // address and connect unpinned.
+        return Ok((format!("[{host}]").to_ascii_lowercase(), port));
     }
 
     let (host, port) = match authority.rsplit_once(':') {
@@ -336,6 +341,13 @@ fn parse_authority(authority: &str) -> Result<(String, Option<u16>), String> {
 }
 
 fn parse_port(port: &str) -> Result<u16, String> {
+    // `u16::from_str` accepts a leading '+'. The non-bracketed authority path
+    // screens for digits before calling, but the IPv6 path does not, so the
+    // digit rule lives here: a port is all ASCII digits or it is not a port —
+    // anything looser is a spelling another URL parser may read differently.
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("invalid URL port {port}: not a decimal number"));
+    }
     port.parse::<u16>()
         .map_err(|e| format!("invalid URL port {port}: {e}"))
 }
@@ -2077,19 +2089,8 @@ fn persist_cookie_jar(path: Option<&str>, jar: &[StoredCookie]) -> Result<(), Va
     let now = now_epoch_seconds();
     let mut content = String::new();
     for cookie in jar.iter().filter(|cookie| !cookie.is_expired(now)) {
-        content.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            BASE64.encode(cookie.name.as_bytes()),
-            BASE64.encode(cookie.value.as_bytes()),
-            BASE64.encode(cookie.domain.as_bytes()),
-            u8::from(cookie.host_only),
-            BASE64.encode(cookie.path.as_bytes()),
-            u8::from(cookie.secure),
-            cookie
-                .expires_at_epoch_seconds
-                .map(|value| value.to_string())
-                .unwrap_or_default()
-        ));
+        content.push_str(&persisted_cookie_line(cookie));
+        content.push('\n');
     }
     if let Some(parent) = std::path::Path::new(path).parent()
         && !parent.as_os_str().is_empty()
@@ -2103,6 +2104,25 @@ fn persist_cookie_jar(path: Option<&str>, jar: &[StoredCookie]) -> Result<(), Va
             "Failed to write cookie persistence file {path}: {err}"
         ))
     })
+}
+
+/// One cookie-jar line; `parse_persisted_cookie` is its inverse. The
+/// `persisted_cookie_line_round_trips_exactly` property holds the pair
+/// together: a drift on either side loses or widens a cookie's scope.
+fn persisted_cookie_line(cookie: &StoredCookie) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        BASE64.encode(cookie.name.as_bytes()),
+        BASE64.encode(cookie.value.as_bytes()),
+        BASE64.encode(cookie.domain.as_bytes()),
+        u8::from(cookie.host_only),
+        BASE64.encode(cookie.path.as_bytes()),
+        u8::from(cookie.secure),
+        cookie
+            .expires_at_epoch_seconds
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    )
 }
 
 fn parse_persisted_cookie(line: &str) -> Option<StoredCookie> {
@@ -4709,6 +4729,9 @@ fn test_request(url: &str) -> VaneRequest {
         follow_redirects: true,
     }
 }
+
+#[cfg(test)]
+mod proptests;
 
 #[cfg(test)]
 mod tests {
