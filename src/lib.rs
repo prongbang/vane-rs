@@ -410,6 +410,10 @@ pub struct VaneRequest {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct VaneResponse {
     pub status_code: u16,
+    /// One entry per header name, keyed lowercase. A name the server repeated
+    /// carries its values comma-joined in wire order (`"a, b"`, RFC 9110
+    /// §5.2) — identically on both transports. `set-cookie` is the exception:
+    /// see [`Self::set_cookie`].
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
     pub body_file_path: Option<String>,
@@ -1607,9 +1611,15 @@ impl RedirectChain<'_> {
             })
             .map_err(|err| withdraw_replay_safety(err, hops))?;
 
+            // A joined `"a, b"` value means the server repeated `Location`;
+            // the first is followed, matching the TCP path's `.get()`. A lone
+            // valid URL cannot contain `", "` — a raw space is not legal in a
+            // URI reference — and the hop stays gated by the scheme/pin/origin
+            // rules whichever value is picked.
             let next = match next_redirect_url(
                 response.status_code,
-                header_value(&response.headers, "location"),
+                header_value(&response.headers, "location")
+                    .map(|value| value.split_once(", ").map_or(value, |(first, _)| first)),
                 &current,
                 self.request,
                 hops,
@@ -3167,6 +3177,31 @@ fn check_cancelled(cancel_token: Option<&AtomicBool>) -> Result<(), VaneError> {
     Ok(())
 }
 
+// Shared by the C ABI and UniFFI entry points. Cancel and free tolerate ids
+// that were never created or already freed, and ids are never reused, so
+// double-free and cancel-after-free are safe no-ops.
+fn cancel_token_create() -> u64 {
+    let id = NEXT_CANCEL_TOKEN_ID.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut tokens) = CANCEL_TOKENS.lock() {
+        tokens.insert(id, Arc::new(AtomicBool::new(false)));
+    }
+    id
+}
+
+fn cancel_token_cancel(id: u64) {
+    if let Ok(tokens) = CANCEL_TOKENS.lock()
+        && let Some(token) = tokens.get(&id)
+    {
+        token.store(true, Ordering::Relaxed);
+    }
+}
+
+fn cancel_token_free(id: u64) {
+    if let Ok(mut tokens) = CANCEL_TOKENS.lock() {
+        tokens.remove(&id);
+    }
+}
+
 fn progress_init(progress_id: Option<u64>, upload_total: u64) -> Option<Arc<VaneProgressState>> {
     let state = progress_handle(progress_id)?;
     state.reset(upload_total);
@@ -3672,6 +3707,43 @@ impl ResponseState {
         }
     }
 
+    /// Folds one response header into the state, applying the rules both
+    /// transports share, so the same response yields the same map whether UDP
+    /// or the TCP fallback served it:
+    ///
+    /// - `set-cookie` goes to its own list and never enters the map: a
+    ///   `HashMap` cannot hold its repeats and RFC 6265 forbids joining them
+    ///   (an `Expires` value contains a comma).
+    /// - Any other repeated name is combined into one `", "`-joined field
+    ///   value in wire order (RFC 9110 §5.2), the shape `package:http`-style
+    ///   consumers split back apart.
+    /// - `content-length` feeds the body-size hint from its first occurrence
+    ///   only. A repeat is malformed (RFC 9110 §8.6); the map keeps the
+    ///   joined evidence verbatim, but re-parsing later occurrences would let
+    ///   a hostile repeat — or a trailer — move the reservation hint after
+    ///   the first was already acted on.
+    ///
+    /// Callers pass lowercase names: reqwest's `HeaderName` already is, and
+    /// the HTTP/3 block merge lowercases before calling.
+    fn merge_header(&mut self, name: String, value: String) {
+        if name == "set-cookie" {
+            self.set_cookie_headers.push(value);
+            return;
+        }
+        match self.headers.get_mut(&name) {
+            Some(combined) => {
+                combined.push_str(", ");
+                combined.push_str(&value);
+            }
+            None => {
+                if name == "content-length" {
+                    self.on_content_length(&value);
+                }
+                self.headers.insert(name, value);
+            }
+        }
+    }
+
     fn push_body(&mut self, bytes: &[u8]) -> Result<(), VaneError> {
         validate_response_body_limit(self.body_len, bytes.len(), self.effective_max_body_bytes())
             // Says which limit was hit: "exceeded 65536 bytes" against a
@@ -3701,9 +3773,11 @@ impl ResponseState {
 /// quiche's h3 layer emits one `Event::Headers` per HEADERS frame and has no
 /// notion of a final response, so without this an `103 Early Hints` block's
 /// `set-cookie` values would be surfaced on the final response and its other
-/// fields would win the `or_insert` against the real ones. hyper consumes 1xx
+/// fields would be comma-joined into the real ones. hyper consumes 1xx
 /// internally on the TCP path, so dropping them here is also what keeps the two
-/// transports agreeing on what the server sent (RFC 9114 §4.1.2).
+/// transports agreeing on what the server sent (RFC 9114 §4.1.2). A trailers
+/// block (an `Event::Headers` with no `:status`) folds in as before; a trailer
+/// name that repeats a header name joins like any other repeat.
 fn merge_h3_header_block(response: &mut ResponseState, list: Vec<quiche::h3::Header>) {
     // `None` rather than 0: a trailers block is also an `Event::Headers` and
     // carries no `:status`, so treating "absent" as 0 would wipe the real
@@ -3714,8 +3788,9 @@ fn merge_h3_header_block(response: &mut ResponseState, list: Vec<quiche::h3::Hea
         // Lowercased before it is keyed: HTTP/3 field names are lowercase by
         // protocol, but the peer controls them, and `Location` plus `location`
         // as two map entries would make the redirect gate's lookup
-        // nondeterministic. First occurrence wins, matching the TCP path's
-        // `get`.
+        // nondeterministic. Lowercasing first means such a repeat comma-joins
+        // into a single entry instead, exactly as the TCP path's `HeaderName`
+        // normalization makes it do.
         let name = String::from_utf8_lossy(header.name()).to_ascii_lowercase();
         let value = String::from_utf8_lossy(header.value()).to_string();
         if name == ":status" {
@@ -3731,14 +3806,7 @@ fn merge_h3_header_block(response: &mut ResponseState, list: Vec<quiche::h3::Hea
         response.status_code = status;
     }
     for (name, value) in fields {
-        if name == "set-cookie" {
-            response.set_cookie_headers.push(value);
-        } else {
-            if name == "content-length" {
-                response.on_content_length(&value);
-            }
-            response.headers.entry(name).or_insert(value);
-        }
+        response.merge_header(name, value);
     }
 }
 
@@ -3821,6 +3889,21 @@ pub fn progress_snapshot_by_id(id: u64) -> VaneProgressSnapshot {
 #[uniffi::export]
 pub fn free_progress(id: u64) {
     progress_free(id);
+}
+
+#[uniffi::export]
+pub fn create_cancel_token() -> u64 {
+    cancel_token_create()
+}
+
+#[uniffi::export]
+pub fn cancel_by_id(id: u64) {
+    cancel_token_cancel(id);
+}
+
+#[uniffi::export]
+pub fn free_cancel_token(id: u64) {
+    cancel_token_free(id);
 }
 
 #[uniffi::export]
@@ -4064,27 +4147,17 @@ pub extern "C" fn vane_ffi_client_set_certificate_pins(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vane_ffi_cancel_token_create() -> u64 {
-    let id = NEXT_CANCEL_TOKEN_ID.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut tokens) = CANCEL_TOKENS.lock() {
-        tokens.insert(id, Arc::new(AtomicBool::new(false)));
-    }
-    id
+    cancel_token_create()
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vane_ffi_cancel_token_cancel(id: u64) {
-    if let Ok(tokens) = CANCEL_TOKENS.lock()
-        && let Some(token) = tokens.get(&id)
-    {
-        token.store(true, Ordering::Relaxed);
-    }
+    cancel_token_cancel(id);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vane_ffi_cancel_token_free(id: u64) {
-    if let Ok(mut tokens) = CANCEL_TOKENS.lock() {
-        tokens.remove(&id);
-    }
+    cancel_token_free(id);
 }
 
 #[unsafe(no_mangle)]
@@ -5591,6 +5664,65 @@ mod tests {
         assert_eq!(response.http_version, Some(VaneHttpVersion::Http3));
     }
 
+    /// Pins the join rule the two transports share: a repeated non-cookie
+    /// header combines into one `", "`-joined value in wire order (RFC 9110
+    /// §5.2). `repeated_headers_comma_join_identically_on_both_transports` in
+    /// `tcp::tests` asserts the same `"a, b"` for the same wire shape on the
+    /// TCP fallback — the whole point is that the map cannot depend on
+    /// whether UDP happened to work.
+    #[test]
+    fn repeated_h3_headers_comma_join_across_header_blocks() {
+        fn header(name: &str, value: &str) -> quiche::h3::Header {
+            quiche::h3::Header::new(name.as_bytes(), value.as_bytes())
+        }
+
+        let mut state = ResponseState::new(1024, None).unwrap();
+        // An interim block's fields must not leak into the join.
+        merge_h3_header_block(
+            &mut state,
+            vec![header(":status", "103"), header("x-multi", "interim")],
+        );
+        merge_h3_header_block(
+            &mut state,
+            vec![
+                header(":status", "200"),
+                header("x-multi", "a"),
+                // Peer-controlled spelling: joins into the lowercase entry
+                // rather than forking a second one.
+                header("X-Multi", "b"),
+                header("x-trailer", "h"),
+                header("set-cookie", "sid=1"),
+                header("set-cookie", "sid=2"),
+                header("content-length", "7"),
+                header("content-length", "999"),
+            ],
+        );
+        // A trailers block carries no `:status`; a repeat there joins too.
+        merge_h3_header_block(&mut state, vec![header("x-trailer", "t")]);
+
+        assert_eq!(
+            state.headers.get("x-multi").map(String::as_str),
+            Some("a, b")
+        );
+        assert_eq!(
+            state.headers.get("x-trailer").map(String::as_str),
+            Some("h, t")
+        );
+        // The map carries the malformed repeat verbatim, but the parsed size
+        // hint keeps first-value semantics: a later occurrence must not move
+        // a reservation the first already sized.
+        assert_eq!(
+            state.headers.get("content-length").map(String::as_str),
+            Some("7, 999")
+        );
+        assert_eq!(state.download_total, 7);
+        assert_eq!(
+            state.set_cookie_headers,
+            vec!["sid=1".to_string(), "sid=2".to_string()]
+        );
+        assert!(!state.headers.contains_key("set-cookie"));
+    }
+
     fn h3_response(status: u16, location: Option<&str>, body: &str) -> VaneResponse {
         let mut headers = HashMap::new();
         if let Some(location) = location {
@@ -6180,6 +6312,23 @@ mod tests {
         assert!(snapshot.done);
         vane_ffi_progress_free(progress_id);
         assert!(!vane_ffi_progress_snapshot(progress_id).done);
+    }
+
+    #[test]
+    fn uniffi_cancel_token_exports_share_the_ffi_registry() {
+        // The UniFFI trio and the C ABI trio must hit the same registry:
+        // create through UniFFI, observe through the request-path resolver.
+        let id = create_cancel_token();
+        let token = cancel_token(Some(id)).expect("cancel token should resolve by id");
+        assert!(check_cancelled(Some(&token)).is_ok());
+        cancel_by_id(id);
+        assert!(check_cancelled(Some(&token)).is_err());
+        free_cancel_token(id);
+        assert!(cancel_token(Some(id)).is_none());
+        // Double-free and cancel-after-free are safe no-ops; ids are never
+        // reused, so a stale id can never reach a later token.
+        free_cancel_token(id);
+        cancel_by_id(id);
     }
 
     #[test]

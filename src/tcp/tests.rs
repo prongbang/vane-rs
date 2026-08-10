@@ -667,6 +667,40 @@ mod response_metadata {
         }
     }
 
+    /// The TCP half of the join rule pinned by
+    /// `repeated_h3_headers_comma_join_across_header_blocks` in the crate
+    /// tests: the same repeated wire shape must yield the same `", "`-joined
+    /// map entry here, or which headers a caller sees depends on whether UDP
+    /// happened to work. Hyper lowercases the mixed-case spelling; hyper also
+    /// rejects differing repeated `Content-Length` values outright, so that
+    /// edge is pinned on the H3 merge, which this response cannot reach.
+    #[test]
+    fn repeated_headers_comma_join_identically_on_both_transports() {
+        const REPEATS: &str = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Length: 2\r\n",
+            "X-Multi: a\r\n",
+            "X-Multi: b\r\n",
+            "Set-Cookie: a=1; Path=/\r\n",
+            "Set-Cookie: b=2; Path=/\r\n",
+            "Connection: close\r\n",
+            "\r\nok"
+        );
+        let (port, ca) = raw_http_server(&[("/", REPEATS)]);
+        let _guard = with_test_root(ca);
+
+        let response = get(port, true);
+        assert_eq!(
+            response.headers.get("x-multi").map(String::as_str),
+            Some("a, b")
+        );
+        assert_eq!(
+            response.set_cookie,
+            vec!["a=1; Path=/".to_string(), "b=2; Path=/".to_string()]
+        );
+        assert!(!response.headers.contains_key("set-cookie"));
+    }
+
     #[test]
     fn a_redirect_surfaces_only_the_final_hop_but_the_jar_still_sees_both() {
         let (port, ca) = raw_http_server(&[

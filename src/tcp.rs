@@ -820,22 +820,15 @@ fn read_body(
 ) -> Result<(), VaneError> {
     state.status_code = response.status().as_u16();
     for (name, value) in response.headers() {
-        if name == reqwest::header::SET_COOKIE {
-            // Surfaced as its own list, never folded into the map. The jar
-            // harvest above is separate and gated on `cookies_enabled`; this
-            // is not, or the caller loses `Set-Cookie` entirely with the jar
-            // off.
-            state
-                .set_cookie_headers
-                .push(String::from_utf8_lossy(value.as_bytes()).to_string());
-            continue;
-        }
-        let name = name.as_str().to_string();
-        let value = String::from_utf8_lossy(value.as_bytes()).to_string();
-        if name.eq_ignore_ascii_case("content-length") {
-            state.on_content_length(&value);
-        }
-        state.headers.insert(name, value);
+        // One `(name, value)` pair per occurrence; the shared merge joins
+        // repeats and diverts `set-cookie` to its own list, so the map cannot
+        // depend on which transport served the response. `Set-Cookie` is
+        // surfaced even with the jar off — the harvest above is gated on
+        // `cookies_enabled`, this is not, or the caller loses it entirely.
+        state.merge_header(
+            name.as_str().to_string(),
+            String::from_utf8_lossy(value.as_bytes()).to_string(),
+        );
     }
 
     let mut buf = vec![0; H3_BODY_BUFFER_BYTES];

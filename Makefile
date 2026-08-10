@@ -62,3 +62,11 @@ build_so:
 # entry for it, and the only System.loadLibrary/Native.register call names
 # "vane". Shipping it added ~659 KB of dead weight across the ABI set.
 	find ../VaneKotlin/library/src/main/jniLibs -name 'libquiche-*.so' -delete
+
+# This machine hit ENOSPC twice with target/ at ~10 GB. Run when low on disk or
+# after a toolchain bump (old rustc caches never get evicted on their own).
+# Cost: the next build is a cold build, minutes not seconds — that is the whole
+# trade. cargo clean keeps nothing, so there is no partial variant worth having.
+clean:
+	cargo clean
+	cd vane-bindgen && cargo clean
