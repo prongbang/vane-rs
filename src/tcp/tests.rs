@@ -676,11 +676,15 @@ mod response_metadata {
     /// edge is pinned on the H3 merge, which this response cannot reach.
     #[test]
     fn repeated_headers_comma_join_identically_on_both_transports() {
+        // A 200, so the repeated `Location` reaches the shared merge instead
+        // of the redirect machinery.
         const REPEATS: &str = concat!(
             "HTTP/1.1 200 OK\r\n",
             "Content-Length: 2\r\n",
             "X-Multi: a\r\n",
             "X-Multi: b\r\n",
+            "Location: https://first.example/\r\n",
+            "Location: https://second.example/\r\n",
             "Set-Cookie: a=1; Path=/\r\n",
             "Set-Cookie: b=2; Path=/\r\n",
             "Connection: close\r\n",
@@ -693,6 +697,13 @@ mod response_metadata {
         assert_eq!(
             response.headers.get("x-multi").map(String::as_str),
             Some("a, b")
+        );
+        // `location` is the join's exception on both transports: first
+        // occurrence whole, repeats dropped — the value `redirect_target`'s
+        // `HeaderMap::get` would act on, now also the one the caller sees.
+        assert_eq!(
+            response.headers.get("location").map(String::as_str),
+            Some("https://first.example/")
         );
         assert_eq!(
             response.set_cookie,

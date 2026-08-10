@@ -59,6 +59,16 @@ const MAX_COOKIES: usize = 512;
 /// redirect stub does not need more than this; a 3xx that exceeds it fails the
 /// request rather than being followed.
 const MAX_INTERMEDIATE_BODY_BYTES: u64 = 64 * 1024;
+/// Ceiling on one HTTP/3 response header section, advertised to the peer as
+/// `SETTINGS_MAX_FIELD_SECTION_SIZE` and enforced by quiche on receipt.
+///
+/// Without it the only bound is the 1 MiB stream flow-control window, which a
+/// hostile peer can fill with header bytes that all land in the response map
+/// before flow control stalls. 64 KiB is far above any legitimate header
+/// block (servers commonly cap *request* header sections at 8-16 KiB) and
+/// well under the flow window, so an oversized block is rejected cleanly
+/// instead of being buffered.
+const MAX_RESPONSE_HEADER_SECTION_BYTES: u64 = 64 * 1024;
 /// Redirect hops allowed when `follow_redirects` is on. Shared by both
 /// transports: the hop cap is a security bound, not a transport detail.
 const MAX_REDIRECTS: usize = 10;
@@ -412,8 +422,10 @@ pub struct VaneResponse {
     pub status_code: u16,
     /// One entry per header name, keyed lowercase. A name the server repeated
     /// carries its values comma-joined in wire order (`"a, b"`, RFC 9110
-    /// §5.2) — identically on both transports. `set-cookie` is the exception:
-    /// see [`Self::set_cookie`].
+    /// §5.2) — identically on both transports. Two exceptions: `set-cookie`
+    /// (see [`Self::set_cookie`]) and `location`, which is single-valued by
+    /// RFC 9110 §10.2.2 and keeps its first occurrence — the one the redirect
+    /// gate acts on — rather than joining into a non-URL.
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
     pub body_file_path: Option<String>,
@@ -785,8 +797,11 @@ impl VaneClient {
         // Loaded once for every attempt on every transport: neither a retry nor
         // a fallback may re-read the body file (it can change underneath us) or
         // re-copy an in-memory body.
-        let request_body = load_request_body(&request)?;
-        validate_request_body_limit(&request_body, self.config.max_request_body_bytes)?;
+        let request_body = load_request_body(&request, self.config.max_request_body_bytes)?;
+        validate_request_body_limit(
+            request_body.len() as u64,
+            self.config.max_request_body_bytes,
+        )?;
         let body = request_body.as_ref();
 
         let result = self.dispatch(&request, &url, body);
@@ -1255,8 +1270,7 @@ impl VaneClient {
             &TlsSessionKey::origin(host, peer_addr.port()),
             certificate_pins,
         );
-        let h3_config = quiche::h3::Config::new()
-            .map_err(|e| VaneError::Generic(format!("Failed to create HTTP/3 config: {e}")))?;
+        let h3_config = create_h3_config()?;
         let mut io = Http3Io::Masque(Box::new(MasqueTunnel {
             socket: outer.socket,
             local_addr: outer.local_addr,
@@ -1611,15 +1625,14 @@ impl RedirectChain<'_> {
             })
             .map_err(|err| withdraw_replay_safety(err, hops))?;
 
-            // A joined `"a, b"` value means the server repeated `Location`;
-            // the first is followed, matching the TCP path's `.get()`. A lone
-            // valid URL cannot contain `", "` — a raw space is not legal in a
-            // URI reference — and the hop stays gated by the scheme/pin/origin
-            // rules whichever value is picked.
+            // `merge_header` keeps `location` first-wins (a repeat never
+            // joins), so this is the first occurrence's whole value — the
+            // same thing the TCP path's `HeaderMap::get` feeds the shared
+            // gate. No splitting here: a lone malformed value goes to the
+            // gate verbatim and both transports agree on its fate.
             let next = match next_redirect_url(
                 response.status_code,
-                header_value(&response.headers, "location")
-                    .map(|value| value.split_once(", ").map_or(value, |(first, _)| first)),
+                header_value(&response.headers, "location"),
                 &current,
                 self.request,
                 hops,
@@ -2312,8 +2325,7 @@ fn connect_quic_h3(
         MAX_DATAGRAM_SIZE,
     )?;
     resume_tls_session(tls_sessions, &mut conn, session_key, certificate_pins);
-    let mut h3_config = quiche::h3::Config::new()
-        .map_err(|e| VaneError::Generic(format!("Failed to create HTTP/3 config: {e}")))?;
+    let mut h3_config = create_h3_config()?;
     h3_config.enable_extended_connect(true);
 
     let mut recv_buf = vec![0; UDP_RECV_BUFFER_BYTES];
@@ -2833,6 +2845,17 @@ fn create_quiche_config(
     Ok(config)
 }
 
+/// Builds the per-connection HTTP/3 config. Shared by the direct and the
+/// MASQUE-tunneled connection paths so neither can drift on the response
+/// header cap; the direct path additionally enables Extended CONNECT on its
+/// copy (needed only where a tunnel may be opened).
+fn create_h3_config() -> Result<quiche::h3::Config, VaneError> {
+    let mut config = quiche::h3::Config::new()
+        .map_err(|e| VaneError::Generic(format!("Failed to create HTTP/3 config: {e}")))?;
+    config.set_max_field_section_size(MAX_RESPONSE_HEADER_SECTION_BYTES);
+    Ok(config)
+}
+
 /// Whether a CA directory holds anything BoringSSL could actually load.
 ///
 /// `load_verify_locations_from_directory` only registers a lazy hash-based
@@ -3120,8 +3143,14 @@ fn path_matches(request_path: &str, cookie_path: &str) -> bool {
             .is_some_and(|b| *b == b'/')
 }
 
-fn validate_request_body_limit(body: &[u8], max_request_body_bytes: u64) -> Result<(), VaneError> {
-    if body.len() as u64 > max_request_body_bytes {
+/// Takes a length, not the bytes, so callers can refuse an oversized body
+/// *before* materializing it — same error either way, so nothing downstream
+/// can tell which check fired.
+fn validate_request_body_limit(
+    body_len: u64,
+    max_request_body_bytes: u64,
+) -> Result<(), VaneError> {
+    if body_len > max_request_body_bytes {
         return Err(VaneError::BodyLimitExceeded(format!(
             "Request body exceeded {max_request_body_bytes} bytes"
         )));
@@ -3130,13 +3159,27 @@ fn validate_request_body_limit(body: &[u8], max_request_body_bytes: u64) -> Resu
     Ok(())
 }
 
-fn load_request_body(request: &VaneRequest) -> Result<Cow<'_, [u8]>, VaneError> {
+fn load_request_body(
+    request: &VaneRequest,
+    max_request_body_bytes: u64,
+) -> Result<Cow<'_, [u8]>, VaneError> {
     if let Some(path) = &request.body_file_path
         && !path.is_empty()
     {
         let mut file = File::open(path).map_err(|e| {
             VaneError::InvalidRequest(format!("Failed to open request body file {path}: {e}"))
         })?;
+        // Sized before it is read: `read_to_end` on a multi-GB body file would
+        // OOM a mobile app long before the post-load check could report the
+        // limit cleanly. The caller re-checks the loaded length, which also
+        // covers a file that grew between this stat and the read.
+        let len = file
+            .metadata()
+            .map(|metadata| metadata.len())
+            .map_err(|e| {
+                VaneError::InvalidRequest(format!("Failed to read request body file {path}: {e}"))
+            })?;
+        validate_request_body_limit(len, max_request_body_bytes)?;
         let mut body = Vec::new();
         file.read_to_end(&mut body).map_err(|e| {
             VaneError::InvalidRequest(format!("Failed to read request body file {path}: {e}"))
@@ -3208,9 +3251,14 @@ fn progress_init(progress_id: Option<u64>, upload_total: u64) -> Option<Arc<Vane
     Some(state)
 }
 
+/// Resolves a progress id to its handle. Lookup only, like `cancel_token`:
+/// every binding creates ids through `progress_create` before use, and
+/// `execute` resolves the id again at done-time — inserting there would
+/// resurrect an id the caller already freed as a permanently leaked entry
+/// (ids are never reused). A missing id is simply "no progress reporting".
 fn progress_handle(progress_id: Option<u64>) -> Option<Arc<VaneProgressState>> {
     let id = progress_id?;
-    Some(PROGRESS_STATES.lock().ok()?.entry(id).or_default().clone())
+    PROGRESS_STATES.lock().ok()?.get(&id).cloned()
 }
 
 fn progress_upload(progress: Option<&VaneProgressState>, sent: u64, total: u64) {
@@ -3714,6 +3762,11 @@ impl ResponseState {
     /// - `set-cookie` goes to its own list and never enters the map: a
     ///   `HashMap` cannot hold its repeats and RFC 6265 forbids joining them
     ///   (an `Expires` value contains a comma).
+    /// - `location` keeps its first occurrence whole and drops repeats: it is
+    ///   single-valued (RFC 9110 §10.2.2), a joined `"a, b"` is not a URL,
+    ///   and the TCP path's `HeaderMap::get` already hands the redirect gate
+    ///   the first occurrence — so first-wins is what keeps the map, the gate
+    ///   and both transports agreeing on the same value.
     /// - Any other repeated name is combined into one `", "`-joined field
     ///   value in wire order (RFC 9110 §5.2), the shape `package:http`-style
     ///   consumers split back apart.
@@ -3732,6 +3785,9 @@ impl ResponseState {
         }
         match self.headers.get_mut(&name) {
             Some(combined) => {
+                if name == "location" {
+                    return;
+                }
                 combined.push_str(", ");
                 combined.push_str(&value);
             }
@@ -4089,6 +4145,22 @@ static FFI_CLIENTS: LazyLock<Mutex<HashMap<u64, Arc<VaneClient>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static FFI_NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
+/// Version of the raw C ABI (`vane_ffi_*` symbols and `VaneFfi*` structs).
+///
+/// Kotlin and Swift ride UniFFI's own checksum guard; the Dart bindings
+/// mirror these structs by hand, and this is their equivalent:
+/// `vane_flutter/lib/vane_flutter_ffi.dart` looks this symbol up when the
+/// library opens and refuses to run on a mismatch, turning layout skew into a
+/// clear error instead of misread fields and wild-pointer frees.
+///
+/// Bump it on ANY `VaneFfi*` struct layout change OR value-contract change
+/// (a new `ffi_kind` / `ffi_code` enum code counts), and bump the expected
+/// constant in `vane_flutter_ffi.dart` in the same change.
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_abi_version() -> u32 {
+    1
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn vane_ffi_client_create(
     config: *const VaneFfiClientConfig,
@@ -4253,6 +4325,10 @@ fn ffi_execute(
     // request struct is transport-related, so they all land on InvalidRequest.
     let mut request = ffi_request(request).map_err(VaneError::InvalidRequest)?;
     if body_len > 0 {
+        // Refused before the copy below materializes the caller's buffer, or
+        // an over-limit body costs its full size in memory just to be
+        // rejected. `execute` re-checks the loaded body; same error there.
+        validate_request_body_limit(body_len as u64, client.config.max_request_body_bytes)?;
         request.body = Some(
             ffi_bytes(body_data, body_len)
                 .map_err(VaneError::InvalidRequest)?
@@ -5564,6 +5640,11 @@ mod tests {
             "https://attacker%2etest/y",
             "https://evil@other.example/",
             "gopher://api.example.com/home",
+            // A single value shaped like a comma-join (`merge_header` never
+            // produces one for `location`): the `", "` lands in the
+            // authority, which cannot parse. Whole-value on both transports,
+            // so both stop here identically.
+            "https://a.example, https://b.example",
         ] {
             assert_eq!(
                 redirect(302, hostile, &from, 0, &unpinned),
@@ -5571,6 +5652,20 @@ mod tests {
                 "{hostile} must not resolve"
             );
         }
+        // The same malformed shape with a path keeps the `", "` out of the
+        // authority, so it parses — to the FIRST URL's host, which is what
+        // every security gate keys on; the junk stays in the path verbatim.
+        // Both transports hand this gate the same whole value, so they agree.
+        assert_eq!(
+            followed(redirect(
+                302,
+                "https://a.example/x, https://b.example/",
+                &from,
+                0,
+                &unpinned
+            )),
+            Some("https://a.example/x, https://b.example/".to_string())
+        );
         // Hop cap, enforced on the last allowed hop and the one after it.
         assert!(matches!(
             redirect(302, "/home", &from, MAX_REDIRECTS - 1, &unpinned),
@@ -5666,8 +5761,9 @@ mod tests {
 
     /// Pins the join rule the two transports share: a repeated non-cookie
     /// header combines into one `", "`-joined value in wire order (RFC 9110
-    /// §5.2). `repeated_headers_comma_join_identically_on_both_transports` in
-    /// `tcp::tests` asserts the same `"a, b"` for the same wire shape on the
+    /// §5.2), except `location`, which keeps its first occurrence whole.
+    /// `repeated_headers_comma_join_identically_on_both_transports` in
+    /// `tcp::tests` asserts the same shapes for the same wire on the
     /// TCP fallback — the whole point is that the map cannot depend on
     /// whether UDP happened to work.
     #[test]
@@ -5695,6 +5791,8 @@ mod tests {
                 header("set-cookie", "sid=2"),
                 header("content-length", "7"),
                 header("content-length", "999"),
+                header("location", "https://first.example/"),
+                header("location", "https://second.example/"),
             ],
         );
         // A trailers block carries no `:status`; a repeat there joins too.
@@ -5716,6 +5814,13 @@ mod tests {
             Some("7, 999")
         );
         assert_eq!(state.download_total, 7);
+        // `location` never joins: first occurrence whole, repeats dropped —
+        // the value the redirect gate acts on, on both transports. A joined
+        // `"a, b"` here would not be a URL at all.
+        assert_eq!(
+            state.headers.get("location").map(String::as_str),
+            Some("https://first.example/")
+        );
         assert_eq!(
             state.set_cookie_headers,
             vec!["sid=1".to_string(), "sid=2".to_string()]
@@ -6095,10 +6200,30 @@ mod tests {
 
     #[test]
     fn request_body_limit_rejects_oversized_body() {
-        let err = validate_request_body_limit(b"abcd", 3).unwrap_err();
+        let err = validate_request_body_limit(4, 3).unwrap_err();
 
         assert!(err.to_string().contains("Request body exceeded 3 bytes"));
-        assert!(validate_request_body_limit(b"abc", 3).is_ok());
+        assert!(validate_request_body_limit(3, 3).is_ok());
+    }
+
+    #[test]
+    fn body_file_over_the_limit_is_refused_before_it_is_read() {
+        // `set_len` makes a sparse multi-GB file in O(1): if the limit were
+        // checked after `read_to_end` instead of before, this test would try
+        // to allocate 8 GB — the OOM this ordering exists to prevent.
+        let path = std::env::temp_dir().join("vane_oversized_body_file_test");
+        let file = File::create(&path).unwrap();
+        file.set_len(8 * 1024 * 1024 * 1024).unwrap();
+
+        let mut oversized = request("https://example.com/upload");
+        oversized.body_file_path = Some(path.display().to_string());
+        let err = load_request_body(&oversized, 1024).unwrap_err();
+        let _ = fs::remove_file(&path);
+
+        // The exact error the post-load check produces, so callers matching
+        // on the kind or message cannot tell which check fired.
+        assert!(matches!(err, VaneError::BodyLimitExceeded(_)));
+        assert!(err.to_string().contains("Request body exceeded 1024 bytes"));
     }
 
     #[test]
@@ -6312,6 +6437,32 @@ mod tests {
         assert!(snapshot.done);
         vane_ffi_progress_free(progress_id);
         assert!(!vane_ffi_progress_snapshot(progress_id).done);
+    }
+
+    /// `execute` resolves the progress id again when the request ends. If the
+    /// caller freed the id mid-request (worker death frees eagerly), that
+    /// late resolve must find nothing — an insert there would resurrect the
+    /// entry forever, because ids are never reused and nothing frees twice.
+    #[test]
+    fn a_freed_progress_id_is_not_resurrected_by_a_late_resolve() {
+        let progress_id = vane_ffi_progress_create();
+        vane_ffi_progress_free(progress_id);
+
+        assert!(progress_handle(Some(progress_id)).is_none());
+        // The done-time call `execute` makes, verbatim: a no-op, not a leak.
+        progress_done(progress_handle(Some(progress_id)).as_deref());
+        assert!(
+            !PROGRESS_STATES.lock().unwrap().contains_key(&progress_id),
+            "resolving a freed progress id must not re-insert it"
+        );
+    }
+
+    /// The constant the Dart bindings check at load time; see
+    /// `vane_ffi_abi_version`'s doc for when it must move. Pinned so a bump
+    /// cannot land without the author reading that contract.
+    #[test]
+    fn c_abi_version_is_the_one_the_dart_bindings_expect() {
+        assert_eq!(vane_ffi_abi_version(), 1);
     }
 
     #[test]
