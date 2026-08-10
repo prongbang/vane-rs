@@ -415,6 +415,46 @@ pub struct VaneResponse {
     pub body_file_path: Option<String>,
     pub is_success: bool,
     pub url: String,
+    /// Raw `Set-Cookie` values from the final response, in wire order.
+    ///
+    /// Unfiltered: a cookie the jar refused (a `Domain` that is a public
+    /// suffix, or an IP literal) still appears here, because this reports what
+    /// the server sent. Never folded into `headers` — a `HashMap` cannot hold
+    /// repeats and RFC 6265 forbids comma-joining `Set-Cookie` (an `Expires`
+    /// value contains a comma, so the join is unsplittable).
+    ///
+    /// Redirects: the final response only. Intermediate hops still reach the
+    /// cookie jar as before.
+    #[uniffi(default = [])]
+    pub set_cookie: Vec<String>,
+    /// Protocol that served the final response. `None` when no exchange
+    /// completed, or when the transport could not say.
+    #[uniffi(default = None)]
+    pub http_version: Option<VaneHttpVersion>,
+}
+
+/// Protocol a response was actually served over, as opposed to the
+/// [`VaneProtocolMode`] the request asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum VaneHttpVersion {
+    Http10,
+    Http11,
+    Http2,
+    Http3,
+}
+
+impl VaneHttpVersion {
+    /// Wire code for `VaneFfiResponse::http_version`. 0 means "not known" and
+    /// is written by `ffi_error_response`. Append only, never renumber: a
+    /// shipped Dart build decodes these by value.
+    fn ffi_code(self) -> u8 {
+        match self {
+            VaneHttpVersion::Http10 => 1,
+            VaneHttpVersion::Http11 => 2,
+            VaneHttpVersion::Http2 => 3,
+            VaneHttpVersion::Http3 => 4,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, uniffi::Record)]
@@ -1864,6 +1904,12 @@ impl Http3ResponseParts {
             body_file_path: self.body_file_path,
             is_success: (200..=299).contains(&self.status_code),
             url: self.url,
+            set_cookie: self.set_cookie_headers,
+            // `create_quiche_config` offers only `h3::APPLICATION_PROTOCOL`,
+            // and the MASQUE path uses the same h3-only config on both hops,
+            // so an `Http3ResponseParts` cannot have been served over anything
+            // else.
+            http_version: Some(VaneHttpVersion::Http3),
         }
     }
 }
@@ -3650,6 +3696,52 @@ impl ResponseState {
     }
 }
 
+/// Folds one HEADERS block into the response, discarding interim (1xx) ones.
+///
+/// quiche's h3 layer emits one `Event::Headers` per HEADERS frame and has no
+/// notion of a final response, so without this an `103 Early Hints` block's
+/// `set-cookie` values would be surfaced on the final response and its other
+/// fields would win the `or_insert` against the real ones. hyper consumes 1xx
+/// internally on the TCP path, so dropping them here is also what keeps the two
+/// transports agreeing on what the server sent (RFC 9114 §4.1.2).
+fn merge_h3_header_block(response: &mut ResponseState, list: Vec<quiche::h3::Header>) {
+    // `None` rather than 0: a trailers block is also an `Event::Headers` and
+    // carries no `:status`, so treating "absent" as 0 would wipe the real
+    // status code off the response.
+    let mut status: Option<u16> = None;
+    let mut fields = Vec::with_capacity(list.len());
+    for header in list {
+        // Lowercased before it is keyed: HTTP/3 field names are lowercase by
+        // protocol, but the peer controls them, and `Location` plus `location`
+        // as two map entries would make the redirect gate's lookup
+        // nondeterministic. First occurrence wins, matching the TCP path's
+        // `get`.
+        let name = String::from_utf8_lossy(header.name()).to_ascii_lowercase();
+        let value = String::from_utf8_lossy(header.value()).to_string();
+        if name == ":status" {
+            status = Some(value.parse::<u16>().unwrap_or_default());
+        } else {
+            fields.push((name, value));
+        }
+    }
+    if let Some(status) = status {
+        if (100..200).contains(&status) {
+            return;
+        }
+        response.status_code = status;
+    }
+    for (name, value) in fields {
+        if name == "set-cookie" {
+            response.set_cookie_headers.push(value);
+        } else {
+            if name == "content-length" {
+                response.on_content_length(&value);
+            }
+            response.headers.entry(name).or_insert(value);
+        }
+    }
+}
+
 fn process_h3_events(
     http3: &mut quiche::h3::Connection,
     conn: &mut quiche::Connection,
@@ -3663,25 +3755,7 @@ fn process_h3_events(
         match http3.poll(conn) {
             Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                 *response_started = true;
-                for header in list {
-                    // Lowercased before it is keyed: HTTP/3 field names are
-                    // lowercase by protocol, but the peer controls them, and
-                    // `Location` plus `location` as two map entries would make
-                    // the redirect gate's lookup nondeterministic. First
-                    // occurrence wins, matching the TCP path's `get`.
-                    let name = String::from_utf8_lossy(header.name()).to_ascii_lowercase();
-                    let value = String::from_utf8_lossy(header.value()).to_string();
-                    if name == ":status" {
-                        response.status_code = value.parse::<u16>().unwrap_or_default();
-                    } else if name == "set-cookie" {
-                        response.set_cookie_headers.push(value);
-                    } else {
-                        if name == "content-length" {
-                            response.on_content_length(&value);
-                        }
-                        response.headers.entry(name).or_insert(value);
-                    }
-                }
+                merge_h3_header_block(response, list);
                 let _ = stream_id;
             }
             Ok((stream_id, quiche::h3::Event::Data)) => loop {
@@ -3904,6 +3978,10 @@ pub struct VaneFfiHeaderArray {
 pub struct VaneFfiResponse {
     pub status_code: u16,
     pub is_success: bool,
+    /// `VaneHttpVersion::ffi_code`; 0 when the protocol is not known. Offset 3
+    /// — the one free padding byte after `is_success` — so the struct neither
+    /// grows nor moves a field. There is no second free byte.
+    pub http_version: u8,
     /// `VaneError::ffi_kind` for `error`; 0 when `error` is empty. Sits here
     /// rather than at the end because it fits the padding after `is_success`,
     /// so the struct does not grow.
@@ -4138,8 +4216,9 @@ fn ffi_response_from_vane(response: VaneResponse) -> VaneFfiResponse {
     VaneFfiResponse {
         status_code: response.status_code,
         is_success: response.is_success,
+        http_version: response.http_version.map_or(0, VaneHttpVersion::ffi_code),
         error_kind: 0,
-        headers: ffi_header_array_from_map(response.headers),
+        headers: ffi_header_array_from(response.headers, response.set_cookie),
         body: ffi_buffer_from_vec(response.body),
         body_file_path: ffi_buffer_from_vec(
             response.body_file_path.unwrap_or_default().into_bytes(),
@@ -4153,6 +4232,7 @@ fn ffi_error_response(error: VaneError) -> VaneFfiResponse {
     VaneFfiResponse {
         status_code: 0,
         is_success: false,
+        http_version: 0,
         error_kind: error.ffi_kind(),
         headers: ffi_header_array_empty(),
         body: ffi_buffer_from_vec(Vec::new()),
@@ -4342,13 +4422,23 @@ fn ffi_header_array_empty() -> VaneFfiHeaderArray {
     }
 }
 
-fn ffi_header_array_from_map(headers: HashMap<String, String>) -> VaneFfiHeaderArray {
+/// The array has always been a `(key, value)` list rather than a map, so the
+/// `Set-Cookie` values ride as repeated `("set-cookie", value)` entries instead
+/// of a second `repr(C)` field. Consumers must not assume unique keys.
+fn ffi_header_array_from(
+    headers: HashMap<String, String>,
+    set_cookie: Vec<String>,
+) -> VaneFfiHeaderArray {
     let mut headers: Vec<VaneFfiHeader> = headers
         .into_iter()
         .map(|(key, value)| VaneFfiHeader {
             key: ffi_buffer_from_vec(key.into_bytes()),
             value: ffi_buffer_from_vec(value.into_bytes()),
         })
+        .chain(set_cookie.into_iter().map(|value| VaneFfiHeader {
+            key: ffi_buffer_from_vec(b"set-cookie".to_vec()),
+            value: ffi_buffer_from_vec(value.into_bytes()),
+        }))
         .collect();
     if headers.is_empty() {
         return ffi_header_array_empty();
@@ -4439,7 +4529,7 @@ pub(crate) fn tcp_test_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// Shared by the unit tests in this file and in `tcp::tests`.
-#[cfg(all(test, feature = "tcp-fallback"))]
+#[cfg(test)]
 fn test_request(url: &str) -> VaneRequest {
     VaneRequest {
         url: url.to_string(),
@@ -4622,10 +4712,30 @@ mod tests {
         })
         .unwrap();
 
+        // Redirects are NOT followed here: `/cookies/set/...` answers 302 and
+        // only the final response's `Set-Cookie` is surfaced, so following it
+        // would land on `/cookies`, which sets nothing. The jar still harvests
+        // every hop either way — the reads below prove it.
         let set_cookie = client
-            .get_request("/cookies/set/vane_cookie/live".to_string())
+            .execute(VaneRequest {
+                follow_redirects: false,
+                ..test_request("/cookies/set/vane_cookie/live")
+            })
             .expect("HTTP/3 cookie set should succeed");
-        assert!(set_cookie.is_success);
+        assert_eq!(set_cookie.status_code, 302);
+        // The H3 half of what `tcp::tests::response_metadata` proves offline:
+        // the values reach the caller as well as the jar, and never through
+        // the header map.
+        assert!(
+            set_cookie
+                .set_cookie
+                .iter()
+                .any(|value| value.contains("vane_cookie")),
+            "set_cookie was {:?}",
+            set_cookie.set_cookie
+        );
+        assert!(!set_cookie.headers.contains_key("set-cookie"));
+        assert_eq!(set_cookie.http_version, Some(VaneHttpVersion::Http3));
 
         let cookies = client
             .get_request("/cookies".to_string())
@@ -4962,6 +5072,54 @@ mod tests {
         // derives the same offset from its own field order, so a field
         // inserted above this one silently desyncs the two.
         assert_eq!(std::mem::offset_of!(VaneFfiResponse, error_kind), 4);
+        // The one remaining padding byte. `headers` is what proves the struct
+        // did not grow, and unlike a `size_of` literal it holds on both
+        // pointer widths.
+        assert_eq!(std::mem::offset_of!(VaneFfiResponse, http_version), 3);
+        assert_eq!(std::mem::offset_of!(VaneFfiResponse, headers), 8);
+
+        assert_eq!(VaneHttpVersion::Http10.ffi_code(), 1);
+        assert_eq!(VaneHttpVersion::Http11.ffi_code(), 2);
+        assert_eq!(VaneHttpVersion::Http2.ffi_code(), 3);
+        assert_eq!(VaneHttpVersion::Http3.ffi_code(), 4);
+    }
+
+    /// The C ABI has no `set_cookie` field: the values ride as repeated
+    /// `("set-cookie", value)` entries in the header array, which a `HashMap`
+    /// input could never produce.
+    #[test]
+    fn ffi_header_array_carries_repeated_set_cookie() {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "text/plain".to_string());
+        let array = ffi_header_array_from(
+            headers,
+            vec!["a=1; Path=/".to_string(), "b=2; Path=/".to_string()],
+        );
+        assert_eq!(array.len, 3);
+        let entries: Vec<(String, String)> = (0..array.len)
+            .map(|index| unsafe {
+                let header = &*array.data.add(index);
+                (
+                    String::from_utf8_lossy(std::slice::from_raw_parts(
+                        header.key.data,
+                        header.key.len,
+                    ))
+                    .into_owned(),
+                    String::from_utf8_lossy(std::slice::from_raw_parts(
+                        header.value.data,
+                        header.value.len,
+                    ))
+                    .into_owned(),
+                )
+            })
+            .collect();
+        let cookies: Vec<&str> = entries
+            .iter()
+            .filter(|(key, _)| key == "set-cookie")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(cookies, vec!["a=1; Path=/", "b=2; Path=/"]);
+        ffi_header_array_free(array);
     }
 
     /// The reason the kind exists at all: an `http://` URL is rejected by both
@@ -5372,6 +5530,67 @@ mod tests {
         );
     }
 
+    /// Covers the whole H3 population path for both new response fields: an
+    /// interim block must be discarded, and `into_public_response` is the only
+    /// place the H3 transport fills `set_cookie`/`http_version` in. Neither had
+    /// offline coverage — the redirect tests assert on the `h3_response` helper
+    /// below, which writes the values itself, and the live test is env-gated.
+    #[test]
+    fn an_interim_h3_header_block_never_reaches_the_response() {
+        fn header(name: &str, value: &str) -> quiche::h3::Header {
+            quiche::h3::Header::new(name.as_bytes(), value.as_bytes())
+        }
+
+        let mut state = ResponseState::new(1024, None).unwrap();
+        // 103 Early Hints, then the real response. A hostile or misconfigured
+        // peer can put anything in the interim block.
+        merge_h3_header_block(
+            &mut state,
+            vec![
+                header(":status", "103"),
+                header("set-cookie", "sid=A"),
+                header("server", "early"),
+            ],
+        );
+        merge_h3_header_block(
+            &mut state,
+            vec![
+                header(":status", "200"),
+                header("set-cookie", "sid=B"),
+                header("server", "real"),
+            ],
+        );
+        // A trailers block is an `Event::Headers` too, and carries no
+        // `:status`. It must not be mistaken for an interim block, and must
+        // not wipe the status code either.
+        merge_h3_header_block(&mut state, vec![header("grpc-status", "0")]);
+
+        let response = Http3ResponseParts {
+            body_len: state.body_len as u64,
+            status_code: state.status_code,
+            headers: state.headers,
+            set_cookie_headers: state.set_cookie_headers,
+            body: state.body,
+            body_file_path: state.body_file_path,
+            url: "https://example.com/".to_string(),
+        }
+        .into_public_response();
+
+        assert_eq!(response.status_code, 200);
+        assert_eq!(
+            response.headers.get("grpc-status").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(response.set_cookie, vec!["sid=B".to_string()]);
+        assert_eq!(
+            response.headers.get("server").map(String::as_str),
+            Some("real")
+        );
+        // The map must never carry the cookie: it cannot hold repeats.
+        assert!(!response.headers.contains_key("set-cookie"));
+        assert_eq!(response.http_version, Some(VaneHttpVersion::Http3));
+    }
+
     fn h3_response(status: u16, location: Option<&str>, body: &str) -> VaneResponse {
         let mut headers = HashMap::new();
         if let Some(location) = location {
@@ -5384,6 +5603,8 @@ mod tests {
             body_file_path: None,
             is_success: (200..=299).contains(&status),
             url: String::new(),
+            set_cookie: Vec::new(),
+            http_version: Some(VaneHttpVersion::Http3),
         }
     }
 
@@ -5521,6 +5742,9 @@ mod tests {
         // followed, so without the final publish this would report zero.
         assert_eq!(response.body, b"moved");
         assert_eq!(progress.download_received.load(Ordering::Relaxed), 9);
+        // `refused_redirect` and `finish` rebuild nothing, so the protocol the
+        // hop reported must still be there.
+        assert_eq!(response.http_version, Some(VaneHttpVersion::Http3));
 
         // A pinned host that a redirect tries to leave is refused the same way.
         let pins = HashMap::from([(

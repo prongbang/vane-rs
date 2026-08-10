@@ -24,7 +24,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 
 use super::{
     H3_BODY_BUFFER_BYTES, REDIRECT_REFUSED_CROSS_ORIGIN_BODY, REDIRECT_REFUSED_HEADER,
-    RedirectDecision, RedirectRewrite, ResponseState, Url, VaneClient, VaneError,
+    RedirectDecision, RedirectRewrite, ResponseState, Url, VaneClient, VaneError, VaneHttpVersion,
     VaneProgressState, VaneProtocolMode, VaneRequest, VaneResponse, cancel_token, check_cancelled,
     for_each_regular_header, header_survives_origin_change, next_redirect_url, origin_port,
     progress_download, progress_init, progress_upload, redact_url_userinfo, redirect_rewrite,
@@ -698,6 +698,9 @@ fn follow_and_read(
         hops += 1;
     };
 
+    // Read off the final hop only — Vane runs `redirect::Policy::none()` and
+    // does its own hops — and before `read_body` moves the response.
+    let http_version = http_version_of(response.version());
     read_body(response, &mut state, cancel_token, progress)?;
 
     if let Some(reason) = refused {
@@ -714,7 +717,21 @@ fn follow_and_read(
         body_file_path: state.body_file_path,
         is_success: (200..=299).contains(&status_code),
         url: current.to_string(),
+        set_cookie: state.set_cookie_headers,
+        http_version,
     })
+}
+
+/// reqwest hands back the version hyper read off the wire (h2 stamps
+/// `HTTP_2`, the h1 parser stamps `HTTP_11`/`HTTP_10` from the status line),
+/// so this is the negotiated protocol, not the requested one.
+fn http_version_of(version: reqwest::Version) -> Option<VaneHttpVersion> {
+    match version {
+        reqwest::Version::HTTP_10 => Some(VaneHttpVersion::Http10),
+        reqwest::Version::HTTP_11 => Some(VaneHttpVersion::Http11),
+        reqwest::Version::HTTP_2 => Some(VaneHttpVersion::Http2),
+        _ => None,
+    }
 }
 
 /// Maps a send failure onto a kind using reqwest's own predicates, so the
@@ -804,7 +821,13 @@ fn read_body(
     state.status_code = response.status().as_u16();
     for (name, value) in response.headers() {
         if name == reqwest::header::SET_COOKIE {
-            // Already harvested per hop.
+            // Surfaced as its own list, never folded into the map. The jar
+            // harvest above is separate and gated on `cookies_enabled`; this
+            // is not, or the caller loses `Set-Cookie` entirely with the jar
+            // off.
+            state
+                .set_cookie_headers
+                .push(String::from_utf8_lossy(value.as_bytes()).to_string());
             continue;
         }
         let name = name.as_str().to_string();

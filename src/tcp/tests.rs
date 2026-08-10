@@ -12,6 +12,112 @@ fn client_with(config: VaneClientConfig) -> VaneClient {
     VaneClient::new(config).unwrap()
 }
 
+type TlsStream = rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>;
+
+/// A localhost TLS listener with a per-run CA, so a test can drive the real
+/// TCP transport against a hand-written HTTP response. Returns the port and
+/// the CA DER the caller must install in `TEST_ROOT`.
+fn local_tls_server<F>(alpn: &[u8], handle: F) -> (u16, CertificateDer<'static>)
+where
+    F: Fn(TlsStream) + Send + Sync + 'static,
+{
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::{ServerConfig, ServerConnection};
+
+    let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_key = KeyPair::generate().unwrap();
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let ca_der = ca.der().clone();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+    let leaf_der = leaf.der().clone();
+    let leaf_pkcs8 = PrivateKeyDer::try_from(leaf_key.serialize_der()).unwrap();
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut server_config = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![leaf_der], leaf_pkcs8)
+        .unwrap();
+    server_config.alpn_protocols = vec![alpn.to_vec()];
+    let server_config = Arc::new(server_config);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = Arc::new(handle);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let config = server_config.clone();
+            let handle = handle.clone();
+            std::thread::spawn(move || {
+                stream.set_nodelay(true).ok();
+                let Ok(conn) = ServerConnection::new(config) else {
+                    return;
+                };
+                handle(rustls::StreamOwned::new(conn, stream));
+            });
+        }
+    });
+    (port, ca_der)
+}
+
+/// Answers each request with a raw response picked by path, so a test can
+/// script the exact bytes on the wire — including a repeated `Set-Cookie` and
+/// an `HTTP/1.0` status line, neither of which reqwest can be asked to fake.
+fn raw_http_server(
+    routes: &'static [(&'static str, &'static str)],
+) -> (u16, CertificateDer<'static>) {
+    local_tls_server(b"http/1.1", move |mut tls| {
+        let mut buf = [0u8; 8192];
+        let mut pending = Vec::new();
+        loop {
+            match std::io::Read::read(&mut tls, &mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => pending.extend_from_slice(&buf[..read]),
+            }
+            while let Some(end) = pending
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|position| position + 4)
+            {
+                let head = String::from_utf8_lossy(&pending[..end]).into_owned();
+                pending.drain(..end);
+                let path = head.split_whitespace().nth(1).unwrap_or("/");
+                let response = routes
+                    .iter()
+                    .find(|(route, _)| *route == path)
+                    .map(|(_, response)| *response)
+                    .unwrap_or("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                if std::io::Write::write_all(&mut tls, response.as_bytes()).is_err() {
+                    return;
+                }
+                std::io::Write::flush(&mut tls).ok();
+            }
+        }
+    })
+}
+
+/// Installs `ca` as the process-wide trust anchor for the duration of the
+/// returned guard, serialized against every other test that builds a TCP
+/// client.
+fn with_test_root(ca: CertificateDer<'static>) -> impl Drop {
+    // Held, not read: dropping the guard is the whole point.
+    struct Guard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *super::TEST_ROOT.lock().unwrap() = None;
+        }
+    }
+    let guard = Guard(crate::tcp_test_lock());
+    *super::TEST_ROOT.lock().unwrap() = Some(ca);
+    guard
+}
+
 /// A CA plus a leaf it signed, so the pin logic can be reached through a chain
 /// that real path validation actually accepts.
 struct Chain {
@@ -427,11 +533,7 @@ fn tcp_rejects_plaintext_urls() {
 mod pool_checkout_race {
     use super::*;
     use std::io::Write;
-    use std::net::{TcpListener, TcpStream};
     use std::time::Duration;
-
-    use rustls::pki_types::PrivateKeyDer;
-    use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
     // The window is narrow and sits where the client's pool checkout coincides
     // with the server's close, so the delay tracks the idle timeout rather than
@@ -445,12 +547,7 @@ mod pool_checkout_race {
     const DELAY_OFFSETS_MS: [i64; 4] = [-2, -1, 0, 1];
     const ROUNDS: usize = 14;
 
-    fn serve(tcp: TcpStream, config: Arc<ServerConfig>) {
-        tcp.set_nodelay(true).ok();
-        let Ok(conn) = ServerConnection::new(config) else {
-            return;
-        };
-        let mut tls = StreamOwned::new(conn, tcp);
+    fn serve(mut tls: TlsStream) {
         let mut buf = [0u8; 8192];
         let mut pending = Vec::new();
         loop {
@@ -482,42 +579,10 @@ mod pool_checkout_race {
 
     #[test]
     fn a_stale_pooled_connection_is_retried_rather_than_failing_the_request() {
-        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca_key = KeyPair::generate().unwrap();
-        let ca = ca_params.self_signed(&ca_key).unwrap();
-        let ca_der = ca.der().clone();
-        let issuer = Issuer::new(ca_params, ca_key);
-
-        let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        let leaf_key = KeyPair::generate().unwrap();
-        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
-        let leaf_der = leaf.der().clone();
-        let leaf_pkcs8 = PrivateKeyDer::try_from(leaf_key.serialize_der()).unwrap();
-
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut server_config = ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![leaf_der], leaf_pkcs8)
-            .unwrap();
-        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let server_config = Arc::new(server_config);
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let config = server_config.clone();
-                std::thread::spawn(move || serve(stream, config));
-            }
-        });
-
+        let (port, ca) = local_tls_server(b"http/1.1", serve);
         // Serialized against the other tests that build a TCP client, since the
         // trust anchor and the client cache are process-wide.
-        let _guard = crate::tcp_test_lock();
-        *super::TEST_ROOT.lock().unwrap() = Some(ca_der);
+        let _guard = with_test_root(ca);
 
         let client = client_with(VaneClientConfig {
             base_url: Some(format!("https://localhost:{port}")),
@@ -542,11 +607,126 @@ mod pool_checkout_race {
             }
         }
 
-        *super::TEST_ROOT.lock().unwrap() = None;
         assert!(
             failures.is_empty(),
             "{} of {attempts} requests failed on a stale pooled connection: {failures:?}",
             failures.len()
         );
+    }
+}
+
+/// The response metadata the transports must agree on: the raw `Set-Cookie`
+/// values, kept out of the header map, and the protocol read off the wire.
+///
+/// These drive the shipped `VaneClient::execute`, not a reimplementation of
+/// the header loop, so the wire bytes are the only input.
+mod response_metadata {
+    use super::*;
+    use crate::VaneHttpVersion;
+
+    const TWO_COOKIES: &str = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Length: 2\r\n",
+        "Set-Cookie: a=1; Path=/\r\n",
+        "Set-Cookie: b=2; Path=/\r\n",
+        "Connection: close\r\n",
+        "\r\nok"
+    );
+
+    fn get(port: u16, cookies_enabled: bool) -> crate::VaneResponse {
+        client_with(VaneClientConfig {
+            base_url: Some(format!("https://localhost:{port}")),
+            protocol_mode: VaneProtocolMode::Http1Only,
+            timeout_seconds: Some(10),
+            cookies_enabled,
+            ..VaneClientConfig::default()
+        })
+        .execute(crate::test_request("/"))
+        .unwrap()
+    }
+
+    #[test]
+    fn repeated_set_cookie_is_surfaced_whether_or_not_the_jar_is_on() {
+        let (port, ca) = raw_http_server(&[("/", TWO_COOKIES)]);
+        let _guard = with_test_root(ca);
+
+        // With the jar off, `read_body`'s skip used to be unconditional while
+        // the per-hop harvest was gated, so `Set-Cookie` vanished entirely.
+        for cookies_enabled in [true, false] {
+            let response = get(port, cookies_enabled);
+            assert_eq!(
+                response.set_cookie,
+                vec!["a=1; Path=/".to_string(), "b=2; Path=/".to_string()],
+                "cookies_enabled={cookies_enabled}"
+            );
+            assert!(
+                !response.headers.contains_key("set-cookie"),
+                "set-cookie must never collapse into the header map"
+            );
+            assert_eq!(response.http_version, Some(VaneHttpVersion::Http11));
+        }
+    }
+
+    #[test]
+    fn a_redirect_surfaces_only_the_final_hop_but_the_jar_still_sees_both() {
+        let (port, ca) = raw_http_server(&[
+            (
+                "/",
+                concat!(
+                    "HTTP/1.1 302 Found\r\n",
+                    "Location: /done\r\n",
+                    "Content-Length: 0\r\n",
+                    "Set-Cookie: hop=1; Path=/\r\n",
+                    "\r\n"
+                ),
+            ),
+            (
+                "/done",
+                concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Length: 2\r\n",
+                    "Set-Cookie: final=2; Path=/\r\n",
+                    "Connection: close\r\n",
+                    "\r\nok"
+                ),
+            ),
+        ]);
+        let _guard = with_test_root(ca);
+
+        let client = client_with(VaneClientConfig {
+            base_url: Some(format!("https://localhost:{port}")),
+            protocol_mode: VaneProtocolMode::Http1Only,
+            timeout_seconds: Some(10),
+            cookies_enabled: true,
+            ..VaneClientConfig::default()
+        });
+        let response = client.execute(crate::test_request("/")).unwrap();
+
+        assert_eq!(response.set_cookie, vec!["final=2; Path=/".to_string()]);
+        // Surfacing the final hop must not have disturbed the per-hop harvest.
+        let jar = client
+            .cookie_header(&Url::parse(&format!("https://localhost:{port}/")).unwrap())
+            .unwrap();
+        assert!(
+            jar.contains("hop=1"),
+            "jar lost the intermediate hop: {jar}"
+        );
+        assert!(jar.contains("final=2"), "jar lost the final hop: {jar}");
+    }
+
+    /// The version has to come off the status line, not from the mode the
+    /// caller asked for — this server answers an `Http1Only` request with
+    /// `HTTP/1.0`, which a hardcoded `Http11` would report wrongly.
+    #[test]
+    fn the_http_version_is_read_off_the_status_line() {
+        let (port, ca) = raw_http_server(&[(
+            "/",
+            "HTTP/1.0 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        )]);
+        let _guard = with_test_root(ca);
+
+        let response = get(port, true);
+        assert_eq!(response.status_code, 200);
+        assert_eq!(response.http_version, Some(VaneHttpVersion::Http10));
     }
 }

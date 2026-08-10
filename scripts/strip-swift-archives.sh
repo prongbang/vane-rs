@@ -49,3 +49,20 @@ while IFS= read -r archive; do
 
     rm -rf "$tmp"
 done < <(find "$xcframework" -name "libvane.a")
+
+# cargo-swift emits AvailableLibraries in an arbitrary order — two runs from the
+# same source produced ios/ios-sim/macos and macos/ios/ios-sim. The content is
+# identical either way, but the XCFrameworks are tracked in git and the release
+# workflow gates on `git diff --exit-code -- VaneSwift`, so an unsorted array
+# fails a release with a diff nobody can act on. Sort by slice identifier.
+python3 - "$xcframework/Info.plist" <<'PY'
+import plistlib
+import sys
+
+path = sys.argv[1]
+with open(path, "rb") as handle:
+    plist = plistlib.load(handle)
+plist["AvailableLibraries"].sort(key=lambda library: library["LibraryIdentifier"])
+with open(path, "wb") as handle:
+    plistlib.dump(plist, handle)
+PY

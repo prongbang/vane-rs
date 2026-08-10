@@ -8,14 +8,19 @@ setup:
         armv7-linux-androideabi \
         x86_64-linux-android
 	cargo install cargo-ndk
-	cargo install cargo-swift
+	cargo install cargo-swift --version "^0.11"
 	brew install gradle
 
 new_project:
 	cargo swift init
 
+# cargo-swift >= 0.11 is required: 0.9 bundles uniffi 0.29, whose metadata
+# reader is one byte out of step with 0.31's record-field defaults (it reads the
+# literal kind where 0.31 writes a DefaultValue discriminator first) and fails
+# with "invalid utf-8" on _UNIFFI_META_VANE_RECORD_VANERESPONSE. It also names
+# the bundle after the FFI module now, hence the explicit --xcframework-name.
 build_swift:
-	IPHONEOS_DEPLOYMENT_TARGET=13.0 MACOSX_DEPLOYMENT_TARGET=10.15 cargo swift package --release --accept-all --name VaneSwift --lib-type static
+	IPHONEOS_DEPLOYMENT_TARGET=13.0 MACOSX_DEPLOYMENT_TARGET=10.15 cargo swift package --release --accept-all --name VaneSwift --xcframework-name RustFramework --lib-type static
 	rm -rf ../VaneSwift/RustFramework.xcframework
 	cp -R VaneSwift/RustFramework.xcframework ../VaneSwift/RustFramework.xcframework
 	find ../VaneSwift/RustFramework.xcframework -name "libvane.a" -exec xcrun strip -S -x {} \; 2>/dev/null
@@ -23,7 +28,7 @@ build_swift:
 	rm -rf VaneSwift
 
 build_swift_small:
-	IPHONEOS_DEPLOYMENT_TARGET=13.0 MACOSX_DEPLOYMENT_TARGET=10.15 cargo swift package --release --accept-all --name VaneSwift --lib-type static --no-default-features
+	IPHONEOS_DEPLOYMENT_TARGET=13.0 MACOSX_DEPLOYMENT_TARGET=10.15 cargo swift package --release --accept-all --name VaneSwift --xcframework-name RustFramework --lib-type static --no-default-features
 	rm -rf ../VaneSwift/RustFramework.small.xcframework
 	cp -R VaneSwift/RustFramework.xcframework ../VaneSwift/RustFramework.small.xcframework
 	find ../VaneSwift/RustFramework.small.xcframework -name "libvane.a" -exec xcrun strip -S -x {} \; 2>/dev/null
