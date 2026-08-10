@@ -62,6 +62,27 @@ build_so:
 # entry for it, and the only System.loadLibrary/Native.register call names
 # "vane". Shipping it added ~659 KB of dead weight across the ABI set.
 	find ../VaneKotlin/library/src/main/jniLibs -name 'libquiche-*.so' -delete
+	$(MAKE) check_so_links
+
+# A cdylib link tolerates undefined symbols, so a libvane.so that is missing
+# every BoringSSL symbol still "builds" — and then fails at System.loadLibrary
+# on every device. That shipped twice in one day: a poisoned boring-sys
+# CMakeCache in a cargo target dir (left by some non-cargo-ndk build) makes
+# later rebuilds silently reuse a host-arch Mach-O archive, whose members lld
+# skips. Nothing downstream notices: unit tests never load the .so and the CI
+# staleness gate only diffs bytes. If this fires, purge
+# `release/build/boring-sys-*` and `release/.fingerprint/boring-sys-*` for the
+# Android targets in EVERY cargo target dir, then rebuild.
+check_so_links:
+	@nm=$$(ls "$$HOME/Library/Android/sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/"*/bin/llvm-nm 2>/dev/null | head -1); \
+	if [ -z "$$nm" ]; then echo "check_so_links: llvm-nm not found, SKIPPED" >&2; exit 0; fi; \
+	fail=0; \
+	for so in ../VaneKotlin/library/src/main/jniLibs/*/libvane.so; do \
+	    n=$$("$$nm" -D --undefined-only "$$so" | grep -cE ' U (SSL_|EVP_|CRYPTO_|X509_)' || true); \
+	    if [ "$$n" -ne 0 ]; then echo "check_so_links: $$so has $$n undefined BoringSSL symbols — it cannot dlopen" >&2; fail=1; \
+	    else echo "check_so_links: $$so ok"; fi; \
+	done; \
+	exit $$fail
 
 # This machine hit ENOSPC twice with target/ at ~10 GB. Run when low on disk or
 # after a toolchain bump (old rustc caches never get evicted on their own).
