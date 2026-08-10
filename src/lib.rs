@@ -3636,6 +3636,16 @@ fn rewrites_to_get(status_code: u16, method: &str) -> bool {
     status_code == 303 || (matches!(status_code, 301 | 302) && !method.eq_ignore_ascii_case("GET"))
 }
 
+/// Reads every UDP packet the peer has already delivered into `conn`.
+///
+/// The first `recv` blocks, bounded by the QUIC timer capped at 50 ms, so the
+/// drive loop waits for the network without spinning and cancel/deadline
+/// checks in the caller still run at least once per timer tick. Once a packet
+/// arrives the socket flips to non-blocking and the rest of the burst drains
+/// without waiting, so the caller flushes ACKs the moment the kernel buffer is
+/// empty. The previous always-blocking loop slept out the full timer after
+/// every burst with the ACKs still queued, which added ~min(timer, 50 ms) to
+/// each response flight and stalled the peer's congestion window.
 fn read_quic_packets(
     socket: &UdpSocket,
     last_read_timeout: &mut Option<Duration>,
@@ -3655,17 +3665,29 @@ fn read_quic_packets(
         *last_read_timeout = Some(timeout);
     }
 
-    loop {
+    // ponytail: two fcntl toggles per burst and one recv syscall per datagram;
+    // a poll-based loop (mio) with recvmmsg/GRO batching would drop both, if
+    // syscall count ever shows up in a profile.
+    let mut draining = false;
+    let result = loop {
         match socket.recv(&mut buf[..]) {
             Ok(len) => {
+                if !draining {
+                    draining = true;
+                    if let Err(e) = socket.set_nonblocking(true) {
+                        break Err(VaneError::Generic(format!(
+                            "Failed to set UDP socket non-blocking: {e}"
+                        )));
+                    }
+                }
                 let recv_info = quiche::RecvInfo {
                     from: peer_addr,
                     to: local_addr,
                 };
                 match conn.recv(&mut buf[..len], recv_info) {
                     Ok(_) => {}
-                    Err(quiche::Error::Done) => break,
-                    Err(e) => return Err(e.into()),
+                    Err(quiche::Error::Done) => break Ok(()),
+                    Err(e) => break Err(e.into()),
                 }
             }
             Err(e)
@@ -3677,17 +3699,27 @@ fn read_quic_packets(
                 if conn.timeout().is_some_and(|t| t.is_zero()) {
                     conn.on_timeout();
                 }
-                break;
+                break Ok(());
             }
             Err(e) => {
-                return Err(VaneError::Transport(format!(
+                break Err(VaneError::Transport(format!(
                     "Failed to receive UDP packet: {e}"
                 )));
             }
         }
-    }
+    };
 
-    Ok(())
+    // Restore before propagating anything: a socket left non-blocking would
+    // turn the next call's opening wait into a busy spin.
+    if draining {
+        let restored = socket.set_nonblocking(false);
+        result?;
+        restored.map_err(|e| {
+            VaneError::Generic(format!("Failed to restore blocking UDP socket: {e}"))
+        })?;
+        return Ok(());
+    }
+    result
 }
 
 fn flush_quic_packets(
