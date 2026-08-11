@@ -469,6 +469,42 @@ mod tests {
         );
     }
 
+    /// `warmup()` in an HTTP/3-capable mode dials ahead of time: exactly one
+    /// connection lands in the pool, a repeat warmup is a no-op while it is
+    /// live, and the first real request rides it instead of handshaking.
+    #[test]
+    fn warmup_pre_connects_the_pool_and_the_first_request_reuses_it() {
+        let server = TestH3Server::start();
+        // Default config is Http3Only with pooling on.
+        let client = offline_client(VaneClientConfig::default());
+        let url = server.url("/get");
+
+        client
+            .warmup_inner(Some(url.as_str()))
+            .expect("warmup against the in-process server");
+        assert_eq!(client.pool.lock().unwrap().len(), 1);
+        // Http3Only must never touch the TCP machinery.
+        #[cfg(feature = "tcp-fallback")]
+        assert!(client.tcp_client.lock().unwrap().is_none());
+
+        // Idempotent: a live pooled connection short-circuits the redial.
+        client
+            .warmup_inner(Some(url.as_str()))
+            .expect("repeat warmup");
+        assert_eq!(client.pool.lock().unwrap().len(), 1);
+
+        let response = client.execute(test_request(&url)).unwrap();
+        assert!(response.is_success);
+        // Asserted only after the round trip: the server registers a
+        // handshake asynchronously, and the request forces it to have
+        // processed the warmup connection — which must be the request's too.
+        assert_eq!(
+            server.handshakes().len(),
+            1,
+            "the request should have ridden the pre-connected pooled connection"
+        );
+    }
+
     /// The batch-2 security rule: a resumed handshake restores the cached
     /// peer chain instead of proving the current one, so a pinned host must
     /// always full-handshake — no ticket stored, none offered.

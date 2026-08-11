@@ -757,7 +757,7 @@ pub struct VaneClient {
     /// Built on first TCP use so HTTP/3-only applications never spin up a tokio
     /// runtime, and cleared whenever the pins it was built with change.
     #[cfg(feature = "tcp-fallback")]
-    tcp_client: Mutex<Option<reqwest::blocking::Client>>,
+    tcp_client: Mutex<Option<tcp::SharedTcpClient>>,
 }
 
 impl VaneClient {
@@ -983,6 +983,117 @@ impl VaneClient {
         _body: &[u8],
     ) -> Result<VaneResponse, VaneError> {
         Err(unsupported_tcp_backend_error())
+    }
+
+    /// The fallible core behind [`Self::warmup`], split out so tests (and a
+    /// Rust caller who wants to know) can see what actually happened.
+    ///
+    /// Warms exactly the transports the configured [`VaneProtocolMode`] can
+    /// use, so `Http3Only` never touches the TCP machinery (no tokio runtime,
+    /// no platform verifier) and a TCP-only mode never dials QUIC. Repeat
+    /// calls are cheap: the TCP client build is cached, and the HTTP/3
+    /// pre-connect is skipped while a live pooled connection exists.
+    fn warmup_inner(&self, url: Option<&str>) -> Result<(), VaneError> {
+        let target = match url.or(self.config.base_url.as_deref()) {
+            Some(raw) => {
+                let parsed = Url::parse(raw)
+                    .map_err(|e| VaneError::InvalidRequest(format!("Invalid warmup URL: {e}")))?;
+                // The same rule every transport enforces; failing here beats a
+                // probe that dials a cleartext port.
+                if parsed.scheme() != "https" {
+                    return Err(VaneError::InvalidRequest(
+                        "Vane only supports https:// URLs".to_string(),
+                    ));
+                }
+                Some(parsed)
+            }
+            // No URL and no baseUrl: nothing to connect to, but construction
+            // (the TCP arm below) is still worth paying for.
+            None => None,
+        };
+
+        match self.config.protocol_mode {
+            VaneProtocolMode::Http3Only => match &target {
+                Some(url) => self.warmup_http3(url),
+                None => Ok(()),
+            },
+            VaneProtocolMode::Http3ThenHttp2ThenHttp1 => {
+                let h3 = match &target {
+                    Some(url) => self.warmup_http3(url),
+                    None => Ok(()),
+                };
+                // TCP is this mode's fallback: warming it moves the ~1 s
+                // construction cost off the worst possible moment — right
+                // after an HTTP/3 transport failure. Both arms always run;
+                // the first failure is the one reported.
+                h3.and(self.warmup_tcp(target.as_ref(), false))
+            }
+            VaneProtocolMode::Http2ThenHttp1
+            | VaneProtocolMode::Http2Only
+            | VaneProtocolMode::Http1Only => self.warmup_tcp(target.as_ref(), true),
+        }
+    }
+
+    #[cfg(feature = "tcp-fallback")]
+    fn warmup_tcp(&self, url: Option<&Url>, _tcp_required: bool) -> Result<(), VaneError> {
+        tcp::warmup(self, url)
+    }
+
+    /// Without the backend, a TCP-only mode gets the same refusal `execute`
+    /// gives it — warmup must not look like it worked — while the fallback
+    /// mode is HTTP/3-only in practice and has nothing to warm.
+    #[cfg(not(feature = "tcp-fallback"))]
+    fn warmup_tcp(&self, _url: Option<&Url>, tcp_required: bool) -> Result<(), VaneError> {
+        if tcp_required {
+            Err(unsupported_tcp_backend_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Establishes one HTTP/3 connection — QUIC + TLS handshake and the H3
+    /// preamble, no HTTP request — and parks it in the pool for the first
+    /// real request to reuse. Goes through [`Self::connect_http3`], so DNS
+    /// overrides, certificate pins, TLS session resumption and a MASQUE proxy
+    /// all behave exactly as they would for a request.
+    fn warmup_http3(&self, url: &Url) -> Result<(), VaneError> {
+        // Nowhere to keep the connection: dialing one just to close it again
+        // would be pure startup cost.
+        if !self.config.connection_pool_enabled || self.config.max_idle_connections == 0 {
+            return Ok(());
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| VaneError::InvalidRequest("URL is missing host".to_string()))?;
+        let certificate_pins = self.certificate_pins_snapshot()?;
+        let key = PoolKey::new(url, &self.config, &certificate_pins);
+        {
+            let pool = self
+                .pool
+                .lock()
+                .map_err(|_| VaneError::Generic("Connection pool lock was poisoned".to_string()))?;
+            // ponytail: two racing warmups can still both dial and pool two
+            // connections; max_idle_connections caps the damage and the spare
+            // idles out. A build-in-flight flag if that ever matters.
+            if pool
+                .iter()
+                .any(|conn| conn.key == key && !conn.conn.is_closed())
+            {
+                return Ok(());
+            }
+        }
+        let peer_addr = resolve_peer_addr(
+            host,
+            url.port_or_known_default().unwrap_or(443),
+            &self.config.dns_overrides,
+        )?;
+        let timeout = Duration::from_secs(self.config.timeout_seconds.unwrap_or(30));
+        let timeouts = HopTimeouts {
+            deadline: Instant::now() + timeout,
+            idle: timeout,
+        };
+        let connection = self.connect_http3(host, peer_addr, timeouts, key, &certificate_pins)?;
+        self.return_pooled_connection(connection)
     }
 
     fn build_url(&self, request: &VaneRequest) -> Result<Url, VaneError> {
@@ -4078,6 +4189,33 @@ impl VaneClient {
     pub fn clear_certificate_pins(&self, host: String) -> Result<(), VaneError> {
         self.set_certificate_pins_internal(host, Vec::new())
     }
+
+    /// Pays the client's one-time setup and connection cost up front — call it
+    /// once at app startup, from a background thread (it blocks, exactly like
+    /// `execute_request`), so the first real request doesn't pay it.
+    ///
+    /// What gets warmed follows the configured protocol mode:
+    /// - HTTP/3-capable modes establish one pooled QUIC+TLS connection to
+    ///   `url` (or `base_url` when `url` is empty). No HTTP request is sent.
+    /// - TCP-capable modes build and cache the TCP client (tokio runtime, TLS
+    ///   config, platform trust verifier) and run one TLS handshake to the
+    ///   target — on Android that first verification loads the system trust
+    ///   store and is the bulk of the measured ~1 s first-request cost. Again
+    ///   no HTTP request: the server sees a handshake and a clean close.
+    /// - `Http3Only` never touches TCP machinery, so it stays as light as it
+    ///   is today.
+    ///
+    /// With neither `url` nor `base_url` there is nothing to connect to;
+    /// TCP-capable modes still do the construction, which is most of the win.
+    ///
+    /// Best effort by contract: failures are swallowed. Every error it could
+    /// raise is either transient (no network yet — exactly the startup
+    /// condition this exists for) or will be reported, with a better message,
+    /// by the first real request. Idempotent and cheap on repeat calls; safe
+    /// to call concurrently with requests from any thread.
+    pub fn warmup(&self, url: Option<String>) {
+        let _ = self.warmup_inner(url.as_deref());
+    }
 }
 
 // ---------- Helpers ----------
@@ -4222,10 +4360,15 @@ static FFI_NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 ///
 /// Bump it on ANY `VaneFfi*` struct layout change OR value-contract change
 /// (a new `ffi_kind` / `ffi_code` enum code counts), and bump the expected
-/// constant in `vane_flutter_ffi.dart` in the same change.
+/// constant in `vane_flutter_ffi.dart` in the same change. A new exported
+/// symbol the Dart side binds also counts: a library without it cannot serve
+/// that package, and the version check is what turns that skew into a clear
+/// error instead of a symbol-lookup failure.
+///
+/// v2: added `vane_ffi_client_warmup`.
 #[unsafe(no_mangle)]
 pub extern "C" fn vane_ffi_abi_version() -> u32 {
-    1
+    2
 }
 
 #[unsafe(no_mangle)]
@@ -4282,6 +4425,29 @@ pub extern "C" fn vane_ffi_client_set_certificate_pins(
             false
         }
     }
+}
+
+/// Blocking, best-effort warm-up of the client behind `handle`; see
+/// [`VaneClient::warmup`]. An empty `url` means "use the client's base_url".
+///
+/// No `out_error` on purpose: warmup swallows failures by contract, and an
+/// unknown handle warms nothing, which is indistinguishable from — and as
+/// harmless as — any other failed warmup.
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_client_warmup(handle: u64, url: VaneFfiString) {
+    let _ = std::panic::catch_unwind(|| {
+        let Some(client) = FFI_CLIENTS
+            .lock()
+            .ok()
+            .and_then(|clients| clients.get(&handle).cloned())
+        else {
+            return;
+        };
+        let Ok(url) = ffi_optional_string(url, "warmup_url") else {
+            return;
+        };
+        client.warmup(url);
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -5341,6 +5507,48 @@ mod tests {
         ffi_header_array_free(array);
     }
 
+    /// warmup is best-effort: bad input errors internally and is swallowed
+    /// publicly, and a client with nothing to connect to warms nothing.
+    #[test]
+    fn warmup_swallows_failures_and_nops_without_a_target() {
+        // Default config: Http3Only, no base_url.
+        let client = VaneClient::new(VaneClientConfig::default()).unwrap();
+        client.warmup_inner(None).expect("no target: nothing to do");
+        assert!(client.pool.lock().unwrap().is_empty());
+        #[cfg(feature = "tcp-fallback")]
+        assert!(client.tcp_client.lock().unwrap().is_none());
+
+        let err = client.warmup_inner(Some("not a url")).unwrap_err();
+        assert!(matches!(err, VaneError::InvalidRequest(_)), "{err:?}");
+        // The same https-only rule every transport enforces.
+        let err = client
+            .warmup_inner(Some("http://example.com/"))
+            .unwrap_err();
+        assert!(matches!(err, VaneError::InvalidRequest(_)), "{err:?}");
+
+        // The public method swallows all of it.
+        client.warmup(Some("not a url".to_string()));
+        client.warmup(None);
+    }
+
+    /// Http3Only with the pool disabled has nowhere to park a connection, so
+    /// warmup must return without dialing (the TEST-NET-1 address would hang)
+    /// and without touching TCP machinery.
+    #[test]
+    fn warmup_http3_only_with_pool_disabled_is_a_complete_noop() {
+        let client = VaneClient::new(VaneClientConfig {
+            connection_pool_enabled: false,
+            ..VaneClientConfig::default()
+        })
+        .unwrap();
+        client
+            .warmup_inner(Some("https://192.0.2.1/"))
+            .expect("pool disabled: nothing to warm");
+        assert!(client.pool.lock().unwrap().is_empty());
+        #[cfg(feature = "tcp-fallback")]
+        assert!(client.tcp_client.lock().unwrap().is_none());
+    }
+
     /// The reason the kind exists at all: an `http://` URL is rejected by both
     /// transports, so before the kind landed this burned a whole TCP attempt
     /// (and a second timeout) to arrive at the same answer.
@@ -5403,6 +5611,25 @@ mod tests {
 
         assert!(err.contains("https:// URLs"), "got {err}");
         assert!(!err.contains("TCP fallback"), "got {err}");
+    }
+
+    /// warmup mirrors `execute`: a TCP-only mode without the backend reports
+    /// the same refusal internally (and swallows it publicly) rather than
+    /// pretending it warmed something.
+    #[cfg(not(feature = "tcp-fallback"))]
+    #[test]
+    fn warmup_in_a_tcp_only_mode_reports_unsupported_without_the_feature() {
+        let client = VaneClient::new(VaneClientConfig {
+            protocol_mode: VaneProtocolMode::Http2Only,
+            ..VaneClientConfig::default()
+        })
+        .unwrap();
+
+        let err = client
+            .warmup_inner(Some("https://api.example.com/"))
+            .unwrap_err();
+        assert!(matches!(err, VaneError::ProtocolUnsupported(_)), "{err:?}");
+        client.warmup(None);
     }
 
     #[cfg(feature = "tcp-fallback")]
@@ -6532,7 +6759,7 @@ mod tests {
     /// cannot land without the author reading that contract.
     #[test]
     fn c_abi_version_is_the_one_the_dart_bindings_expect() {
-        assert_eq!(vane_ffi_abi_version(), 1);
+        assert_eq!(vane_ffi_abi_version(), 2);
     }
 
     #[test]

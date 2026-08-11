@@ -28,7 +28,7 @@ use super::{
     VaneProgressState, VaneProtocolMode, VaneRequest, VaneResponse, cancel_token, check_cancelled,
     for_each_regular_header, header_survives_origin_change, next_redirect_url, origin_port,
     progress_download, progress_init, progress_upload, redact_url_userinfo, redirect_rewrite,
-    verify_certificate_pins,
+    resolve_peer_addr, verify_certificate_pins,
 };
 
 /// Wraps the platform's own certificate verifier and adds Vane's host-scoped
@@ -336,13 +336,34 @@ fn inner_verifier(
     .map_err(|e| VaneError::Tls(format!("Failed to build TLS verifier: {e}")))?)
 }
 
+/// The cached blocking client together with the exact rustls config it was
+/// built from.
+///
+/// The config is kept so [`warmup`]'s probe can handshake through the *same*
+/// verifier instance the client's own connections use. On Android the
+/// platform verifier carries per-instance state whose first verification
+/// costs hundreds of ms on top of the process-global trust-store init
+/// (measured: a probe through a separate verifier left ~380 ms in the first
+/// real request; the matrix benchmark's second in-process TCP client shows
+/// the same per-instance cost). Sharing the config also shares the TLS
+/// session cache, so the first real connection can resume the probe's
+/// session instead of running a full handshake.
+#[derive(Debug)]
+pub(crate) struct SharedTcpClient {
+    http: Client,
+    tls: ClientConfig,
+}
+
 fn build_client(
     client: &VaneClient,
     certificate_pins: HashMap<String, Vec<String>>,
-) -> Result<Client, VaneError> {
+) -> Result<SharedTcpClient, VaneError> {
     let config = &client.config;
+    let tls = tls_config(&config.protocol_mode, certificate_pins)?;
     let mut builder = Client::builder()
-        .use_preconfigured_tls(tls_config(&config.protocol_mode, certificate_pins)?)
+        // A clone shares the verifier and session cache by `Arc`, so the
+        // retained copy IS the client's TLS identity, not a twin.
+        .use_preconfigured_tls(tls.clone())
         // Redirects are driven by hand in `follow_and_read`: reqwest's policy
         // cannot re-derive the cookie header per hop, cannot see intermediate
         // `Set-Cookie`, and cannot drop caller headers when the host changes.
@@ -404,9 +425,10 @@ fn build_client(
         builder = builder.no_proxy();
     }
 
-    builder
+    let http = builder
         .build()
-        .map_err(|e| VaneError::Generic(format!("Failed to build TCP client: {e}")))
+        .map_err(|e| VaneError::Generic(format!("Failed to build TCP client: {e}")))?;
+    Ok(SharedTcpClient { http, tls })
 }
 
 /// Returns the client's blocking reqwest client, building it on first use so
@@ -424,10 +446,148 @@ fn shared_client(client: &VaneClient) -> Result<(Client, HashMap<String, Vec<Str
     // verifier baked into the client can never disagree about the pin set.
     let certificate_pins = client.certificate_pins_snapshot()?;
     if let Some(existing) = cached.as_ref() {
-        return Ok((existing.clone(), certificate_pins));
+        return Ok((existing.http.clone(), certificate_pins));
     }
     let built = build_client(client, certificate_pins.clone())?;
-    Ok((cached.insert(built).clone(), certificate_pins))
+    Ok((cached.insert(built).http.clone(), certificate_pins))
+}
+
+/// Pays the TCP transport's one-time costs ahead of the first real request:
+/// builds (and caches) the shared reqwest client — the tokio runtime, the
+/// rustls config and the platform verifier — and then, given a target and no
+/// proxy, runs one TLS handshake against it.
+///
+/// The handshake is the load-bearing half on Android: the platform
+/// verifier's *first* verification initializes conscrypt and loads the
+/// system trust store over JNI — the bulk of the measured ~1 s first-request
+/// cost, part process-global and part per-verifier-instance. The probe
+/// therefore handshakes through the cached client's own `ClientConfig`
+/// (see [`SharedTcpClient`]), so both layers are paid here and the client's
+/// first real handshake finds a warm verifier and a resumable TLS session.
+/// No HTTP bytes are ever written — the probe completes the handshake, sends
+/// close_notify and hangs up, so the server sees a connection but never a
+/// request, and nothing caller-visible happens on either side.
+///
+/// The probe socket is discarded rather than pooled: reqwest has no way to
+/// adopt a foreign connection, so the first real request still performs its
+/// own (now cheap, likely resumed) handshake.
+///
+/// ponytail: with a proxy configured the probe is skipped — a CONNECT tunnel
+/// dance isn't worth building for a best-effort path; client construction
+/// still runs.
+pub(crate) fn warmup(client: &VaneClient, url: Option<&Url>) -> Result<(), VaneError> {
+    // One critical section builds (or reuses) the cached client and clones
+    // its TLS config — Arc-backed, so this IS the client's verifier and
+    // session cache, not a copy. Same lock order as `shared_client`.
+    let tls = {
+        let mut cached = client
+            .tcp_client
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if cached.is_none() {
+            let certificate_pins = client.certificate_pins_snapshot()?;
+            *cached = Some(build_client(client, certificate_pins)?);
+        }
+        let entry = cached.as_ref().expect("cached TCP client was just built");
+        entry.tls.clone()
+    };
+    let Some(url) = url else { return Ok(()) };
+    if client.config.proxy_url.is_some() {
+        return Ok(());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| VaneError::InvalidRequest("URL is missing host".to_string()))?;
+    let peer_addr = resolve_peer_addr(
+        host,
+        url.port_or_known_default().unwrap_or(443),
+        &client.config.dns_overrides,
+    )?;
+    let timeout = Duration::from_secs(client.config.timeout_seconds.unwrap_or(30));
+    let deadline = Instant::now() + timeout;
+
+    let server_name = ServerName::try_from(host.to_string())
+        .map_err(|e| VaneError::InvalidRequest(format!("Invalid TLS server name {host}: {e}")))?;
+    let mut conn = rustls::ClientConnection::new(Arc::new(tls), server_name)
+        .map_err(|e| VaneError::Tls(format!("Failed to start warmup TLS handshake: {e}")))?;
+
+    let mut stream = std::net::TcpStream::connect_timeout(&peer_addr, timeout)
+        .map_err(classify_warmup_io_error)?;
+    while conn.is_handshaking() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(VaneError::ConnectTimeout(
+                "Warmup TLS handshake timed out".to_string(),
+            ));
+        }
+        // Re-armed per step so the whole handshake — not each blocking
+        // syscall — is bounded by the one deadline.
+        stream
+            .set_read_timeout(Some(remaining))
+            .and_then(|()| stream.set_write_timeout(Some(remaining)))
+            .map_err(classify_warmup_io_error)?;
+        conn.complete_io(&mut stream).map_err(|e| {
+            // rustls reports TLS failures — including a refused certificate or
+            // a pin mismatch — through io::Error too, so split on the kinds
+            // the socket timeouts produce.
+            if matches!(
+                e.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) {
+                VaneError::ConnectTimeout(format!("Warmup TLS handshake timed out: {e}"))
+            } else {
+                VaneError::Tls(format!("Warmup TLS handshake failed: {e}"))
+            }
+        })?;
+    }
+    // The handshake alone leaves nothing to resume: the server's TLS 1.3
+    // NewSessionTickets arrive one round trip AFTER the client Finished, so
+    // wait briefly and read them into the shared session cache. That is what
+    // lets the client's first real handshake resume — and a resumed
+    // handshake carries no certificate, which on Android skips the
+    // platform verifier's per-verification JNI cost (~350–400 ms per full
+    // handshake on the emulator benchmark; the verifier re-runs PKIX
+    // building and revocation per call, so a warm verifier alone does not
+    // help).
+    //
+    // Two bounded reads: the first waits for the ticket flight, the second
+    // briefly sweeps for the rest of it in case the flight crossed a TCP
+    // segment boundary and the first read caught only part of a ticket. One
+    // whole ticket is all resumption needs. A server that sends none costs
+    // the cap once and nothing else; failures are ignored because the
+    // handshake already succeeded and its other value (warm trust store,
+    // warm DNS) is banked. (Resumption remains the server's call — a
+    // declined ticket just means the first request runs a full handshake.)
+    let ticket_wait = deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_millis(750));
+    for wait in [ticket_wait, Duration::from_millis(100)] {
+        let wait = wait.min(deadline.saturating_duration_since(Instant::now()));
+        if wait.is_zero() || stream.set_read_timeout(Some(wait)).is_err() {
+            break;
+        }
+        match conn.read_tls(&mut stream) {
+            Ok(read) if read > 0 => {
+                conn.process_new_packets().ok();
+            }
+            _ => break,
+        }
+    }
+    conn.send_close_notify();
+    // Best-effort flush of the close alert; the handshake already succeeded.
+    conn.complete_io(&mut stream).ok();
+    Ok(())
+}
+
+fn classify_warmup_io_error(error: io::Error) -> VaneError {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    ) {
+        VaneError::ConnectTimeout(format!("Warmup connection timed out: {error}"))
+    } else {
+        VaneError::Transport(format!("Warmup connection failed: {error}"))
+    }
 }
 
 /// Builds the header map for one hop. `origin` is the origin the caller

@@ -775,3 +775,108 @@ mod response_metadata {
         assert_eq!(response.http_version, Some(VaneHttpVersion::Http10));
     }
 }
+
+/// `VaneClient::warmup` on the TCP transport: client construction, the TLS
+/// probe, and the best-effort failure contract.
+mod warmup {
+    use super::*;
+
+    const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+    /// End to end over the real transport: warmup builds and caches the
+    /// client, handshakes against a live listener without sending a request,
+    /// repeats cheaply, and leaves the client fully usable.
+    #[test]
+    fn warmup_builds_the_client_probes_the_target_and_repeats() {
+        let (port, ca) = raw_http_server(&[("/", OK)]);
+        let _guard = with_test_root(ca);
+
+        let client = client_with(VaneClientConfig {
+            base_url: Some(format!("https://localhost:{port}")),
+            protocol_mode: VaneProtocolMode::Http1Only,
+            timeout_seconds: Some(10),
+            // The probe resolves one address; the resolver may prefer ::1
+            // while the test server listens on 127.0.0.1 only. Same pinning
+            // the h3_offline tests use.
+            dns_overrides: HashMap::from([("localhost".to_string(), "127.0.0.1".to_string())]),
+            ..VaneClientConfig::default()
+        });
+
+        assert!(client.tcp_client.lock().unwrap().is_none());
+        client
+            .warmup_inner(None)
+            .expect("warmup against a live local server");
+        assert!(
+            client.tcp_client.lock().unwrap().is_some(),
+            "warmup should have built and cached the TCP client"
+        );
+        // Idempotent: the second call reuses the cached client and stays Ok.
+        client.warmup_inner(None).expect("repeat warmup");
+
+        // The warmed client serves a real request.
+        let response = client.execute(crate::test_request("/")).unwrap();
+        assert_eq!(response.status_code, 200);
+    }
+
+    /// No URL and no baseUrl: construction still happens — that is most of
+    /// the win — and nothing is dialed.
+    #[test]
+    fn warmup_without_a_target_only_builds_the_client() {
+        // Never contacted; exists so a per-run CA is installed and the client
+        // build stays hermetic under TEST_ROOT.
+        let (_port, ca) = raw_http_server(&[]);
+        let _guard = with_test_root(ca);
+
+        let client = client_with(VaneClientConfig {
+            protocol_mode: VaneProtocolMode::Http2Only,
+            ..VaneClientConfig::default()
+        });
+
+        client.warmup_inner(None).expect("construction-only warmup");
+        assert!(client.tcp_client.lock().unwrap().is_some());
+    }
+
+    /// A dead target fails the probe but must leave the built client cached;
+    /// the public wrapper swallows the failure entirely, because the first
+    /// real request reports the same problem with a better message.
+    #[test]
+    fn a_failed_probe_reports_but_keeps_the_built_client() {
+        let (_port, ca) = raw_http_server(&[]);
+        let _guard = with_test_root(ca);
+
+        // Accepts and immediately hangs up, so the TLS handshake can never
+        // complete.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                drop(stream);
+            }
+        });
+
+        let client = client_with(VaneClientConfig {
+            base_url: Some(format!("https://localhost:{dead_port}")),
+            protocol_mode: VaneProtocolMode::Http1Only,
+            timeout_seconds: Some(5),
+            // Pin the probe onto the dropping listener rather than whatever
+            // the resolver prefers for localhost.
+            dns_overrides: HashMap::from([("localhost".to_string(), "127.0.0.1".to_string())]),
+            ..VaneClientConfig::default()
+        });
+
+        let err = client.warmup_inner(None).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VaneError::Tls(_) | VaneError::Transport(_) | VaneError::ConnectTimeout(_)
+            ),
+            "{err:?}"
+        );
+        assert!(
+            client.tcp_client.lock().unwrap().is_some(),
+            "construction must survive a failed probe"
+        );
+        // The public API swallows exactly this class of failure.
+        client.warmup(None);
+    }
+}
