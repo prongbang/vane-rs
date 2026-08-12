@@ -2349,7 +2349,10 @@ fn resume_tls_session(
     }
 }
 
-/// The pinned-host gate described on [`resume_tls_session`].
+/// The pinned-host gate described on [`resume_tls_session`]. The TCP
+/// transport enforces the same rule through its rustls session store and
+/// consults this in `warmup`, so both transports agree on what "pinned"
+/// means for resumption.
 fn may_resume_tls_session(host: &str, certificate_pins: &HashMap<String, Vec<String>>) -> bool {
     certificate_pins
         .get(host)

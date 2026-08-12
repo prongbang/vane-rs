@@ -15,9 +15,13 @@ fn client_with(config: VaneClientConfig) -> VaneClient {
 type TlsStream = rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>;
 
 /// A localhost TLS listener with a per-run CA, so a test can drive the real
-/// TCP transport against a hand-written HTTP response. Returns the port and
-/// the CA DER the caller must install in `TEST_ROOT`.
-fn local_tls_server<F>(alpn: &[u8], handle: F) -> (u16, CertificateDer<'static>)
+/// TCP transport against a hand-written HTTP response. Returns the port, the
+/// CA DER the caller must install in `TEST_ROOT`, and the leaf DER so a test
+/// can compute a pin that matches what the server presents.
+fn local_tls_server<F>(
+    alpn: &[u8],
+    handle: F,
+) -> (u16, CertificateDer<'static>, CertificateDer<'static>)
 where
     F: Fn(TlsStream) + Send + Sync + 'static,
 {
@@ -35,6 +39,7 @@ where
     let leaf_key = KeyPair::generate().unwrap();
     let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
     let leaf_der = leaf.der().clone();
+    let leaf_for_pins = leaf_der.clone();
     let leaf_pkcs8 = PrivateKeyDer::try_from(leaf_key.serialize_der()).unwrap();
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -63,7 +68,7 @@ where
             });
         }
     });
-    (port, ca_der)
+    (port, ca_der, leaf_for_pins)
 }
 
 /// Answers each request with a raw response picked by path, so a test can
@@ -72,7 +77,7 @@ where
 fn raw_http_server(
     routes: &'static [(&'static str, &'static str)],
 ) -> (u16, CertificateDer<'static>) {
-    local_tls_server(b"http/1.1", move |mut tls| {
+    let (port, ca, _leaf) = local_tls_server(b"http/1.1", move |mut tls| {
         let mut buf = [0u8; 8192];
         let mut pending = Vec::new();
         loop {
@@ -99,7 +104,8 @@ fn raw_http_server(
                 std::io::Write::flush(&mut tls).ok();
             }
         }
-    })
+    });
+    (port, ca)
 }
 
 /// Installs `ca` as the process-wide trust anchor for the duration of the
@@ -579,7 +585,7 @@ mod pool_checkout_race {
 
     #[test]
     fn a_stale_pooled_connection_is_retried_rather_than_failing_the_request() {
-        let (port, ca) = local_tls_server(b"http/1.1", serve);
+        let (port, ca, _leaf) = local_tls_server(b"http/1.1", serve);
         // Serialized against the other tests that build a TCP client, since the
         // trust anchor and the client cache are process-wide.
         let _guard = with_test_root(ca);
@@ -878,5 +884,165 @@ mod warmup {
         );
         // The public API swallows exactly this class of failure.
         client.warmup(None);
+    }
+}
+
+/// The never-resume-pinned-hosts rule on the TCP transport, mirroring the
+/// HTTP/3 gate (`may_resume_tls_session`): a resumed TLS handshake carries no
+/// Certificate message — rustls restores the chain cached when the ticket was
+/// stored and never calls `verify_server_cert` — so the only connection shape
+/// on which `PinnedServerCertVerifier` runs at all is a full handshake.
+///
+/// The server records each connection's `HandshakeKind`; `Full` is the
+/// observable proof the verifier ran (a full handshake cannot complete
+/// without it), `Resumed` the proof it was skipped.
+mod resumption {
+    use super::*;
+    use rustls::HandshakeKind;
+
+    const OK_CLOSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+    type Kinds = Arc<std::sync::Mutex<Vec<Option<HandshakeKind>>>>;
+
+    /// [`local_tls_server`] with each connection's handshake kind recorded.
+    /// Records land in handshake order: the handshake is driven to completion
+    /// before serving, and these tests issue requests strictly sequentially.
+    fn recording_server() -> (u16, CertificateDer<'static>, CertificateDer<'static>, Kinds) {
+        let kinds: Kinds = Arc::default();
+        let record = kinds.clone();
+        let (port, ca, leaf) = local_tls_server(b"http/1.1", move |mut tls| {
+            while tls.conn.is_handshaking() {
+                if tls.conn.complete_io(&mut tls.sock).is_err() {
+                    return;
+                }
+            }
+            record.lock().unwrap().push(tls.conn.handshake_kind());
+            // One scripted response, `Connection: close`, so every request
+            // below costs exactly one handshake. A warmup probe never sends a
+            // request; its close_notify lands here as EOF.
+            let mut buf = [0u8; 8192];
+            let mut pending = Vec::new();
+            loop {
+                match std::io::Read::read(&mut tls, &mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => pending.extend_from_slice(&buf[..read]),
+                }
+                if pending.windows(4).any(|window| window == b"\r\n\r\n") {
+                    std::io::Write::write_all(&mut tls, OK_CLOSE.as_bytes()).ok();
+                    std::io::Write::flush(&mut tls).ok();
+                    return;
+                }
+            }
+        });
+        (port, ca, leaf, kinds)
+    }
+
+    /// Pool off, so every request handshakes rather than reusing a pooled
+    /// connection; the server's `Connection: close` makes the peer agree.
+    fn fresh_handshake_client(
+        port: u16,
+        certificate_pins: HashMap<String, Vec<String>>,
+    ) -> VaneClient {
+        client_with(VaneClientConfig {
+            base_url: Some(format!("https://localhost:{port}")),
+            protocol_mode: VaneProtocolMode::Http1Only,
+            timeout_seconds: Some(10),
+            connection_pool_enabled: false,
+            // Same pinning as the warmup tests: the resolver may prefer ::1
+            // while the server listens on 127.0.0.1 only.
+            dns_overrides: HashMap::from([("localhost".to_string(), "127.0.0.1".to_string())]),
+            certificate_pins,
+            ..VaneClientConfig::default()
+        })
+    }
+
+    fn recorded(kinds: &Kinds) -> Vec<Option<HandshakeKind>> {
+        kinds.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn a_pinned_host_never_resumes_while_an_unpinned_host_does() {
+        let (port, ca, leaf, kinds) = recording_server();
+        let _guard = with_test_root(ca);
+
+        // Unpinned: the second connection must keep resuming — the gate is
+        // per-host, not client-wide.
+        let unpinned = fresh_handshake_client(port, HashMap::new());
+        unpinned.execute(crate::test_request("/")).unwrap();
+        unpinned.execute(crate::test_request("/")).unwrap();
+        assert_eq!(
+            recorded(&kinds),
+            vec![Some(HandshakeKind::Full), Some(HandshakeKind::Resumed)],
+            "an unpinned host stopped resuming — the pinned-host gate overshot"
+        );
+
+        // Pinned, with a pin that MATCHES the presented leaf so every full
+        // handshake succeeds: each connection must be a full handshake, since
+        // a resumed one would never consult the verifier the pin lives in.
+        let pinned = fresh_handshake_client(
+            port,
+            HashMap::from([("localhost".to_string(), certificate_pin_values(&leaf))]),
+        );
+        pinned.execute(crate::test_request("/")).unwrap();
+        pinned.execute(crate::test_request("/")).unwrap();
+        assert_eq!(
+            recorded(&kinds)[2..],
+            [Some(HandshakeKind::Full), Some(HandshakeKind::Full)],
+            "a pinned host resumed a TLS session, so its pin was never checked"
+        );
+    }
+
+    #[test]
+    fn pins_added_after_tickets_exist_invalidate_them() {
+        let (port, ca, leaf, kinds) = recording_server();
+        let _guard = with_test_root(ca);
+
+        // Unpinned first contact banks the server's session tickets.
+        let client = fresh_handshake_client(port, HashMap::new());
+        client.execute(crate::test_request("/")).unwrap();
+
+        // Pinning the host must strand those tickets: they were stored under
+        // the old trust context, and resuming from one would skip the
+        // certificate exchange the new pin needs to be checked against.
+        client
+            .set_certificate_pins("localhost".to_string(), certificate_pin_values(&leaf))
+            .unwrap();
+        client.execute(crate::test_request("/")).unwrap();
+        assert_eq!(
+            recorded(&kinds),
+            vec![Some(HandshakeKind::Full), Some(HandshakeKind::Full)],
+            "a ticket banked before the host was pinned was resumed after"
+        );
+    }
+
+    #[test]
+    fn warmup_primes_resumption_for_unpinned_hosts_only() {
+        let (port, ca, leaf, kinds) = recording_server();
+        let _guard = with_test_root(ca);
+
+        // Unpinned: the probe's session is exactly what the first real
+        // request resumes — warmup's banked value, kept working.
+        let unpinned = fresh_handshake_client(port, HashMap::new());
+        unpinned.warmup_inner(None).unwrap();
+        unpinned.execute(crate::test_request("/")).unwrap();
+        assert_eq!(
+            recorded(&kinds),
+            vec![Some(HandshakeKind::Full), Some(HandshakeKind::Resumed)],
+            "warmup no longer primes resumption for an unpinned host"
+        );
+
+        // Pinned: the probe still runs — warm verifier, warm DNS, and an
+        // early pin check — but must not bank a resumable session.
+        let pinned = fresh_handshake_client(
+            port,
+            HashMap::from([("localhost".to_string(), certificate_pin_values(&leaf))]),
+        );
+        pinned.warmup_inner(None).unwrap();
+        pinned.execute(crate::test_request("/")).unwrap();
+        assert_eq!(
+            recorded(&kinds)[2..],
+            [Some(HandshakeKind::Full), Some(HandshakeKind::Full)],
+            "warmup primed a resumable TLS session for a pinned host"
+        );
     }
 }

@@ -6,7 +6,7 @@
 //! — is the same machinery the HTTP/3 path uses, so the two transports are
 //! interchangeable from the caller's side.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::AtomicBool;
@@ -19,16 +19,20 @@ use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::redirect;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::{
+    ClientSessionMemoryCache, ClientSessionStore, Resumption, Tls12ClientSessionValue,
+    Tls13ClientSessionValue,
+};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls::{ClientConfig, DigitallySignedStruct, NamedGroup, SignatureScheme};
 
 use super::{
     H3_BODY_BUFFER_BYTES, REDIRECT_REFUSED_CROSS_ORIGIN_BODY, REDIRECT_REFUSED_HEADER,
     RedirectDecision, RedirectRewrite, ResponseState, Url, VaneClient, VaneError, VaneHttpVersion,
     VaneProgressState, VaneProtocolMode, VaneRequest, VaneResponse, cancel_token, check_cancelled,
-    for_each_regular_header, header_survives_origin_change, next_redirect_url, origin_port,
-    progress_download, progress_init, progress_upload, redact_url_userinfo, redirect_rewrite,
-    resolve_peer_addr, verify_certificate_pins,
+    for_each_regular_header, header_survives_origin_change, may_resume_tls_session,
+    next_redirect_url, origin_port, progress_download, progress_init, progress_upload,
+    redact_url_userinfo, redirect_rewrite, resolve_peer_addr, verify_certificate_pins,
 };
 
 /// Wraps the platform's own certificate verifier and adds Vane's host-scoped
@@ -116,6 +120,95 @@ fn pin_lookup_host(server_name: &ServerName<'_>) -> Option<String> {
             IpAddr::V6(address) => format!("[{address}]"),
         }),
         _ => None,
+    }
+}
+
+/// The TCP spelling of the HTTP/3 rule in [`super::may_resume_tls_session`]:
+/// a pinned host never stores or offers a TLS session.
+///
+/// A resumed handshake — TLS 1.3 PSK or TLS 1.2 abbreviated — carries no
+/// Certificate message; rustls restores the chain cached when the session was
+/// stored and never calls [`PinnedServerCertVerifier::verify_server_cert`],
+/// so a resumed connection to a pinned host would complete with no pin check
+/// at all. Gated per host, so pins on one host cost no resumption anywhere
+/// else.
+///
+/// Both directions are refused for a pinned host: never offering alone would
+/// leave tickets banked for a future code path to misuse, and never storing
+/// alone would trust nothing else ever writing to the cache.
+///
+/// The pin set is a snapshot with exactly the verifier's lifetime —
+/// `set_certificate_pins` rebuilds the whole TCP client (dropping this store
+/// and any tickets in it), so the store and the verifier can never disagree
+/// about which hosts are pinned.
+#[derive(Debug)]
+struct PinAwareSessionStore {
+    inner: ClientSessionMemoryCache,
+    /// Hosts with at least one pin, spelled the way [`pin_lookup_host`]
+    /// spells them.
+    pinned_hosts: HashSet<String>,
+}
+
+impl PinAwareSessionStore {
+    fn may_resume(&self, server_name: &ServerName<'_>) -> bool {
+        if self.pinned_hosts.is_empty() {
+            return true;
+        }
+        // Fail closed, exactly like the verifier: a name shape we cannot
+        // spell cannot be looked up, and this client has pins configured.
+        match pin_lookup_host(server_name) {
+            Some(host) => !self.pinned_hosts.contains(&host),
+            None => false,
+        }
+    }
+}
+
+impl ClientSessionStore for PinAwareSessionStore {
+    // Key-exchange hints carry no trust — only a round trip saved on the next
+    // full handshake — so pinned hosts keep them.
+    fn set_kx_hint(&self, server_name: ServerName<'static>, group: NamedGroup) {
+        self.inner.set_kx_hint(server_name, group);
+    }
+
+    fn kx_hint(&self, server_name: &ServerName<'_>) -> Option<NamedGroup> {
+        self.inner.kx_hint(server_name)
+    }
+
+    fn set_tls12_session(&self, server_name: ServerName<'static>, value: Tls12ClientSessionValue) {
+        if self.may_resume(&server_name) {
+            self.inner.set_tls12_session(server_name, value);
+        }
+    }
+
+    fn tls12_session(&self, server_name: &ServerName<'_>) -> Option<Tls12ClientSessionValue> {
+        if !self.may_resume(server_name) {
+            return None;
+        }
+        self.inner.tls12_session(server_name)
+    }
+
+    fn remove_tls12_session(&self, server_name: &ServerName<'static>) {
+        self.inner.remove_tls12_session(server_name);
+    }
+
+    fn insert_tls13_ticket(
+        &self,
+        server_name: ServerName<'static>,
+        value: Tls13ClientSessionValue,
+    ) {
+        if self.may_resume(&server_name) {
+            self.inner.insert_tls13_ticket(server_name, value);
+        }
+    }
+
+    fn take_tls13_ticket(
+        &self,
+        server_name: &ServerName<'static>,
+    ) -> Option<Tls13ClientSessionValue> {
+        if !self.may_resume(server_name) {
+            return None;
+        }
+        self.inner.take_tls13_ticket(server_name)
     }
 }
 
@@ -268,6 +361,14 @@ fn tls_config(
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let inner = inner_verifier(&provider)?;
 
+    // Lowercased like every pin lookup; an entry that only differs by case
+    // still marks the host pinned here, which errs toward a full handshake.
+    let pinned_hosts = certificate_pins
+        .iter()
+        .filter(|(_, pins)| !pins.is_empty())
+        .map(|(host, _)| host.to_ascii_lowercase())
+        .collect();
+
     // `with_safe_default_protocol_versions` is TLS 1.2 + 1.3.
     let mut config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -278,6 +379,16 @@ fn tls_config(
             certificate_pins,
         }))
         .with_no_client_auth();
+
+    // rustls's default resumption would happily resume a pinned host, and a
+    // resumed handshake never reaches the verifier installed above. The
+    // 256-entry cache matches the default this replaces; 0-RTT stays off
+    // (rustls clients never send early data unless `enable_early_data` is
+    // set, and it is not).
+    config.resumption = Resumption::store(Arc::new(PinAwareSessionStore {
+        inner: ClientSessionMemoryCache::new(256),
+        pinned_hosts,
+    }));
 
     // reqwest only fills these in on its own TLS path; a preconfigured config
     // is passed through untouched, so without this nothing offers ALPN, HTTP/2
@@ -346,8 +457,10 @@ fn inner_verifier(
 /// (measured: a probe through a separate verifier left ~380 ms in the first
 /// real request; the matrix benchmark's second in-process TCP client shows
 /// the same per-instance cost). Sharing the config also shares the TLS
-/// session cache, so the first real connection can resume the probe's
-/// session instead of running a full handshake.
+/// session cache, so for an unpinned host the first real connection can
+/// resume the probe's session instead of running a full handshake. A pinned
+/// host never resumes (see [`PinAwareSessionStore`]); its probe still buys
+/// the warm verifier and an early pin check.
 #[derive(Debug)]
 pub(crate) struct SharedTcpClient {
     http: Client,
@@ -463,7 +576,8 @@ fn shared_client(client: &VaneClient) -> Result<(Client, HashMap<String, Vec<Str
 /// cost, part process-global and part per-verifier-instance. The probe
 /// therefore handshakes through the cached client's own `ClientConfig`
 /// (see [`SharedTcpClient`]), so both layers are paid here and the client's
-/// first real handshake finds a warm verifier and a resumable TLS session.
+/// first real handshake finds a warm verifier and — for an unpinned host —
+/// a resumable TLS session.
 /// No HTTP bytes are ever written — the probe completes the handshake, sends
 /// close_notify and hangs up, so the server sees a connection but never a
 /// request, and nothing caller-visible happens on either side.
@@ -478,18 +592,20 @@ fn shared_client(client: &VaneClient) -> Result<(Client, HashMap<String, Vec<Str
 pub(crate) fn warmup(client: &VaneClient, url: Option<&Url>) -> Result<(), VaneError> {
     // One critical section builds (or reuses) the cached client and clones
     // its TLS config — Arc-backed, so this IS the client's verifier and
-    // session cache, not a copy. Same lock order as `shared_client`.
-    let tls = {
+    // session cache, not a copy. Same lock order as `shared_client`, and the
+    // pins are read inside it, so they are exactly the set the cached
+    // client's verifier and session store were built with.
+    let (tls, certificate_pins) = {
         let mut cached = client
             .tcp_client
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        let certificate_pins = client.certificate_pins_snapshot()?;
         if cached.is_none() {
-            let certificate_pins = client.certificate_pins_snapshot()?;
-            *cached = Some(build_client(client, certificate_pins)?);
+            *cached = Some(build_client(client, certificate_pins.clone())?);
         }
         let entry = cached.as_ref().expect("cached TCP client was just built");
-        entry.tls.clone()
+        (entry.tls.clone(), certificate_pins)
     };
     let Some(url) = url else { return Ok(()) };
     if client.config.proxy_url.is_some() {
@@ -558,19 +674,27 @@ pub(crate) fn warmup(client: &VaneClient, url: Option<&Url>) -> Result<(), VaneE
     // handshake already succeeded and its other value (warm trust store,
     // warm DNS) is banked. (Resumption remains the server's call — a
     // declined ticket just means the first request runs a full handshake.)
-    let ticket_wait = deadline
-        .saturating_duration_since(Instant::now())
-        .min(Duration::from_millis(750));
-    for wait in [ticket_wait, Duration::from_millis(100)] {
-        let wait = wait.min(deadline.saturating_duration_since(Instant::now()));
-        if wait.is_zero() || stream.set_read_timeout(Some(wait)).is_err() {
-            break;
-        }
-        match conn.read_tls(&mut stream) {
-            Ok(read) if read > 0 => {
-                conn.process_new_packets().ok();
+    //
+    // A pinned host is skipped: its tickets are exactly the ones
+    // `PinAwareSessionStore` refuses to bank — a pinned host never resumes —
+    // so waiting for them would spend up to ~850 ms collecting bytes that get
+    // dropped. The probe's full handshake above already delivered the pinned
+    // host's whole value: warm verifier, warm DNS, early pin check.
+    if may_resume_tls_session(host, &certificate_pins) {
+        let ticket_wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(750));
+        for wait in [ticket_wait, Duration::from_millis(100)] {
+            let wait = wait.min(deadline.saturating_duration_since(Instant::now()));
+            if wait.is_zero() || stream.set_read_timeout(Some(wait)).is_err() {
+                break;
             }
-            _ => break,
+            match conn.read_tls(&mut stream) {
+                Ok(read) if read > 0 => {
+                    conn.process_new_packets().ok();
+                }
+                _ => break,
+            }
         }
     }
     conn.send_close_notify();
