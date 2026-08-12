@@ -18,12 +18,14 @@ keeps certificate DER pins (`sha256-cert/<base64>`).
 HTTP/1.0 and dynamic DNS callback resolvers are explicitly unsupported in the
 first production candidate. Static custom DNS overrides are available for
 routing a hostname to a specific IP while preserving the original hostname for
-SNI, authority, and certificate verification. HTTP/3 proxying is supported
-through HTTPS MASQUE/CONNECT-UDP proxies. Certificate pinning is available as
-opt-in host-scoped pins for the HTTP/3 backend.
-Optional retry policy, HTTP/3 connection pooling, and in-memory cookies are
-available behind explicit configuration. Remaining production work is tracked
-in the repository root `PLAN.md`.
+SNI, authority, and certificate verification. Proxying is supported per
+transport from one `proxy_url`: HTTPS MASQUE/CONNECT-UDP over HTTP/3, HTTP
+CONNECT over the TCP fallback. Certificate pinning is available as opt-in
+host-scoped pins on both transports, and a pinned host never resumes a TLS
+session, so a cached certificate chain can never stand in for a checked one.
+Optional retry policy, connection pooling on both transports, and in-memory
+cookies are available behind explicit configuration. Remaining work is tracked
+in the repository root `PERFORMANCE_PLAN.md`.
 
 ---
 
