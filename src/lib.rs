@@ -800,17 +800,7 @@ impl VaneClient {
 
     pub fn execute(&self, request: VaneRequest) -> Result<VaneResponse, VaneError> {
         let url = self.build_url(&request)?;
-        // Without the TCP backend these modes cannot work, so fail before
-        // touching the request body file.
-        #[cfg(not(feature = "tcp-fallback"))]
-        if matches!(
-            self.config.protocol_mode,
-            VaneProtocolMode::Http2ThenHttp1
-                | VaneProtocolMode::Http2Only
-                | VaneProtocolMode::Http1Only
-        ) {
-            return Err(unsupported_tcp_backend_error());
-        }
+        self.reject_unsupported_protocol_mode()?;
         // Loaded once for every attempt on every transport: neither a retry nor
         // a fallback may re-read the body file (it can change underneath us) or
         // re-copy an in-memory body.
@@ -829,16 +819,108 @@ impl VaneClient {
         result
     }
 
+    /// Like [`Self::execute`], but returns as soon as the final response's
+    /// headers are in, leaving the body to be pulled incrementally from the
+    /// returned [`VaneResponseStream`].
+    ///
+    /// Everything up to the headers behaves exactly like `execute`: the same
+    /// redirect chain (intermediate 3xx bodies are drained internally), the
+    /// same retry policy and HTTP/3-to-TCP fallback (both apply only until
+    /// headers are delivered — a stream, once returned, is never silently
+    /// replayed), the same cookie and pin handling, and the shared deadline
+    /// for reaching the headers. The response body limit still applies,
+    /// cumulatively across chunks. `response_body_path` is refused: the
+    /// stream replaces the file escape hatch.
+    ///
+    /// Takes `self: Arc<Self>` because the stream keeps the client alive to
+    /// return its connection to the pool when the body is drained.
+    pub fn execute_streaming(
+        self: Arc<Self>,
+        request: VaneRequest,
+    ) -> Result<VaneResponseStream, VaneError> {
+        let result = Self::execute_streaming_inner(&self, &request);
+        if result.is_err() {
+            // Parity with `execute`: a request that failed before its stream
+            // existed is over. A live stream instead latches `done` when it
+            // terminates — that is when the transfer actually ends.
+            progress_done(progress_handle(request.progress_id).as_deref());
+        }
+        result
+    }
+
+    fn execute_streaming_inner(
+        this: &Arc<Self>,
+        request: &VaneRequest,
+    ) -> Result<VaneResponseStream, VaneError> {
+        if request
+            .response_body_path
+            .as_deref()
+            .is_some_and(|path| !path.is_empty())
+        {
+            return Err(VaneError::InvalidRequest(
+                "responseBodyPath cannot be combined with a streaming request; \
+                 read the stream instead"
+                    .to_string(),
+            ));
+        }
+        let url = this.build_url(request)?;
+        this.reject_unsupported_protocol_mode()?;
+        let request_body = load_request_body(request, this.config.max_request_body_bytes)?;
+        validate_request_body_limit(
+            request_body.len() as u64,
+            this.config.max_request_body_bytes,
+        )?;
+        let body = request_body.as_ref();
+
+        this.dispatch_via(
+            request,
+            || Self::execute_http3_streaming(this, request, &url, body),
+            || this.execute_tcp_streaming(request, &url, body),
+        )
+    }
+
+    /// Without the TCP backend the TCP-only modes cannot work; fail before
+    /// touching the request body file.
+    fn reject_unsupported_protocol_mode(&self) -> Result<(), VaneError> {
+        #[cfg(not(feature = "tcp-fallback"))]
+        if matches!(
+            self.config.protocol_mode,
+            VaneProtocolMode::Http2ThenHttp1
+                | VaneProtocolMode::Http2Only
+                | VaneProtocolMode::Http1Only
+        ) {
+            return Err(unsupported_tcp_backend_error());
+        }
+        Ok(())
+    }
+
     fn dispatch(
         &self,
         request: &VaneRequest,
         url: &Url,
         body: &[u8],
     ) -> Result<VaneResponse, VaneError> {
+        self.dispatch_via(
+            request,
+            || self.execute_http3(request, url, body),
+            || self.execute_tcp(request, url, body),
+        )
+    }
+
+    /// The protocol-mode routing and HTTP/3-to-TCP fallback rules, shared by
+    /// the buffered and streaming entry points so the two can never disagree
+    /// about when a fallback is safe. The closures run one full transport
+    /// attempt each (retry policy included).
+    fn dispatch_via<R>(
+        &self,
+        request: &VaneRequest,
+        http3: impl Fn() -> Result<R, VaneError>,
+        tcp: impl Fn() -> Result<R, VaneError>,
+    ) -> Result<R, VaneError> {
         match self.config.protocol_mode {
-            VaneProtocolMode::Http3Only => self.execute_http3(request, url, body),
+            VaneProtocolMode::Http3Only => http3(),
             VaneProtocolMode::Http3ThenHttp2ThenHttp1 => {
-                let http3 = self.execute_http3(request, url, body);
+                let http3 = http3();
                 // Only a transport failure falls through: an HTTP status is a
                 // successful exchange, and a cancelled request must stay
                 // cancelled rather than being replayed over TCP.
@@ -874,7 +956,7 @@ impl VaneClient {
                         {
                             return Err(err);
                         }
-                        self.execute_tcp(request, url, body).map_err(|tcp_err| {
+                        tcp().map_err(|tcp_err| {
                             // Both transports failed: reporting only one of
                             // them sends whoever debugs this down the wrong
                             // path. The kind kept is the TCP one — that is the
@@ -890,7 +972,7 @@ impl VaneClient {
             }
             VaneProtocolMode::Http2ThenHttp1
             | VaneProtocolMode::Http2Only
-            | VaneProtocolMode::Http1Only => self.execute_tcp(request, url, body),
+            | VaneProtocolMode::Http1Only => tcp(),
         }
     }
 
@@ -955,6 +1037,68 @@ impl VaneClient {
         })
     }
 
+    /// Streaming twin of [`Self::execute_http3`]: the same retry policy over
+    /// streaming attempts. A retried attempt's stream is dropped, which tears
+    /// its connection down; nothing of its body was ever handed out.
+    fn execute_http3_streaming(
+        this: &Arc<Self>,
+        request: &VaneRequest,
+        url: &Url,
+        body: &[u8],
+    ) -> Result<VaneResponseStream, VaneError> {
+        this.execute_with_retry(request, || {
+            Self::follow_http3_redirects_streaming(this, request, url, body)
+        })
+    }
+
+    /// Streaming twin of [`Self::follow_http3_redirects`]: the identical chain
+    /// (same [`RedirectChain`], same deadline, same refusal rules) over
+    /// streaming hops. Only the hop the gate declares final becomes the public
+    /// stream; every intermediate is drained and dropped inside the chain.
+    fn follow_http3_redirects_streaming(
+        this: &Arc<Self>,
+        request: &VaneRequest,
+        url: &Url,
+        request_body: &[u8],
+    ) -> Result<VaneResponseStream, VaneError> {
+        let timeout = Duration::from_secs(
+            request
+                .timeout_seconds
+                .or(this.config.timeout_seconds)
+                .unwrap_or(30),
+        );
+        let cancel_token = cancel_token(request.cancel_token_id);
+        let progress = progress_init(request.progress_id, request_body.len() as u64);
+        let certificate_pins = this.certificate_pins_snapshot()?;
+
+        let hop_result = RedirectChain {
+            request,
+            certificate_pins: &certificate_pins,
+            cancel_token: cancel_token.as_deref(),
+            progress: progress.as_deref(),
+            timeouts: HopTimeouts {
+                // One deadline bounds the whole chain up to the final
+                // headers, exactly as it bounds the buffered chain. The body
+                // is then paced by the caller: each pull gets the configured
+                // timeout as its inactivity budget instead.
+                deadline: Instant::now() + timeout,
+                idle: timeout,
+            },
+        }
+        .run(url, request_body, |hop| {
+            this.execute_http3_hop(
+                request,
+                hop,
+                &certificate_pins,
+                cancel_token.as_deref(),
+                progress.as_deref(),
+                H3HopMode::Streaming { client: this },
+            )?
+            .expect_stream()
+        })?;
+        Ok(hop_result.into_stream(cancel_token, progress))
+    }
+
     #[cfg(feature = "tcp-fallback")]
     fn tcp_fallback_enabled(&self) -> bool {
         true
@@ -982,6 +1126,28 @@ impl VaneClient {
         _url: &Url,
         _body: &[u8],
     ) -> Result<VaneResponse, VaneError> {
+        Err(unsupported_tcp_backend_error())
+    }
+
+    #[cfg(feature = "tcp-fallback")]
+    fn execute_tcp_streaming(
+        &self,
+        request: &VaneRequest,
+        url: &Url,
+        body: &[u8],
+    ) -> Result<VaneResponseStream, VaneError> {
+        self.execute_with_retry(request, || {
+            tcp::execute_tcp_streaming_once(self, request, url, body)
+        })
+    }
+
+    #[cfg(not(feature = "tcp-fallback"))]
+    fn execute_tcp_streaming(
+        &self,
+        _request: &VaneRequest,
+        _url: &Url,
+        _body: &[u8],
+    ) -> Result<VaneResponseStream, VaneError> {
         Err(unsupported_tcp_backend_error())
     }
 
@@ -1115,11 +1281,14 @@ impl VaneClient {
     }
 
     /// Runs one transport's attempt closure under the shared retry policy.
-    fn execute_with_retry(
+    /// Generic over the delivery mode: a streaming attempt whose status the
+    /// policy retries is simply dropped — nothing of its body was handed out,
+    /// and dropping a live stream tears its connection down.
+    fn execute_with_retry<R: RedirectHopResponse>(
         &self,
         request: &VaneRequest,
-        attempt_once: impl Fn() -> Result<VaneResponse, VaneError>,
-    ) -> Result<VaneResponse, VaneError> {
+        attempt_once: impl Fn() -> Result<R, VaneError>,
+    ) -> Result<R, VaneError> {
         let max_attempts = self.config.retry_max_attempts.max(1);
         let mut attempt = 1u64;
         let mut last_error = None;
@@ -1129,7 +1298,7 @@ impl VaneClient {
                 Ok(response) => {
                     if should_retry_response(
                         &request.method,
-                        response.status_code,
+                        response.status_code(),
                         attempt,
                         &self.config,
                     ) {
@@ -1157,9 +1326,7 @@ impl VaneClient {
         }))
     }
 
-    /// One hop. Everything here is keyed off `hop.url`, so a redirect to another
-    /// host gets its own pool key, its own TLS session key and its own resolved
-    /// address without any of them having to know a chain is in progress.
+    /// One buffered hop; see [`Self::execute_http3_hop`].
     fn execute_http3_once(
         &self,
         request: &VaneRequest,
@@ -1168,6 +1335,38 @@ impl VaneClient {
         cancel_token: Option<&AtomicBool>,
         progress: Option<&VaneProgressState>,
     ) -> Result<(VaneResponse, u64), VaneError> {
+        let parts = self
+            .execute_http3_hop(
+                request,
+                hop,
+                certificate_pins,
+                cancel_token,
+                progress,
+                H3HopMode::Buffered,
+            )?
+            .expect_response()?;
+        let body_len = parts.body_len;
+        Ok((parts.into_public_response(), body_len))
+    }
+
+    /// One hop. Everything here is keyed off `hop.url`, so a redirect to another
+    /// host gets its own pool key, its own TLS session key and its own resolved
+    /// address without any of them having to know a chain is in progress.
+    ///
+    /// `mode` picks the delivery: [`H3HopMode::Buffered`] reads the whole body
+    /// before returning (the historical behavior), [`H3HopMode::Streaming`]
+    /// stops at the response headers and hands the live transport out — except
+    /// for a followable 3xx, whose body is an intermediate the caller never
+    /// asked for and is drained buffered exactly as before.
+    fn execute_http3_hop(
+        &self,
+        request: &VaneRequest,
+        hop: &Http3Hop<'_>,
+        certificate_pins: &HashMap<String, Vec<String>>,
+        cancel_token: Option<&AtomicBool>,
+        progress: Option<&VaneProgressState>,
+        mode: H3HopMode<'_>,
+    ) -> Result<H3HopOutcome, VaneError> {
         let url = hop.url;
         let request_body = hop.body;
         if url.scheme() != "https" {
@@ -1232,30 +1431,56 @@ impl VaneClient {
             };
 
             let mut response_started = false;
-            let result = perform_http3_request(
-                &mut transport,
-                H3RequestOptions {
-                    headers: &headers,
-                    request_body,
-                    deadline: hop.timeouts.deadline,
-                    url,
-                    max_response_body_bytes: self.config.max_response_body_bytes,
-                    response_body_path: request.response_body_path.as_deref(),
-                    cancel_token,
-                    progress,
-                    report_upload: hop.report_upload,
-                    redirect_possible: hop.redirect_possible,
-                },
-                &mut response_started,
-            );
+            let options = H3RequestOptions {
+                headers: &headers,
+                request_body,
+                deadline: hop.timeouts.deadline,
+                url,
+                max_response_body_bytes: self.config.max_response_body_bytes,
+                response_body_path: request.response_body_path.as_deref(),
+                cancel_token,
+                progress,
+                report_upload: hop.report_upload,
+                redirect_possible: hop.redirect_possible,
+            };
+            let result = (|| {
+                let mut exchange = begin_h3_exchange(&mut transport, &options)?;
+                let until = match mode {
+                    H3HopMode::Buffered => H3DriveUntil::ResponseFinished,
+                    H3HopMode::Streaming { .. } => H3DriveUntil::HeadersComplete,
+                };
+                drive_h3_exchange(
+                    &mut transport,
+                    &options,
+                    &mut exchange,
+                    &mut response_started,
+                    until,
+                )?;
+                // A followable 3xx's body is an intermediate: drain it under
+                // the intermediate cap so the connection stays clean, exactly
+                // as the buffered path always has.
+                if exchange.response.is_intermediate_redirect() && !exchange.response.finished {
+                    drive_h3_exchange(
+                        &mut transport,
+                        &options,
+                        &mut exchange,
+                        &mut response_started,
+                        H3DriveUntil::ResponseFinished,
+                    )?;
+                }
+                Ok(exchange)
+            })();
             match result {
-                Ok(response) => {
+                Ok(mut exchange) => {
                     if self.config.cookies_enabled {
-                        self.store_response_cookies(url, &response.set_cookie_headers)?;
+                        self.store_response_cookies(url, &exchange.response.set_cookie_headers)?;
                     }
                     // The server's NewSessionTicket normally lands after the
                     // handshake loop already returned, so this is the point
-                    // where a resumable ticket actually exists.
+                    // where a resumable ticket actually exists. For a live
+                    // stream this is also the last guaranteed look at the
+                    // connection state before the caller paces it; a ticket
+                    // that arrives mid-body is not banked.
                     store_tls_session(
                         &self.tls_sessions,
                         &transport.conn,
@@ -1263,16 +1488,63 @@ impl VaneClient {
                         certificate_pins,
                     );
 
-                    let body_len = response.body_len;
-                    let public_response = response.into_public_response();
-                    if self.config.connection_pool_enabled && !transport.conn.is_closed() {
-                        self.return_pooled_connection(transport)?;
-                    } else {
-                        transport.conn.close(true, 0x00, b"done").ok();
-                        transport.flush_packets().ok();
-                    }
-
-                    return Ok((public_response, body_len));
+                    return match mode {
+                        H3HopMode::Buffered => {
+                            self.park_or_close_h3(transport)?;
+                            Ok(H3HopOutcome::Response(Http3ResponseParts {
+                                body_len: exchange.response.body_len as u64,
+                                status_code: exchange.response.status_code,
+                                headers: exchange.response.headers,
+                                set_cookie_headers: exchange.response.set_cookie_headers,
+                                body: exchange.response.body,
+                                body_file_path: exchange.response.body_file_path,
+                                url: url.to_string(),
+                            }))
+                        }
+                        H3HopMode::Streaming { client } => {
+                            let downloaded = exchange.response.body_len as u64;
+                            let head = streaming_head(
+                                &mut exchange.response,
+                                url,
+                                Some(VaneHttpVersion::Http3),
+                            );
+                            let source = if exchange.response.finished {
+                                // Whole body already read: an intermediate 3xx
+                                // always, and any final response small enough
+                                // to arrive with its headers. Nothing keeps
+                                // the transport, so it can be parked now.
+                                self.park_or_close_h3(transport)?;
+                                StreamingBodySource::Buffered(std::mem::take(
+                                    &mut exchange.response.body,
+                                ))
+                            } else {
+                                // The caller's body is copied only when the
+                                // server answered before the upload finished,
+                                // so the continuation can keep sending without
+                                // walking the upload counters backwards.
+                                let request_body = if exchange.body_offset >= request_body.len() {
+                                    Vec::new()
+                                } else {
+                                    request_body.to_vec()
+                                };
+                                let body_offset = exchange.body_offset.min(request_body.len());
+                                StreamingBodySource::H3(Box::new(H3BodyStream {
+                                    client: Arc::clone(client),
+                                    transport: Some(transport),
+                                    state: exchange.response,
+                                    stream_id: exchange.stream_id,
+                                    request_body,
+                                    body_offset,
+                                    report_upload: hop.report_upload,
+                                    idle: hop.timeouts.idle,
+                                }))
+                            };
+                            Ok(H3HopOutcome::Stream {
+                                hop: StreamingHopResult { head, source },
+                                downloaded,
+                            })
+                        }
+                    };
                 }
                 Err(err) => {
                     transport.conn.close(true, 0x01, b"request failed").ok();
@@ -1293,6 +1565,19 @@ impl VaneClient {
                     return Err(err);
                 }
             }
+        }
+    }
+
+    /// Returns a connection whose response was fully read to the pool, or
+    /// closes it when pooling is off. Shared by the buffered hop and the
+    /// streaming completion so the two can never disagree on reusability.
+    fn park_or_close_h3(&self, mut transport: PooledHttp3Connection) -> Result<(), VaneError> {
+        if self.config.connection_pool_enabled && !transport.conn.is_closed() {
+            self.return_pooled_connection(transport)
+        } else {
+            transport.conn.close(true, 0x00, b"done").ok();
+            transport.flush_packets().ok();
+            Ok(())
         }
     }
 
@@ -1700,6 +1985,38 @@ impl HopTimeouts {
     }
 }
 
+/// What the redirect chain and the retry policy need to know about one hop's
+/// response — implemented by the buffered [`VaneResponse`], by the streaming
+/// hop result, and by [`VaneResponseStream`], so the chain, the retry loop and
+/// the transport-fallback logic stay single-sourced instead of forking per
+/// delivery mode.
+trait RedirectHopResponse {
+    fn status_code(&self) -> u16;
+    /// The `location` header value the shared gate acts on. `merge_header`
+    /// keeps `location` first-wins (a repeat never joins), so this is the
+    /// first occurrence's whole value on every implementation.
+    fn location(&self) -> Option<&str>;
+    /// Marks a 3xx that Vane refused to follow, so a caller cannot mistake it
+    /// for "the server simply sent a redirect" and re-follow the `Location` by
+    /// hand — which would defeat the pin or the downgrade rule that stopped it.
+    fn mark_refused(&mut self, reason: &'static str);
+}
+
+impl RedirectHopResponse for VaneResponse {
+    fn status_code(&self) -> u16 {
+        self.status_code
+    }
+
+    fn location(&self) -> Option<&str> {
+        header_value(&self.headers, "location")
+    }
+
+    fn mark_refused(&mut self, reason: &'static str) {
+        self.headers
+            .insert(REDIRECT_REFUSED_HEADER.to_string(), reason.to_string());
+    }
+}
+
 /// Everything a redirect chain needs that does not change between hops.
 ///
 /// Split from the hop executor so the loop — hop counting, the method and body
@@ -1718,12 +2035,12 @@ struct RedirectChain<'a> {
 impl RedirectChain<'_> {
     /// `hop` performs one request and reports how many body bytes it read (the
     /// body itself may have gone to a file, so the response cannot be asked).
-    fn run(
+    fn run<R: RedirectHopResponse>(
         &self,
         url: &Url,
         request_body: &[u8],
-        mut hop: impl FnMut(&Http3Hop<'_>) -> Result<(VaneResponse, u64), VaneError>,
-    ) -> Result<VaneResponse, VaneError> {
+        mut hop: impl FnMut(&Http3Hop<'_>) -> Result<(R, u64), VaneError>,
+    ) -> Result<R, VaneError> {
         let origin = (
             url.host_str().unwrap_or_default().to_string(),
             origin_port(url),
@@ -1753,14 +2070,13 @@ impl RedirectChain<'_> {
             })
             .map_err(|err| withdraw_replay_safety(err, hops))?;
 
-            // `merge_header` keeps `location` first-wins (a repeat never
-            // joins), so this is the first occurrence's whole value — the
-            // same thing the TCP path's `HeaderMap::get` feeds the shared
+            // The trait's `location` is the first occurrence's whole value —
+            // the same thing the TCP path's `HeaderMap::get` feeds the shared
             // gate. No splitting here: a lone malformed value goes to the
             // gate verbatim and both transports agree on its fate.
             let next = match next_redirect_url(
-                response.status_code,
-                header_value(&response.headers, "location"),
+                response.status_code(),
+                response.location(),
                 &current,
                 self.request,
                 hops,
@@ -1768,7 +2084,9 @@ impl RedirectChain<'_> {
             ) {
                 RedirectDecision::Stop => return Ok(self.finish(response, downloaded)),
                 RedirectDecision::Refused(reason) => {
-                    return Ok(self.finish(refused_redirect(response, reason), downloaded));
+                    let mut response = response;
+                    response.mark_refused(reason);
+                    return Ok(self.finish(response, downloaded));
                 }
                 RedirectDecision::Follow(next) => next,
             };
@@ -1779,16 +2097,15 @@ impl RedirectChain<'_> {
                     origin_port(&current),
                 );
             match redirect_rewrite(
-                response.status_code,
+                response.status_code(),
                 &method,
                 !body.is_empty(),
                 cross_origin,
             ) {
                 RedirectRewrite::Refuse => {
-                    return Ok(self.finish(
-                        refused_redirect(response, REDIRECT_REFUSED_CROSS_ORIGIN_BODY),
-                        downloaded,
-                    ));
+                    let mut response = response;
+                    response.mark_refused(REDIRECT_REFUSED_CROSS_ORIGIN_BODY);
+                    return Ok(self.finish(response, downloaded));
                 }
                 RedirectRewrite::ToGet => {
                     method = "GET".to_string();
@@ -1805,8 +2122,10 @@ impl RedirectChain<'_> {
     /// Publishes the download figure for the hop that turned out to be the
     /// final one. Streaming progress is suppressed while a 3xx could still be
     /// followed, so a 3xx the gate then refuses would otherwise be handed to
-    /// the caller having reported nothing at all before `done` latches.
-    fn finish(&self, response: VaneResponse, downloaded: u64) -> VaneResponse {
+    /// the caller having reported nothing at all before `done` latches. For a
+    /// live streaming hop `downloaded` is only the prefix read so far; the
+    /// per-chunk reporting then keeps counting from it.
+    fn finish<R>(&self, response: R, downloaded: u64) -> R {
         progress_download(self.progress, downloaded, downloaded);
         response
     }
@@ -1826,16 +2145,6 @@ fn withdraw_replay_safety(err: VaneError, hops: usize) -> VaneError {
         VaneError::ConnectTimeout(message) if hops > 0 => VaneError::Timeout(message),
         err => err,
     }
-}
-
-/// Marks a 3xx that Vane refused to follow, so a caller cannot mistake it for
-/// "the server simply sent a redirect" and re-follow the `Location` by hand —
-/// which would defeat the pin or the downgrade rule that stopped it here.
-fn refused_redirect(mut response: VaneResponse, reason: &str) -> VaneResponse {
-    response
-        .headers
-        .insert(REDIRECT_REFUSED_HEADER.to_string(), reason.to_string());
-    response
 }
 
 /// One hop of an HTTP/3 request: everything a redirect chain changes between
@@ -2061,6 +2370,396 @@ impl Http3ResponseParts {
             // so an `Http3ResponseParts` cannot have been served over anything
             // else.
             http_version: Some(VaneHttpVersion::Http3),
+        }
+    }
+}
+
+// ---------- Streaming response delivery ----------
+
+/// How an HTTP/3 hop delivers its body; see [`VaneClient::execute_http3_hop`].
+#[derive(Clone, Copy)]
+enum H3HopMode<'a> {
+    Buffered,
+    Streaming { client: &'a Arc<VaneClient> },
+}
+
+/// What [`VaneClient::execute_http3_hop`] produced. The variant is dictated by
+/// the [`H3HopMode`], so the `expect_*` accessors can only miss on a Vane bug.
+enum H3HopOutcome {
+    Response(Http3ResponseParts),
+    Stream {
+        hop: StreamingHopResult,
+        /// Body bytes read while producing the hop: the whole body for a
+        /// drained intermediate, only the prefix for a live stream.
+        downloaded: u64,
+    },
+}
+
+impl H3HopOutcome {
+    fn expect_response(self) -> Result<Http3ResponseParts, VaneError> {
+        match self {
+            H3HopOutcome::Response(parts) => Ok(parts),
+            H3HopOutcome::Stream { .. } => Err(VaneError::Generic(
+                "Buffered HTTP/3 hop produced a stream".to_string(),
+            )),
+        }
+    }
+
+    fn expect_stream(self) -> Result<(StreamingHopResult, u64), VaneError> {
+        match self {
+            H3HopOutcome::Stream { hop, downloaded } => Ok((hop, downloaded)),
+            H3HopOutcome::Response(_) => Err(VaneError::Generic(
+                "Streaming HTTP/3 hop produced a buffered response".to_string(),
+            )),
+        }
+    }
+}
+
+/// One streaming hop's result: the response head plus the body source that
+/// will serve it. The redirect chain drives this through
+/// [`RedirectHopResponse`]; only the hop that turns out to be final is wrapped
+/// into the public [`VaneResponseStream`]. An intermediate hop the chain
+/// follows is simply dropped, which is free: an intermediate is always a
+/// drained [`StreamingBodySource::Buffered`], never a live transport.
+struct StreamingHopResult {
+    /// `body` is empty by contract; the stream delivers it.
+    head: VaneResponse,
+    source: StreamingBodySource,
+}
+
+impl StreamingHopResult {
+    fn into_stream(
+        self,
+        cancel: Option<Arc<AtomicBool>>,
+        progress: Option<Arc<VaneProgressState>>,
+    ) -> VaneResponseStream {
+        VaneResponseStream {
+            head: self.head,
+            body: Mutex::new(StreamingBody {
+                source: self.source,
+                terminal: None,
+                cancel,
+                progress,
+            }),
+        }
+    }
+}
+
+impl RedirectHopResponse for StreamingHopResult {
+    fn status_code(&self) -> u16 {
+        self.head.status_code
+    }
+
+    fn location(&self) -> Option<&str> {
+        header_value(&self.head.headers, "location")
+    }
+
+    fn mark_refused(&mut self, reason: &'static str) {
+        self.head.mark_refused(reason);
+    }
+}
+
+/// Builds the caller-visible head off a response whose headers are complete,
+/// leaving the body (and the body counters) behind for the stream. Trailers a
+/// live stream receives later merge into the drained state and are discarded:
+/// the head was already handed out.
+fn streaming_head(
+    state: &mut ResponseState,
+    url: &Url,
+    http_version: Option<VaneHttpVersion>,
+) -> VaneResponse {
+    VaneResponse {
+        status_code: state.status_code,
+        headers: std::mem::take(&mut state.headers),
+        body: Vec::new(),
+        body_file_path: None,
+        is_success: (200..=299).contains(&state.status_code),
+        url: url.to_string(),
+        set_cookie: std::mem::take(&mut state.set_cookie_headers),
+        http_version,
+    }
+}
+
+/// An HTTP response whose headers have arrived and whose body is read
+/// incrementally by the caller.
+///
+/// Pull-based on purpose: the core never reads ahead of the caller, so a slow
+/// consumer stalls the peer through QUIC flow control / the TCP receive
+/// window instead of buffering without bound. `read_chunk` blocks until body
+/// bytes arrive, the body ends (`None`), or the stream fails — a transport
+/// error after the headers were delivered surfaces here, not as a failed
+/// request. Abandoning the stream (`close`, or dropping it) discards the
+/// underlying connection; only a stream read to its end returns the
+/// connection to the pool.
+pub struct VaneResponseStream {
+    head: VaneResponse,
+    body: Mutex<StreamingBody>,
+}
+
+impl VaneResponseStream {
+    /// The response head: status, headers, final URL, cookies, protocol.
+    /// `body` is empty by contract — the stream itself delivers it.
+    pub fn head(&self) -> VaneResponse {
+        self.head.clone()
+    }
+
+    /// Blocks until the next body chunk arrives and returns it; `Ok(None)`
+    /// once the body is complete. Chunk boundaries carry no meaning.
+    ///
+    /// A pull that sees no data for roughly the request's timeout fails with
+    /// [`VaneError::Timeout`]. After any error the stream is dead: the
+    /// connection has been discarded and every later pull repeats the same
+    /// error. After `close`, pulls return `Ok(None)`.
+    pub fn read_chunk(&self) -> Result<Option<Vec<u8>>, VaneError> {
+        let mut body = self
+            .body
+            .lock()
+            .map_err(|_| VaneError::Generic("Response stream lock was poisoned".to_string()))?;
+        if let Some(terminal) = &body.terminal {
+            return match terminal {
+                StreamTerminal::Eof | StreamTerminal::Closed => Ok(None),
+                StreamTerminal::Failed(err) => Err(err.clone()),
+            };
+        }
+        let cancel = body.cancel.clone();
+        let progress = body.progress.clone();
+        if let Err(err) = check_cancelled(cancel.as_deref()) {
+            return Err(body.fail(err));
+        }
+        match body.source.next(cancel.as_deref(), progress.as_deref()) {
+            Ok(BodyStep::Chunk(chunk)) => Ok(Some(chunk)),
+            Ok(BodyStep::Eof) => {
+                progress_done(body.progress.as_deref());
+                body.terminal = Some(StreamTerminal::Eof);
+                Ok(None)
+            }
+            Err(err) => Err(body.fail(err)),
+        }
+    }
+
+    /// Releases the stream without draining it. Idempotent. The connection is
+    /// discarded, never pooled: an undrained body would poison the next
+    /// request on it. Reading after close returns `Ok(None)`.
+    ///
+    /// This runs on the caller's thread and takes the stream's lock, so it
+    /// waits for an in-flight `read_chunk` to return; to interrupt a blocked
+    /// read, cancel the request's `VaneCancelToken` first.
+    pub fn close(&self) {
+        if let Ok(mut body) = self.body.lock()
+            && body.terminal.is_none()
+        {
+            body.source.abandon();
+            progress_done(body.progress.as_deref());
+            body.terminal = Some(StreamTerminal::Closed);
+        }
+    }
+}
+
+impl Drop for VaneResponseStream {
+    fn drop(&mut self) {
+        // A dropped-but-unfinished stream must not leak its connection or
+        // leave a progress poller waiting forever. Poisoned lock: the panic
+        // in flight already owns the teardown story.
+        if let Ok(body) = self.body.get_mut()
+            && body.terminal.is_none()
+        {
+            body.source.abandon();
+            progress_done(body.progress.as_deref());
+        }
+    }
+}
+
+impl RedirectHopResponse for VaneResponseStream {
+    fn status_code(&self) -> u16 {
+        self.head.status_code
+    }
+
+    fn location(&self) -> Option<&str> {
+        header_value(&self.head.headers, "location")
+    }
+
+    fn mark_refused(&mut self, reason: &'static str) {
+        self.head.mark_refused(reason);
+    }
+}
+
+struct StreamingBody {
+    source: StreamingBodySource,
+    /// Set once the stream ends, and replayed on every later pull.
+    terminal: Option<StreamTerminal>,
+    cancel: Option<Arc<AtomicBool>>,
+    progress: Option<Arc<VaneProgressState>>,
+}
+
+impl StreamingBody {
+    /// Tears the source down, latches the terminal state and hands the error
+    /// back for returning. The clone is what later pulls replay.
+    fn fail(&mut self, err: VaneError) -> VaneError {
+        self.source.abandon();
+        progress_done(self.progress.as_deref());
+        self.terminal = Some(StreamTerminal::Failed(err.clone()));
+        err
+    }
+}
+
+enum StreamTerminal {
+    Eof,
+    Closed,
+    Failed(VaneError),
+}
+
+enum BodyStep {
+    Chunk(Vec<u8>),
+    Eof,
+}
+
+enum StreamingBodySource {
+    /// Body already fully in memory: a 3xx handed back to the caller
+    /// (refused, hop-capped, or missing its Location), or a final response
+    /// small enough to have arrived with its headers.
+    Buffered(Vec<u8>),
+    H3(Box<H3BodyStream>),
+    #[cfg(feature = "tcp-fallback")]
+    Tcp(Box<tcp::TcpBodyStream>),
+}
+
+impl StreamingBodySource {
+    fn next(
+        &mut self,
+        cancel: Option<&AtomicBool>,
+        progress: Option<&VaneProgressState>,
+    ) -> Result<BodyStep, VaneError> {
+        match self {
+            StreamingBodySource::Buffered(body) => {
+                if body.is_empty() {
+                    Ok(BodyStep::Eof)
+                } else {
+                    Ok(BodyStep::Chunk(std::mem::take(body)))
+                }
+            }
+            StreamingBodySource::H3(stream) => stream.next(cancel, progress),
+            #[cfg(feature = "tcp-fallback")]
+            StreamingBodySource::Tcp(stream) => stream.next(cancel, progress),
+        }
+    }
+
+    /// Idempotent teardown for close, failure and drop.
+    fn abandon(&mut self) {
+        match self {
+            StreamingBodySource::Buffered(body) => body.clear(),
+            StreamingBodySource::H3(stream) => stream.abandon(),
+            #[cfg(feature = "tcp-fallback")]
+            StreamingBodySource::Tcp(stream) => stream.abandon(),
+        }
+    }
+}
+
+/// A live HTTP/3 response body: the checked-out connection plus everything the
+/// drive loop needs to keep advancing it one pull at a time.
+struct H3BodyStream {
+    /// For returning the connection to the pool at end of body.
+    client: Arc<VaneClient>,
+    /// `None` once the connection was parked or discarded.
+    transport: Option<PooledHttp3Connection>,
+    /// Headers already stripped into the caller's head; carries the body
+    /// accumulator, the cumulative limit counters and the finished flag.
+    state: ResponseState,
+    stream_id: Option<u64>,
+    /// Unsent request-body tail; empty in the common fully-uploaded case.
+    request_body: Vec<u8>,
+    body_offset: usize,
+    report_upload: bool,
+    /// Per-pull inactivity budget: the request's configured timeout, the same
+    /// value the connection's QUIC idle timeout was armed with.
+    idle: Duration,
+}
+
+impl H3BodyStream {
+    fn next(
+        &mut self,
+        cancel: Option<&AtomicBool>,
+        progress: Option<&VaneProgressState>,
+    ) -> Result<BodyStep, VaneError> {
+        // Serve what the headers phase (or the previous pass) already read.
+        if !self.state.body.is_empty() {
+            return Ok(BodyStep::Chunk(std::mem::take(&mut self.state.body)));
+        }
+        if !self.state.finished {
+            let Some(transport) = self.transport.as_mut() else {
+                return Err(VaneError::Generic(
+                    "Response stream connection is gone".to_string(),
+                ));
+            };
+            let deadline = Instant::now() + self.idle;
+            loop {
+                check_cancelled(cancel)?;
+                transport.read_packets()?;
+                // A server may answer before consuming the whole request
+                // body; keep feeding it so the exchange can finish.
+                if let Some(stream_id) = self.stream_id
+                    && self.body_offset < self.request_body.len()
+                {
+                    send_request_body(
+                        transport,
+                        stream_id,
+                        &self.request_body,
+                        &mut self.body_offset,
+                        self.report_upload,
+                        progress,
+                    )?;
+                }
+                let mut response_started = true;
+                process_h3_events(
+                    &mut transport.http3,
+                    &mut transport.conn,
+                    &mut transport.body_buf,
+                    &mut self.state,
+                    cancel,
+                    progress,
+                    &mut response_started,
+                )?;
+                transport.flush_packets()?;
+
+                if !self.state.body.is_empty() {
+                    return Ok(BodyStep::Chunk(std::mem::take(&mut self.state.body)));
+                }
+                if self.state.finished {
+                    break;
+                }
+                if transport.conn.is_closed() {
+                    return Err(VaneError::Transport(
+                        "QUIC connection closed before response completed".to_string(),
+                    ));
+                }
+                if Instant::now() >= deadline {
+                    return Err(VaneError::Timeout(
+                        "HTTP/3 response body read timed out".to_string(),
+                    ));
+                }
+            }
+        }
+        // Body complete: park the connection and publish the final figure so
+        // a poller sees received == total even without a content-length.
+        if let Some(transport) = self.transport.take() {
+            self.client.park_or_close_h3(transport)?;
+        }
+        progress_download(
+            progress,
+            self.state.body_len as u64,
+            self.state.body_len as u64,
+        );
+        Ok(BodyStep::Eof)
+    }
+
+    /// ponytail: an abandoned stream always closes its connection. QUIC could
+    /// cancel just the stream (STOP_SENDING) and keep the connection, but
+    /// making that reusable means draining the aborted stream's events
+    /// without wedging the pool; one extra handshake after an abandon is the
+    /// price until a real workload earns the upgrade.
+    fn abandon(&mut self) {
+        if let Some(mut transport) = self.transport.take() {
+            transport.conn.close(true, 0x00, b"stream abandoned").ok();
+            transport.flush_packets().ok();
         }
     }
 }
@@ -2864,13 +3563,31 @@ struct H3RequestOptions<'a> {
     redirect_possible: bool,
 }
 
-fn perform_http3_request(
+/// In-flight request state that must survive across drive passes, so a
+/// streaming caller can stop at the headers and keep driving the body later.
+struct H3ExchangeState {
+    response: ResponseState,
+    /// `None` while quiche has asked us to retry `send_request`.
+    stream_id: Option<u64>,
+    body_offset: usize,
+}
+
+/// How far [`drive_h3_exchange`] runs before returning control.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum H3DriveUntil {
+    /// The whole response, exactly the historical behavior.
+    ResponseFinished,
+    /// The final (non-1xx) header block. Body bytes that arrive in the same
+    /// pass are kept in `response.body` for the caller to serve first.
+    HeadersComplete,
+}
+
+/// Sends the request (headers plus whatever body quiche accepts up front) and
+/// returns the exchange state the drive loop advances.
+fn begin_h3_exchange(
     transport: &mut PooledHttp3Connection,
-    options: H3RequestOptions<'_>,
-    response_started: &mut bool,
-) -> Result<Http3ResponseParts, VaneError> {
-    let mut body_offset = 0usize;
-    let deadline = options.deadline;
+    options: &H3RequestOptions<'_>,
+) -> Result<H3ExchangeState, VaneError> {
     let mut response =
         ResponseState::new(options.max_response_body_bytes, options.response_body_path)?;
     response.redirect_possible = options.redirect_possible;
@@ -2878,37 +3595,65 @@ fn perform_http3_request(
     // Send before the first read: the read blocks for up to 50 ms, so reading
     // first delays the request by a full poll interval on every attempt. The
     // deadline is still checked first so an expired one sends nothing.
-    if Instant::now() >= deadline {
+    if Instant::now() >= options.deadline {
         return Err(VaneError::Timeout(format!(
             "HTTP/3 request to {} timed out",
             redact_url_userinfo(&options.url.to_string())
         )));
     }
     check_cancelled(options.cancel_token)?;
-    let mut stream_id = send_h3_request(transport, &options)?;
-    if let Some(stream_id) = stream_id {
-        send_request_body(transport, stream_id, &options, &mut body_offset)?;
+    let mut exchange = H3ExchangeState {
+        response,
+        stream_id: send_h3_request(transport, options)?,
+        body_offset: 0,
+    };
+    if let Some(stream_id) = exchange.stream_id {
+        send_request_body(
+            transport,
+            stream_id,
+            options.request_body,
+            &mut exchange.body_offset,
+            options.report_upload,
+            options.progress,
+        )?;
     }
     transport.flush_packets()?;
+    Ok(exchange)
+}
 
+fn drive_h3_exchange(
+    transport: &mut PooledHttp3Connection,
+    options: &H3RequestOptions<'_>,
+    exchange: &mut H3ExchangeState,
+    response_started: &mut bool,
+    until: H3DriveUntil,
+) -> Result<(), VaneError> {
+    let deadline = options.deadline;
     while Instant::now() < deadline {
         check_cancelled(options.cancel_token)?;
         transport.read_packets()?;
 
         // Re-issue a request quiche asked us to retry, now that the read above
         // may have delivered the peer's MAX_STREAMS credit.
-        if stream_id.is_none() {
-            stream_id = send_h3_request(transport, &options)?;
+        if exchange.stream_id.is_none() {
+            exchange.stream_id = send_h3_request(transport, options)?;
         }
-        if let Some(stream_id) = stream_id {
-            send_request_body(transport, stream_id, &options, &mut body_offset)?;
+        if let Some(stream_id) = exchange.stream_id {
+            send_request_body(
+                transport,
+                stream_id,
+                options.request_body,
+                &mut exchange.body_offset,
+                options.report_upload,
+                options.progress,
+            )?;
         }
 
         process_h3_events(
             &mut transport.http3,
             &mut transport.conn,
             &mut transport.body_buf,
-            &mut response,
+            &mut exchange.response,
             options.cancel_token,
             options.progress,
             response_started,
@@ -2916,8 +3661,11 @@ fn perform_http3_request(
 
         transport.flush_packets()?;
 
-        if response.finished {
-            break;
+        if exchange.response.finished {
+            return Ok(());
+        }
+        if until == H3DriveUntil::HeadersComplete && exchange.response.headers_complete {
+            return Ok(());
         }
 
         if transport.conn.is_closed() {
@@ -2927,22 +3675,10 @@ fn perform_http3_request(
         }
     }
 
-    if !response.finished {
-        return Err(VaneError::Timeout(format!(
-            "HTTP/3 request to {} timed out",
-            redact_url_userinfo(&options.url.to_string())
-        )));
-    }
-
-    Ok(Http3ResponseParts {
-        body_len: response.body_len as u64,
-        status_code: response.status_code,
-        headers: response.headers,
-        set_cookie_headers: response.set_cookie_headers,
-        body: response.body,
-        body_file_path: response.body_file_path,
-        url: options.url.to_string(),
-    })
+    Err(VaneError::Timeout(format!(
+        "HTTP/3 request to {} timed out",
+        redact_url_userinfo(&options.url.to_string())
+    )))
 }
 
 /// Returns `None` when quiche asked us to retry the whole call later. Both
@@ -2971,24 +3707,22 @@ fn send_h3_request(
 fn send_request_body(
     transport: &mut PooledHttp3Connection,
     stream_id: u64,
-    options: &H3RequestOptions<'_>,
+    request_body: &[u8],
     body_offset: &mut usize,
+    report_upload: bool,
+    progress: Option<&VaneProgressState>,
 ) -> Result<(), VaneError> {
-    while *body_offset < options.request_body.len() {
+    while *body_offset < request_body.len() {
         match transport.http3.send_body(
             &mut transport.conn,
             stream_id,
-            &options.request_body[*body_offset..],
+            &request_body[*body_offset..],
             true,
         ) {
             Ok(written) => {
                 *body_offset += written;
-                if options.report_upload {
-                    progress_upload(
-                        options.progress,
-                        *body_offset as u64,
-                        options.request_body.len() as u64,
-                    );
+                if report_upload {
+                    progress_upload(progress, *body_offset as u64, request_body.len() as u64);
                 }
             }
             Err(quiche::h3::Error::Done) => break,
@@ -3913,6 +4647,10 @@ struct ResponseState {
     body_file_path: Option<String>,
     body_file: Option<File>,
     finished: bool,
+    /// Set once a final (non-1xx) HEADERS block has been folded in — the
+    /// response header section is complete and the status/header map may be
+    /// acted on. Trailers arrive later and still merge; they do not clear it.
+    headers_complete: bool,
     max_body_bytes: u64,
     body_len: usize,
     download_total: u64,
@@ -3945,6 +4683,7 @@ impl ResponseState {
                 .map(ToString::to_string),
             body_file,
             finished: false,
+            headers_complete: false,
             max_body_bytes,
             body_len: 0,
             download_total: 0,
@@ -4090,6 +4829,7 @@ fn merge_h3_header_block(response: &mut ResponseState, list: Vec<quiche::h3::Hea
             return;
         }
         response.status_code = status;
+        response.headers_complete = true;
     }
     for (name, value) in fields {
         response.merge_header(name, value);

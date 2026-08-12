@@ -176,6 +176,15 @@ struct ServerConn {
     conn: quiche::Connection,
     h3: Option<quiche::h3::Connection>,
     requests: HashMap<u64, PendingRequest>,
+    /// Response bodies still being written, keyed by stream id: a body larger
+    /// than the stream's flow-control window cannot leave in one pass, which
+    /// is exactly what the client's streaming tests need to exist.
+    pending_bodies: HashMap<u64, PendingBody>,
+}
+
+struct PendingBody {
+    body: Vec<u8>,
+    offset: usize,
 }
 
 #[derive(Default)]
@@ -216,6 +225,7 @@ fn serve(
                             conn,
                             h3: None,
                             requests: HashMap::new(),
+                            pending_bodies: HashMap::new(),
                         })
                     }
                 };
@@ -255,7 +265,13 @@ fn serve(
                     quiche::h3::Connection::with_transport(&mut server_conn.conn, &h3_config).ok();
             }
             if let Some(h3) = server_conn.h3.as_mut() {
-                poll_h3(h3, &mut server_conn.conn, &mut server_conn.requests);
+                poll_h3(
+                    h3,
+                    &mut server_conn.conn,
+                    &mut server_conn.requests,
+                    &mut server_conn.pending_bodies,
+                );
+                drain_pending_bodies(h3, &mut server_conn.conn, &mut server_conn.pending_bodies);
             }
             loop {
                 match server_conn.conn.send(&mut out) {
@@ -286,6 +302,7 @@ fn poll_h3(
     h3: &mut quiche::h3::Connection,
     conn: &mut quiche::Connection,
     requests: &mut HashMap<u64, PendingRequest>,
+    pending_bodies: &mut HashMap<u64, PendingBody>,
 ) {
     loop {
         match h3.poll(conn) {
@@ -311,7 +328,7 @@ fn poll_h3(
             }
             Ok((stream_id, quiche::h3::Event::Finished)) => {
                 if let Some(request) = requests.remove(&stream_id) {
-                    respond(h3, conn, stream_id, &request);
+                    respond(h3, conn, stream_id, &request, pending_bodies);
                 }
             }
             Ok(_) => {}
@@ -326,6 +343,7 @@ fn respond(
     conn: &mut quiche::Connection,
     stream_id: u64,
     request: &PendingRequest,
+    pending_bodies: &mut HashMap<u64, PendingBody>,
 ) {
     let (status, extra_headers, body) = route(request);
     let content_length = body.len().to_string();
@@ -342,16 +360,45 @@ fn respond(
     {
         return;
     }
-    let mut offset = 0;
-    while offset < body.len() {
-        match h3.send_body(conn, stream_id, &body[offset..], true) {
-            Ok(written) => offset += written,
-            // ponytail: includes Done (stream blocked). Unreachable for these
-            // bodies under 1 MB stream windows, and content-length makes a
-            // truncation a loud client-side error, never a silent pass.
-            Err(_) => return,
+    let mut pending = PendingBody { body, offset: 0 };
+    if push_pending_body(h3, conn, stream_id, &mut pending) && pending.offset < pending.body.len() {
+        // Flow control stalled the write; the serve loop keeps draining it as
+        // the client's window updates arrive. This is what lets the server
+        // carry a body larger than one stream window — the shape the client's
+        // streaming path exists for.
+        pending_bodies.insert(stream_id, pending);
+    }
+}
+
+/// Writes as much of `pending` as quiche will take. `false` means the stream
+/// died and the body should be dropped.
+fn push_pending_body(
+    h3: &mut quiche::h3::Connection,
+    conn: &mut quiche::Connection,
+    stream_id: u64,
+    pending: &mut PendingBody,
+) -> bool {
+    while pending.offset < pending.body.len() {
+        // fin=true throughout: quiche only puts the FIN on the wire once the
+        // final byte is accepted, so repeating it on each remainder is the
+        // established idiom.
+        match h3.send_body(conn, stream_id, &pending.body[pending.offset..], true) {
+            Ok(0) | Err(quiche::h3::Error::Done) => return true,
+            Ok(written) => pending.offset += written,
+            Err(_) => return false,
         }
     }
+    true
+}
+
+fn drain_pending_bodies(
+    h3: &mut quiche::h3::Connection,
+    conn: &mut quiche::Connection,
+    pending_bodies: &mut HashMap<u64, PendingBody>,
+) {
+    pending_bodies.retain(|stream_id, pending| {
+        push_pending_body(h3, conn, *stream_id, pending) && pending.offset < pending.body.len()
+    });
 }
 
 /// httpbin-shaped routing, just deep enough for the offline twins of the live
@@ -405,7 +452,25 @@ fn route(request: &PendingRequest) -> (String, Vec<(String, String)>, Vec<u8>) {
             Vec::new(),
         );
     }
+    if let Some(len) = path.strip_prefix("/bytes/") {
+        let len: usize = len.parse().unwrap_or(0);
+        return ("200".to_string(), Vec::new(), body_pattern(len));
+    }
+    // A redirect to cleartext, which the shared gate refuses (downgrade).
+    if path == "/redirect-http" {
+        return (
+            "302".to_string(),
+            vec![("location".to_string(), format!("http://{TEST_HOST}/get"))],
+            Vec::new(),
+        );
+    }
     ("404".to_string(), Vec::new(), Vec::new())
+}
+
+/// Deterministic non-repeating-ish byte pattern, so a reassembled streamed
+/// body can be checked for both length and content.
+pub(crate) fn body_pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
 }
 
 /// Loose JSON echo in httpbin's shape — tests assert with `contains`, so the
@@ -614,5 +679,219 @@ mod tests {
             body.contains("\"vane\": \"offline\""),
             "cookie jar round-trip missing: {body}"
         );
+    }
+
+    // ---------- Streaming ----------
+
+    use std::sync::Arc;
+
+    use super::body_pattern;
+    use crate::VaneError;
+
+    /// Larger than the 1 MiB stream flow-control window, so the body cannot
+    /// possibly arrive in one pass: the server is forced to wait for the
+    /// client's window updates, which only flow while the caller pulls.
+    const STREAM_BODY_LEN: usize = 3 * 1024 * 1024;
+
+    fn stream_request(server: &TestH3Server) -> crate::VaneRequest {
+        test_request(&server.url(&format!("/bytes/{STREAM_BODY_LEN}")))
+    }
+
+    #[test]
+    fn streaming_get_delivers_incremental_chunks_and_pools_the_drained_connection() {
+        let server = TestH3Server::start();
+        let client = Arc::new(offline_client(VaneClientConfig::default()));
+        let progress_id = crate::create_progress();
+        let mut request = stream_request(&server);
+        request.progress_id = Some(progress_id);
+
+        let stream = Arc::clone(&client).execute_streaming(request).unwrap();
+        let head = stream.head();
+        assert!(head.is_success);
+        assert_eq!(head.status_code, 200);
+        assert!(head.body.is_empty(), "the stream head carries no body");
+        assert_eq!(
+            head.headers.get("content-length").map(String::as_str),
+            Some(STREAM_BODY_LEN.to_string().as_str())
+        );
+
+        let mut body = Vec::new();
+        let mut chunks = 0usize;
+        while let Some(chunk) = stream.read_chunk().unwrap() {
+            assert!(!chunk.is_empty(), "read_chunk never returns empty chunks");
+            chunks += 1;
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body.len(), STREAM_BODY_LEN);
+        assert!(
+            body == body_pattern(STREAM_BODY_LEN),
+            "body content differs"
+        );
+        assert!(
+            chunks > 1,
+            "3 MiB against a 1 MiB flow window cannot arrive as one chunk"
+        );
+        // EOF after EOF stays EOF.
+        assert!(stream.read_chunk().unwrap().is_none());
+
+        // The drained connection went back to the pool, and the follow-up
+        // request rides it instead of handshaking.
+        assert_eq!(client.pool.lock().unwrap().len(), 1);
+        let followup = client.execute(test_request(&server.url("/get"))).unwrap();
+        assert!(followup.is_success);
+        assert_eq!(
+            server.handshakes().len(),
+            1,
+            "the follow-up request must reuse the streamed request's connection"
+        );
+
+        let progress = crate::progress_snapshot_by_id(progress_id);
+        assert!(progress.done, "progress latches done at end of stream");
+        assert_eq!(progress.download_received, STREAM_BODY_LEN as u64);
+        assert_eq!(progress.download_total, STREAM_BODY_LEN as u64);
+        crate::free_progress(progress_id);
+    }
+
+    #[test]
+    fn streaming_redirect_chain_streams_the_final_hop() {
+        let server = TestH3Server::start();
+        let client = Arc::new(offline_client(VaneClientConfig::default()));
+
+        let stream = Arc::clone(&client)
+            .execute_streaming(test_request(&server.url("/redirect/2")))
+            .unwrap();
+        let head = stream.head();
+        assert!(head.is_success);
+        assert!(
+            head.url.ends_with("/get"),
+            "redirect chain should end on /get, got {}",
+            head.url
+        );
+
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.read_chunk().unwrap() {
+            body.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8_lossy(&body).into_owned();
+        assert!(body.contains("args"), "final hop body missing: {body}");
+    }
+
+    /// A refused redirect (cleartext downgrade here) is handed back as the
+    /// stream itself: the 3xx head with the refusal marker, and its (empty)
+    /// body drained through the same pull API.
+    #[test]
+    fn streaming_refused_redirect_hands_back_the_marked_3xx() {
+        let server = TestH3Server::start();
+        let client = Arc::new(offline_client(VaneClientConfig::default()));
+
+        let stream = Arc::clone(&client)
+            .execute_streaming(test_request(&server.url("/redirect-http")))
+            .unwrap();
+        let head = stream.head();
+        assert_eq!(head.status_code, 302);
+        assert_eq!(
+            head.headers
+                .get(crate::REDIRECT_REFUSED_HEADER)
+                .map(String::as_str),
+            Some(crate::REDIRECT_REFUSED_DOWNGRADE)
+        );
+        assert!(stream.read_chunk().unwrap().is_none());
+    }
+
+    #[test]
+    fn streaming_cancel_aborts_mid_body_and_discards_the_connection() {
+        let server = TestH3Server::start();
+        let client = Arc::new(offline_client(VaneClientConfig::default()));
+        let cancel_id = crate::create_cancel_token();
+        let mut request = stream_request(&server);
+        request.cancel_token_id = Some(cancel_id);
+
+        let stream = Arc::clone(&client).execute_streaming(request).unwrap();
+        assert!(
+            stream.read_chunk().unwrap().is_some(),
+            "first chunk arrives before the cancel"
+        );
+        crate::cancel_by_id(cancel_id);
+        assert!(matches!(stream.read_chunk(), Err(VaneError::Cancelled(_))));
+        // Terminal: the same error replays, and the connection was discarded
+        // rather than pooled with an unread body.
+        assert!(matches!(stream.read_chunk(), Err(VaneError::Cancelled(_))));
+        assert!(client.pool.lock().unwrap().is_empty());
+        crate::free_cancel_token(cancel_id);
+    }
+
+    /// The response body limit applies to streamed bodies cumulatively —
+    /// streaming must not become the bypass route for a configured bound.
+    #[test]
+    fn streaming_enforces_the_response_body_limit() {
+        let server = TestH3Server::start();
+        let client = Arc::new(offline_client(VaneClientConfig {
+            max_response_body_bytes: 64 * 1024,
+            ..VaneClientConfig::default()
+        }));
+
+        // The limit can trip while reaching the headers (body bytes arriving
+        // in the same pass) or on a later pull; either way it must be a
+        // `BodyLimitExceeded` and the connection must not be pooled.
+        let err = match Arc::clone(&client).execute_streaming(stream_request(&server)) {
+            Err(err) => err,
+            Ok(stream) => loop {
+                match stream.read_chunk() {
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("stream ended under the limit"),
+                    Err(err) => break err,
+                }
+            },
+        };
+        assert!(matches!(err, VaneError::BodyLimitExceeded(_)), "{err}");
+        assert!(client.pool.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn streaming_close_without_draining_discards_the_connection() {
+        let server = TestH3Server::start();
+        let client = Arc::new(offline_client(VaneClientConfig::default()));
+
+        let stream = Arc::clone(&client)
+            .execute_streaming(stream_request(&server))
+            .unwrap();
+        assert!(stream.read_chunk().unwrap().is_some());
+        stream.close();
+        assert!(
+            client.pool.lock().unwrap().is_empty(),
+            "an undrained stream must never pool its connection"
+        );
+        // Reading after close is a clean EOF, not an error.
+        assert!(stream.read_chunk().unwrap().is_none());
+
+        // The next request has to dial a fresh connection (a resumed TLS
+        // handshake still counts: the ticket was banked at headers-time).
+        assert!(
+            client
+                .execute(test_request(&server.url("/get")))
+                .unwrap()
+                .is_success
+        );
+        assert_eq!(
+            server.handshakes().len(),
+            2,
+            "a closed stream's connection must not be reused"
+        );
+    }
+
+    /// Dropping an undrained stream without `close()` — the FFI-handle-freed
+    /// path — must clean up exactly like `close()`.
+    #[test]
+    fn streaming_drop_without_close_discards_the_connection() {
+        let server = TestH3Server::start();
+        let client = Arc::new(offline_client(VaneClientConfig::default()));
+
+        {
+            let stream = Arc::clone(&client)
+                .execute_streaming(stream_request(&server))
+                .unwrap();
+            assert!(stream.read_chunk().unwrap().is_some());
+        }
+        assert!(client.pool.lock().unwrap().is_empty());
     }
 }

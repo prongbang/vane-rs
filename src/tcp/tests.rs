@@ -1046,3 +1046,216 @@ mod resumption {
         );
     }
 }
+
+mod streaming {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{local_tls_server, raw_http_server, with_test_root};
+    use crate::{VaneClientConfig, VaneError, VaneHttpVersion, VaneProtocolMode};
+
+    fn streaming_client(port: u16) -> Arc<crate::VaneClient> {
+        Arc::new(
+            crate::VaneClient::new(VaneClientConfig {
+                base_url: Some(format!("https://localhost:{port}")),
+                protocol_mode: VaneProtocolMode::Http1Only,
+                timeout_seconds: Some(10),
+                ..VaneClientConfig::default()
+            })
+            .unwrap(),
+        )
+    }
+
+    /// Reads one request head off the TLS stream; the response is the
+    /// handler's business. Good for one request per connection.
+    fn read_request_head(tls: &mut super::TlsStream) {
+        let mut buf = [0u8; 4096];
+        let mut pending = Vec::new();
+        loop {
+            match std::io::Read::read(tls, &mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => pending.extend_from_slice(&buf[..read]),
+            }
+            if pending.windows(4).any(|window| window == b"\r\n\r\n") {
+                return;
+            }
+        }
+    }
+
+    /// The load-bearing streaming property: a chunk is delivered as soon as
+    /// the server sends it, not when the body completes. The server holds the
+    /// second half back for 500 ms, so the first pull can only ever contain
+    /// the first half — unless the client buffered the whole body, which is
+    /// exactly the bug this pins against.
+    #[test]
+    fn first_chunk_arrives_before_the_body_is_complete() {
+        let (port, ca, _leaf) = local_tls_server(b"http/1.1", |mut tls| {
+            read_request_head(&mut tls);
+            let head = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";
+            std::io::Write::write_all(&mut tls, head.as_bytes()).ok();
+            std::io::Write::write_all(&mut tls, b"part1").ok();
+            std::io::Write::flush(&mut tls).ok();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::io::Write::write_all(&mut tls, b"part2").ok();
+            std::io::Write::flush(&mut tls).ok();
+        });
+        let _guard = with_test_root(ca);
+        let client = streaming_client(port);
+
+        let stream = Arc::clone(&client)
+            .execute_streaming(crate::test_request("/"))
+            .unwrap();
+        let head = stream.head();
+        assert!(head.is_success);
+        assert!(head.body.is_empty());
+        assert_eq!(head.http_version, Some(VaneHttpVersion::Http11));
+
+        let first = stream.read_chunk().unwrap().unwrap();
+        assert_eq!(
+            first.as_slice(),
+            b"part1",
+            "the first pull must not wait for (or contain) the held-back half"
+        );
+        let mut rest = Vec::new();
+        while let Some(chunk) = stream.read_chunk().unwrap() {
+            rest.extend_from_slice(&chunk);
+        }
+        assert_eq!(rest.as_slice(), b"part2");
+    }
+
+    #[test]
+    fn cancel_mid_stream_is_terminal() {
+        let (port, ca, _leaf) = local_tls_server(b"http/1.1", |mut tls| {
+            read_request_head(&mut tls);
+            let head = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";
+            std::io::Write::write_all(&mut tls, head.as_bytes()).ok();
+            std::io::Write::write_all(&mut tls, b"part1").ok();
+            std::io::Write::flush(&mut tls).ok();
+            // Hold the connection open so the body never completes.
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+        let _guard = with_test_root(ca);
+        let client = streaming_client(port);
+        let cancel_id = crate::cancel_token_create();
+        let mut request = crate::test_request("/");
+        request.cancel_token_id = Some(cancel_id);
+
+        let stream = Arc::clone(&client).execute_streaming(request).unwrap();
+        assert_eq!(stream.read_chunk().unwrap().unwrap().as_slice(), b"part1");
+        crate::cancel_token_cancel(cancel_id);
+        assert!(matches!(stream.read_chunk(), Err(VaneError::Cancelled(_))));
+        // Terminal: replays, never resurrects.
+        assert!(matches!(stream.read_chunk(), Err(VaneError::Cancelled(_))));
+        crate::cancel_token_free(cancel_id);
+    }
+
+    #[test]
+    fn body_limit_applies_to_streamed_bodies() {
+        let (port, ca, _leaf) = local_tls_server(b"http/1.1", |mut tls| {
+            read_request_head(&mut tls);
+            let body = vec![b'x'; 128 * 1024];
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            std::io::Write::write_all(&mut tls, head.as_bytes()).ok();
+            std::io::Write::write_all(&mut tls, &body).ok();
+            std::io::Write::flush(&mut tls).ok();
+        });
+        let _guard = with_test_root(ca);
+        let client = Arc::new(
+            crate::VaneClient::new(VaneClientConfig {
+                base_url: Some(format!("https://localhost:{port}")),
+                protocol_mode: VaneProtocolMode::Http1Only,
+                timeout_seconds: Some(10),
+                max_response_body_bytes: 1024,
+                ..VaneClientConfig::default()
+            })
+            .unwrap(),
+        );
+
+        let stream = Arc::clone(&client)
+            .execute_streaming(crate::test_request("/"))
+            .unwrap();
+        let err = loop {
+            match stream.read_chunk() {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("stream ended under the limit"),
+                Err(err) => break err,
+            }
+        };
+        assert!(matches!(err, VaneError::BodyLimitExceeded(_)), "{err}");
+    }
+
+    #[test]
+    fn redirect_chain_streams_the_final_hop() {
+        let (port, ca) = raw_http_server(&[
+            (
+                "/hop",
+                "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n",
+            ),
+            ("/final", "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone"),
+        ]);
+        let _guard = with_test_root(ca);
+        let client = streaming_client(port);
+
+        let stream = Arc::clone(&client)
+            .execute_streaming(crate::test_request("/hop"))
+            .unwrap();
+        let head = stream.head();
+        assert_eq!(head.status_code, 200);
+        assert!(head.url.ends_with("/final"), "got {}", head.url);
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.read_chunk().unwrap() {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body.as_slice(), b"done");
+    }
+
+    /// A drained stream's connection goes back to hyper's pool; the follow-up
+    /// buffered request must ride it instead of dialing a second one.
+    #[test]
+    fn drained_stream_connection_is_reused() {
+        static CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+        const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let (port, ca, _leaf) = local_tls_server(b"http/1.1", |mut tls| {
+            CONNECTIONS.fetch_add(1, Ordering::SeqCst);
+            // Keep-alive loop: serve every request on this connection.
+            let mut buf = [0u8; 4096];
+            let mut pending = Vec::new();
+            loop {
+                match std::io::Read::read(&mut tls, &mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => pending.extend_from_slice(&buf[..read]),
+                }
+                while let Some(end) = pending
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|position| position + 4)
+                {
+                    pending.drain(..end);
+                    if std::io::Write::write_all(&mut tls, OK.as_bytes()).is_err() {
+                        return;
+                    }
+                    std::io::Write::flush(&mut tls).ok();
+                }
+            }
+        });
+        let _guard = with_test_root(ca);
+        let client = streaming_client(port);
+
+        let stream = Arc::clone(&client)
+            .execute_streaming(crate::test_request("/"))
+            .unwrap();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.read_chunk().unwrap() {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body.as_slice(), b"ok");
+
+        let followup = client.execute(crate::test_request("/")).unwrap();
+        assert!(followup.is_success);
+        assert_eq!(
+            CONNECTIONS.load(Ordering::SeqCst),
+            1,
+            "the buffered follow-up must reuse the drained stream's connection"
+        );
+    }
+}

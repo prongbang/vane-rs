@@ -27,12 +27,13 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, NamedGroup, SignatureScheme};
 
 use super::{
-    H3_BODY_BUFFER_BYTES, REDIRECT_REFUSED_CROSS_ORIGIN_BODY, REDIRECT_REFUSED_HEADER,
-    RedirectDecision, RedirectRewrite, ResponseState, Url, VaneClient, VaneError, VaneHttpVersion,
-    VaneProgressState, VaneProtocolMode, VaneRequest, VaneResponse, cancel_token, check_cancelled,
-    for_each_regular_header, header_survives_origin_change, may_resume_tls_session,
-    next_redirect_url, origin_port, progress_download, progress_init, progress_upload,
-    redact_url_userinfo, redirect_rewrite, resolve_peer_addr, verify_certificate_pins,
+    BodyStep, H3_BODY_BUFFER_BYTES, REDIRECT_REFUSED_CROSS_ORIGIN_BODY, REDIRECT_REFUSED_HEADER,
+    RedirectDecision, RedirectRewrite, ResponseState, StreamingBodySource, StreamingHopResult, Url,
+    VaneClient, VaneError, VaneHttpVersion, VaneProgressState, VaneProtocolMode, VaneRequest,
+    VaneResponse, VaneResponseStream, cancel_token, check_cancelled, for_each_regular_header,
+    header_survives_origin_change, may_resume_tls_session, next_redirect_url, origin_port,
+    progress_download, progress_init, progress_upload, redact_url_userinfo, redirect_rewrite,
+    resolve_peer_addr, streaming_head, verify_certificate_pins,
 };
 
 /// Wraps the platform's own certificate verifier and adds Vane's host-scoped
@@ -812,20 +813,10 @@ fn follow_and_read(
     cancel_token: Option<&AtomicBool>,
     progress: Option<&VaneProgressState>,
 ) -> Result<VaneResponse, VaneError> {
-    let origin = (
-        url.host_str().unwrap_or_default().to_string(),
-        origin_port(url),
-    );
-    let timeout = std::time::Duration::from_secs(
-        request
-            .timeout_seconds
-            .or(client.config.timeout_seconds)
-            .unwrap_or(30),
-    );
     // One deadline for the whole chain. Applying the timeout per hop would let
     // a hostile server hold a caller thread for hop-cap times the requested
     // timeout, and the retry loop multiplies that again.
-    let deadline = Instant::now() + timeout;
+    let deadline = request_deadline(client, request);
     let (http, certificate_pins) = shared_client(client)?;
 
     // Created before anything goes on the wire so a bad response_body_path
@@ -835,6 +826,80 @@ fn follow_and_read(
         request.response_body_path.as_deref(),
     )?;
 
+    let hop = follow(
+        client,
+        request,
+        url,
+        request_body,
+        cancel_token,
+        progress,
+        &http,
+        &certificate_pins,
+        deadline,
+    )?;
+
+    // Read off the final hop only — Vane runs `redirect::Policy::none()` and
+    // does its own hops — and before `read_body` moves the response.
+    let http_version = http_version_of(hop.response.version());
+    read_body(hop.response, &mut state, cancel_token, progress)?;
+
+    if let Some(reason) = hop.refused {
+        state
+            .headers
+            .insert(REDIRECT_REFUSED_HEADER.to_string(), reason.to_string());
+    }
+
+    let status_code = state.status_code;
+    Ok(VaneResponse {
+        status_code,
+        headers: state.headers,
+        body: state.body,
+        body_file_path: state.body_file_path,
+        is_success: (200..=299).contains(&status_code),
+        url: hop.url.to_string(),
+        set_cookie: state.set_cookie_headers,
+        http_version,
+    })
+}
+
+fn request_deadline(client: &VaneClient, request: &VaneRequest) -> Instant {
+    Instant::now()
+        + std::time::Duration::from_secs(
+            request
+                .timeout_seconds
+                .or(client.config.timeout_seconds)
+                .unwrap_or(30),
+        )
+}
+
+/// The redirect chain's final hop, its body still unread.
+struct TcpFinalHop {
+    response: reqwest::blocking::Response,
+    /// Why the chain stopped on a 3xx it refused to follow, if it did.
+    refused: Option<&'static str>,
+    /// URL the final hop was served from.
+    url: Url,
+}
+
+/// Runs the redirect chain and returns the final hop with its body untouched,
+/// so the caller can read it whole or stream it. Intermediate 3xx bodies are
+/// never read: reqwest drops them with the hop's response.
+#[allow(clippy::too_many_arguments)]
+fn follow(
+    client: &VaneClient,
+    request: &VaneRequest,
+    url: &Url,
+    request_body: &[u8],
+    cancel_token: Option<&AtomicBool>,
+    progress: Option<&VaneProgressState>,
+    http: &Client,
+    certificate_pins: &HashMap<String, Vec<String>>,
+    deadline: Instant,
+) -> Result<TcpFinalHop, VaneError> {
+    let origin = (
+        url.host_str().unwrap_or_default().to_string(),
+        origin_port(url),
+    );
     let mut current = url.clone();
     let mut method = reqwest::Method::from_bytes(request.method.to_ascii_uppercase().as_bytes())
         .map_err(|_| {
@@ -947,7 +1012,7 @@ fn follow_and_read(
             }
         }
 
-        let next = match redirect_target(&response, &current, request, hops, &certificate_pins) {
+        let next = match redirect_target(&response, &current, request, hops, certificate_pins) {
             RedirectDecision::Stop => break response,
             RedirectDecision::Refused(reason) => {
                 refused = Some(reason);
@@ -982,28 +1047,149 @@ fn follow_and_read(
         hops += 1;
     };
 
-    // Read off the final hop only — Vane runs `redirect::Policy::none()` and
-    // does its own hops — and before `read_body` moves the response.
-    let http_version = http_version_of(response.version());
-    read_body(response, &mut state, cancel_token, progress)?;
+    Ok(TcpFinalHop {
+        response,
+        refused,
+        url: current,
+    })
+}
 
-    if let Some(reason) = refused {
-        state
-            .headers
+/// Streaming twin of [`execute_tcp_once`]: identical up to the final hop's
+/// headers, after which the unread reqwest response becomes the stream's body
+/// source. The per-request timeout armed on the hop keeps working after this
+/// returns: reqwest re-anchors it on every blocking body read, which makes it
+/// the stream's per-pull inactivity budget.
+pub(crate) fn execute_tcp_streaming_once(
+    client: &VaneClient,
+    request: &VaneRequest,
+    url: &Url,
+    request_body: &[u8],
+) -> Result<VaneResponseStream, VaneError> {
+    // Same guard as the HTTP/3 path; see `execute_tcp_once`.
+    if url.scheme() != "https" {
+        return Err(VaneError::InvalidRequest(
+            "Vane only supports https:// URLs".to_string(),
+        ));
+    }
+
+    let cancel_token = cancel_token(request.cancel_token_id);
+    let progress = progress_init(request.progress_id, request_body.len() as u64);
+    let deadline = request_deadline(client, request);
+    let (http, certificate_pins) = shared_client(client)?;
+    // No body file: `execute_streaming` already refused `response_body_path`.
+    let mut state = ResponseState::new(client.config.max_response_body_bytes, None)?;
+
+    let hop = follow(
+        client,
+        request,
+        url,
+        request_body,
+        cancel_token.as_deref(),
+        progress.as_deref(),
+        &http,
+        &certificate_pins,
+        deadline,
+    )?;
+
+    let http_version = http_version_of(hop.response.version());
+    merge_response_head(&hop.response, &mut state);
+    let mut head = streaming_head(&mut state, &hop.url, http_version);
+    if let Some(reason) = hop.refused {
+        head.headers
             .insert(REDIRECT_REFUSED_HEADER.to_string(), reason.to_string());
     }
 
-    let status_code = state.status_code;
-    Ok(VaneResponse {
-        status_code,
-        headers: state.headers,
-        body: state.body,
-        body_file_path: state.body_file_path,
-        is_success: (200..=299).contains(&status_code),
-        url: current.to_string(),
-        set_cookie: state.set_cookie_headers,
-        http_version,
-    })
+    let source = StreamingBodySource::Tcp(Box::new(TcpBodyStream {
+        response: Some(hop.response),
+        state,
+        buf: vec![0; H3_BODY_BUFFER_BYTES],
+    }));
+    Ok(StreamingHopResult { head, source }.into_stream(cancel_token, progress))
+}
+
+/// A live TCP response body: the unread reqwest response plus the shared
+/// accumulator that enforces the body limit and feeds progress.
+pub(crate) struct TcpBodyStream {
+    /// `None` once abandoned. Dropping a reqwest response mid-body discards
+    /// its connection — hyper only pools a connection whose body was read to
+    /// EOF — which is exactly the pool rule streaming needs.
+    response: Option<reqwest::blocking::Response>,
+    /// Headers already stripped into the caller's head; carries the body
+    /// accumulator and the cumulative limit counters.
+    state: ResponseState,
+    buf: Vec<u8>,
+}
+
+impl TcpBodyStream {
+    pub(crate) fn next(
+        &mut self,
+        cancel: Option<&AtomicBool>,
+        progress: Option<&VaneProgressState>,
+    ) -> Result<BodyStep, VaneError> {
+        let Some(response) = self.response.as_mut() else {
+            return Err(VaneError::Generic(
+                "Response stream connection is gone".to_string(),
+            ));
+        };
+        loop {
+            // ponytail: only between reads, so a cancel lands on a chunk
+            // boundary — on a stalled stream it takes effect when the read
+            // returns, at worst after the per-read timeout.
+            check_cancelled(cancel)?;
+            match response.read(&mut self.buf) {
+                Ok(0) => break,
+                Ok(read) => {
+                    self.state.push_body(&self.buf[..read])?;
+                    progress_download(
+                        progress,
+                        self.state.body_len as u64,
+                        self.state.download_total,
+                    );
+                    return Ok(BodyStep::Chunk(std::mem::take(&mut self.state.body)));
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if is_read_timeout(&e) => {
+                    return Err(VaneError::Timeout(format!(
+                        "HTTP response body read timed out: {e}"
+                    )));
+                }
+                Err(e) => {
+                    return Err(VaneError::Transport(format!(
+                        "Failed to read HTTP response body: {e}"
+                    )));
+                }
+            }
+        }
+        // EOF: dropping the drained response hands its connection back to
+        // hyper's pool. Publish the final figure so a poller sees
+        // received == total even without a content-length.
+        self.response = None;
+        progress_download(
+            progress,
+            self.state.body_len as u64,
+            self.state.body_len as u64,
+        );
+        Ok(BodyStep::Eof)
+    }
+
+    pub(crate) fn abandon(&mut self) {
+        // Dropping mid-body closes the connection; nothing else to do.
+        self.response = None;
+    }
+}
+
+/// Whether a blocking body-read error is the per-read timeout. reqwest
+/// surfaces it as `ErrorKind::Other` wrapping its own `Error`, so the kind
+/// alone cannot say; `TimedOut`/`WouldBlock` are kept for plain socket-level
+/// timeouts.
+fn is_read_timeout(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    ) || error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+        .is_some_and(reqwest::Error::is_timeout)
 }
 
 /// reqwest hands back the version hyper read off the wire (h2 stamps
@@ -1096,24 +1282,30 @@ fn redirect_target(
     )
 }
 
+/// Folds the final hop's status and headers into the shared state.
+fn merge_response_head(response: &reqwest::blocking::Response, state: &mut ResponseState) {
+    state.status_code = response.status().as_u16();
+    for (name, value) in response.headers() {
+        // One `(name, value)` pair per occurrence; the shared merge joins
+        // repeats and diverts `set-cookie` to its own list, so the map cannot
+        // depend on which transport served the response. `Set-Cookie` is
+        // surfaced even with the jar off — the cookie harvest in `follow` is
+        // gated on `cookies_enabled`, this is not, or the caller loses it
+        // entirely.
+        state.merge_header(
+            name.as_str().to_string(),
+            String::from_utf8_lossy(value.as_bytes()).to_string(),
+        );
+    }
+}
+
 fn read_body(
     mut response: reqwest::blocking::Response,
     state: &mut ResponseState,
     cancel_token: Option<&AtomicBool>,
     progress: Option<&VaneProgressState>,
 ) -> Result<(), VaneError> {
-    state.status_code = response.status().as_u16();
-    for (name, value) in response.headers() {
-        // One `(name, value)` pair per occurrence; the shared merge joins
-        // repeats and diverts `set-cookie` to its own list, so the map cannot
-        // depend on which transport served the response. `Set-Cookie` is
-        // surfaced even with the jar off — the harvest above is gated on
-        // `cookies_enabled`, this is not, or the caller loses it entirely.
-        state.merge_header(
-            name.as_str().to_string(),
-            String::from_utf8_lossy(value.as_bytes()).to_string(),
-        );
-    }
+    merge_response_head(&response, state);
 
     let mut buf = vec![0; H3_BODY_BUFFER_BYTES];
     loop {
