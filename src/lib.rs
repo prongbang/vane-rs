@@ -3757,6 +3757,19 @@ fn rewrites_to_get(status_code: u16, method: &str) -> bool {
 /// empty. The previous always-blocking loop slept out the full timer after
 /// every burst with the ACKs still queued, which added ~min(timer, 50 ms) to
 /// each response flight and stalled the peer's congestion window.
+/// Blocking-recv timeout for `read_quic_packets`: the QUIC timer, defaulted
+/// to 10 ms when quiche has none pending, capped at 50 ms so the caller's
+/// cancel/deadline checks keep ticking. Floored at 1 ms because a pooled
+/// connection checked out after its quiche timer already expired reports
+/// `Duration::ZERO`, and `UdpSocket::set_read_timeout(Some(ZERO))` is an
+/// error in std — the request would fail instead of just polling promptly
+/// (the expired timer itself fires via `on_timeout` on the recv-timeout arm).
+fn quic_read_timeout(conn_timeout: Option<Duration>) -> Duration {
+    conn_timeout
+        .unwrap_or(Duration::from_millis(10))
+        .clamp(Duration::from_millis(1), Duration::from_millis(50))
+}
+
 fn read_quic_packets(
     socket: &UdpSocket,
     last_read_timeout: &mut Option<Duration>,
@@ -3765,10 +3778,7 @@ fn read_quic_packets(
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
 ) -> Result<(), VaneError> {
-    let timeout = conn
-        .timeout()
-        .unwrap_or(Duration::from_millis(10))
-        .min(Duration::from_millis(50));
+    let timeout = quic_read_timeout(conn.timeout());
     if *last_read_timeout != Some(timeout) {
         socket
             .set_read_timeout(Some(timeout))
@@ -4969,6 +4979,31 @@ mod tests {
         assert!(
             body.contains(expected),
             "expected response body to contain {expected:?}, got {body}"
+        );
+    }
+
+    #[test]
+    fn quic_read_timeout_stays_in_settable_range() {
+        // A pooled connection with an already-expired quiche timer reports
+        // ZERO, which UdpSocket::set_read_timeout rejects — must floor to 1 ms.
+        assert_eq!(
+            quic_read_timeout(Some(Duration::ZERO)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            quic_read_timeout(Some(Duration::from_micros(200))),
+            Duration::from_millis(1)
+        );
+        // No timer pending: the 10 ms default.
+        assert_eq!(quic_read_timeout(None), Duration::from_millis(10));
+        // In-range timers pass through; long timers cap at 50 ms.
+        assert_eq!(
+            quic_read_timeout(Some(Duration::from_millis(25))),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            quic_read_timeout(Some(Duration::from_secs(3))),
+            Duration::from_millis(50)
         );
     }
 
