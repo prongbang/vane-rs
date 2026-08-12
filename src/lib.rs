@@ -2414,6 +2414,44 @@ fn insert_tls_session(
     sessions.insert(key.clone(), session);
 }
 
+/// Asks the kernel for a 1 MB receive buffer on a QUIC UDP socket —
+/// best-effort, the same number Chromium's QUIC stack requests.
+///
+/// A pooled connection keeps the server's congestion window hot, so a whole
+/// response flight arrives back-to-back; at ~2 KB of kernel skb accounting
+/// per 1350-byte datagram, a ~110-packet flight (~126 KB of payload) costs
+/// ~256 KB of socket buffer, which overflows Linux/Android's default
+/// `rmem_default` (212–229 KB). Every overflowed packet is silently dropped
+/// (`Udp: RcvbufErrors`) and costs the transfer a fast-retransmit RTT — or a
+/// full probe timeout, tens of ms, when the tail of the flight is hit.
+/// Measured on the Android emulator benchmark: one drop per request on
+/// average, and every ≥50 ms body-transfer stall traced to it.
+///
+/// The kernel clamps the request to `rmem_max` on its own, and `SO_RCVBUF`
+/// is a limit, not an allocation — an idle pooled connection costs nothing.
+/// A socket that keeps its default buffer is still a working socket, so
+/// failure (e.g. a platform rejecting the size) is deliberately ignored.
+fn request_large_udp_recv_buffer(socket: &UdpSocket) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let size: libc::c_int = 1024 * 1024;
+        // SAFETY: setsockopt on an open, owned fd, with a valid c_int payload
+        // and its exact size; the fd outlives the call.
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&raw const size).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = socket;
+}
+
 /// `timeout` bounds the handshake; `idle_timeout` becomes the connection's QUIC
 /// idle timeout and keys the config cache, so it must not shrink per redirect
 /// hop.
@@ -2433,6 +2471,7 @@ fn connect_quic_h3(
 
     let socket = UdpSocket::bind(bind_addr)
         .map_err(|e| VaneError::Generic(format!("Failed to bind UDP socket: {e}")))?;
+    request_large_udp_recv_buffer(&socket);
     socket.connect(peer_addr).map_err(|e| {
         VaneError::Generic(format!("Failed to connect UDP socket to {peer_addr}: {e}"))
     })?;
@@ -5005,6 +5044,47 @@ mod tests {
             quic_read_timeout(Some(Duration::from_secs(3))),
             Duration::from_millis(50)
         );
+    }
+
+    /// The sockopt call ignores errors by design (a default-buffer socket
+    /// still works), so a typo in level/optname would regress silently — this
+    /// readback is the only thing that would catch it.
+    #[cfg(unix)]
+    #[test]
+    fn quic_socket_receive_buffer_actually_grows() {
+        use std::os::fd::AsRawFd as _;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let read_back = |socket: &UdpSocket| {
+            let mut size: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: getsockopt on an open fd with a correctly-sized out slot.
+            let rc = unsafe {
+                libc::getsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    (&raw mut size).cast(),
+                    &raw mut len,
+                )
+            };
+            assert_eq!(rc, 0, "getsockopt(SO_RCVBUF) failed");
+            size
+        };
+
+        let before = read_back(&socket);
+        request_large_udp_recv_buffer(&socket);
+        let after = read_back(&socket);
+
+        // Exact values are platform policy (Linux doubles the request and
+        // clamps to rmem_max; macOS reports the request verbatim), so assert
+        // the floor that matters: comfortably above the ~110-packet response
+        // flight that overflowed Linux/Android's ~213-229 KB default.
+        assert!(
+            after >= 262_144,
+            "SO_RCVBUF after request: {after} (before: {before})"
+        );
+        assert!(after >= before, "SO_RCVBUF shrank: {before} -> {after}");
     }
 
     #[test]
