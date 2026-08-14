@@ -894,4 +894,82 @@ mod tests {
         }
         assert!(client.pool.lock().unwrap().is_empty());
     }
+
+    /// The whole C ABI stream lifecycle against the in-process server, byte
+    /// for byte: head through `VaneFfiResponse` with an empty body buffer,
+    /// the chunk pull loop, the EOF latch, and close freeing the registry
+    /// entry — after which a read reports EOF, not an error. This is the
+    /// only test that exercises the exact structs and ownership rules the
+    /// Dart pump builds on.
+    #[test]
+    fn ffi_streaming_round_trips_the_c_abi() {
+        let server = TestH3Server::start();
+        let client = Arc::new(offline_client(VaneClientConfig::default()));
+        let handle = crate::FFI_NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::FFI_CLIENTS
+            .lock()
+            .unwrap()
+            .insert(handle, Arc::clone(&client));
+
+        let url = server.url(&format!("/bytes/{STREAM_BODY_LEN}"));
+        let request = crate::test_ffi_request(&url);
+        let mut stream_id = 0u64;
+        let response = crate::vane_ffi_execute_streaming(
+            handle,
+            &request,
+            std::ptr::null(),
+            0,
+            &mut stream_id,
+        );
+        unsafe {
+            assert_eq!((*response).error.len, 0, "the head must not be an error");
+            assert_eq!((*response).status_code, 200);
+            assert_eq!((*response).body.len, 0, "the stream head carries no body");
+            crate::vane_ffi_response_free(response);
+        }
+        assert_ne!(stream_id, 0, "success must hand out a stream handle");
+
+        let mut body = Vec::new();
+        let mut chunks = 0usize;
+        loop {
+            let chunk = crate::vane_ffi_stream_read(stream_id);
+            assert_eq!(chunk.error.len, 0, "no chunk may carry an error");
+            if chunk.eof {
+                crate::vane_ffi_buffer_free(chunk.body);
+                crate::vane_ffi_buffer_free(chunk.error);
+                break;
+            }
+            assert!(!chunk.body.data.is_null() && chunk.body.len > 0);
+            body.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(chunk.body.data, chunk.body.len)
+            });
+            chunks += 1;
+            crate::vane_ffi_buffer_free(chunk.body);
+            crate::vane_ffi_buffer_free(chunk.error);
+        }
+        assert_eq!(body.len(), STREAM_BODY_LEN);
+        assert!(
+            body == body_pattern(STREAM_BODY_LEN),
+            "body content differs"
+        );
+        assert!(chunks > 1, "3 MiB cannot arrive as one chunk");
+
+        // EOF latches through the ABI.
+        let again = crate::vane_ffi_stream_read(stream_id);
+        assert!(again.eof);
+        crate::vane_ffi_buffer_free(again.body);
+        crate::vane_ffi_buffer_free(again.error);
+
+        crate::vane_ffi_stream_close(stream_id);
+        assert!(
+            !crate::FFI_STREAMS.lock().unwrap().contains_key(&stream_id),
+            "close must free the registry entry"
+        );
+        let after_close = crate::vane_ffi_stream_read(stream_id);
+        assert!(after_close.eof, "read after close is EOF, not an error");
+        crate::vane_ffi_buffer_free(after_close.body);
+        crate::vane_ffi_buffer_free(after_close.error);
+
+        crate::vane_ffi_client_close(handle);
+    }
 }

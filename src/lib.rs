@@ -5138,8 +5138,33 @@ pub struct VaneFfiProgress {
     pub done: bool,
 }
 
+/// One blocking pull off a response stream, returned by value like
+/// [`VaneFfiProgress`]. Exactly one of three shapes:
+///
+/// - `eof == false`, `error` empty: `body` holds a chunk the caller now owns
+///   and frees with `vane_ffi_buffer_free`.
+/// - `eof == true`: end of body; both buffers are empty.
+/// - `error` non-empty: terminal failure (`error_kind` is
+///   `VaneError::ffi_kind`); the stream is dead and every later pull repeats
+///   the same error. The caller frees `error` with `vane_ffi_buffer_free`.
+#[repr(C)]
+pub struct VaneFfiStreamChunk {
+    pub body: VaneFfiBuffer,
+    pub error: VaneFfiBuffer,
+    pub error_kind: u32,
+    pub eof: bool,
+}
+
 static FFI_CLIENTS: LazyLock<Mutex<HashMap<u64, Arc<VaneClient>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Live response streams, keyed by the handle `vane_ffi_execute_streaming`
+/// hands out. `Arc` so a read can clone its stream out and release this lock
+/// before blocking — a pull parked here for the life of a chunk must never
+/// queue other streams' operations behind the map.
+static FFI_STREAMS: LazyLock<Mutex<HashMap<u64, Arc<VaneResponseStream>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Shared by clients and streams: ids stay globally unique, so a handle from
+/// one namespace passed to the other's functions can never resolve.
 static FFI_NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 /// Version of the raw C ABI (`vane_ffi_*` symbols and `VaneFfi*` structs).
@@ -5158,9 +5183,13 @@ static FFI_NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 /// error instead of a symbol-lookup failure.
 ///
 /// v2: added `vane_ffi_client_warmup`.
+///
+/// v3: response-body streaming — `vane_ffi_execute_streaming`,
+/// `vane_ffi_stream_read`, `vane_ffi_stream_close`, and the
+/// `VaneFfiStreamChunk` struct.
 #[unsafe(no_mangle)]
 pub extern "C" fn vane_ffi_abi_version() -> u32 {
-    2
+    3
 }
 
 #[unsafe(no_mangle)]
@@ -5321,6 +5350,88 @@ pub extern "C" fn vane_ffi_buffer_free(buffer: VaneFfiBuffer) {
     ffi_buffer_free(buffer);
 }
 
+/// Like `vane_ffi_execute`, but returns as soon as the final response's
+/// headers are in. The returned `VaneFfiResponse` is the head (its body
+/// buffer is empty by contract; error fields are filled on failure exactly as
+/// `vane_ffi_execute` fills them) and is freed with `vane_ffi_response_free`.
+/// On success `*out_stream` is a nonzero stream handle for
+/// `vane_ffi_stream_read` / `vane_ffi_stream_close`; on failure it is 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_execute_streaming(
+    handle: u64,
+    request: *const VaneFfiRequest,
+    body_data: *const u8,
+    body_len: usize,
+    out_stream: *mut u64,
+) -> *mut VaneFfiResponse {
+    ffi_store_u64(out_stream, 0);
+    let result =
+        std::panic::catch_unwind(|| ffi_execute_streaming(handle, request, body_data, body_len));
+    let response = match result {
+        Ok(Ok((head, stream_id))) => {
+            if out_stream.is_null() {
+                // Nowhere to report the handle: close the stream now rather
+                // than leak a live connection, and report the misuse.
+                vane_ffi_stream_close(stream_id);
+                ffi_error_response(VaneError::InvalidRequest(
+                    "out_stream pointer is null".to_string(),
+                ))
+            } else {
+                ffi_store_u64(out_stream, stream_id);
+                ffi_response_from_vane(head)
+            }
+        }
+        Ok(Err(error)) => ffi_error_response(error),
+        Err(_) => ffi_error_response(VaneError::Generic(
+            "Rust panic while executing streaming Vane request".to_string(),
+        )),
+    };
+    Box::into_raw(Box::new(response))
+}
+
+/// Null-tolerant out-parameter store; the private-fn shape (like
+/// [`ffi_clear_error`]) is what keeps the exported callers clean under
+/// `clippy::not_unsafe_ptr_arg_deref`.
+fn ffi_store_u64(target: *mut u64, value: u64) {
+    if !target.is_null() {
+        unsafe { *target = value };
+    }
+}
+
+/// One blocking pull; see [`VaneFfiStreamChunk`] for the result contract.
+/// An unknown handle reads as EOF, not an error: `vane_ffi_stream_close`
+/// frees the handle, and reading after close is `Ok(None)` by the core's
+/// contract — the two are indistinguishable on purpose.
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_stream_read(stream: u64) -> VaneFfiStreamChunk {
+    match std::panic::catch_unwind(|| ffi_stream_read(stream)) {
+        Ok(chunk) => chunk,
+        Err(_) => ffi_stream_chunk_error(VaneError::Generic(
+            "Rust panic while reading Vane response stream".to_string(),
+        )),
+    }
+}
+
+/// Idempotent early release; also frees the handle. Safe on unknown handles.
+/// Serializes with an in-flight `vane_ffi_stream_read` on the same stream
+/// (it waits for that read to return); cancel the request's token first to
+/// interrupt a blocked read.
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_stream_close(stream: u64) {
+    let _ = std::panic::catch_unwind(|| {
+        // Remove under the map lock, close outside it: close() can wait for
+        // an in-flight read, and holding the map through that wait would
+        // block every other stream's create/read/close behind this one.
+        let entry = FFI_STREAMS
+            .lock()
+            .ok()
+            .and_then(|mut streams| streams.remove(&stream));
+        if let Some(entry) = entry {
+            entry.close();
+        }
+    });
+}
+
 fn ffi_create_client(config: *const VaneFfiClientConfig) -> Result<u64, String> {
     let config = ffi_config(config)?;
     let client = Arc::new(VaneClient::new(config).map_err(|error| error.to_string())?);
@@ -5363,6 +5474,69 @@ fn ffi_execute(
         request.body = None;
     }
     client.execute(request)
+}
+
+fn ffi_execute_streaming(
+    handle: u64,
+    request: *const VaneFfiRequest,
+    body_data: *const u8,
+    body_len: usize,
+) -> Result<(VaneResponse, u64), VaneError> {
+    let client = {
+        let clients = FFI_CLIENTS
+            .lock()
+            .map_err(|_| VaneError::Generic("Vane FFI client registry lock was poisoned".into()))?;
+        clients.get(&handle).cloned().ok_or_else(|| {
+            VaneError::InvalidRequest(format!("No Vane client exists for handle {handle}"))
+        })?
+    };
+    let mut request = ffi_request(request).map_err(VaneError::InvalidRequest)?;
+    if body_len > 0 {
+        // Same precheck as `ffi_execute`: refuse before the copy materializes
+        // an over-limit body.
+        validate_request_body_limit(body_len as u64, client.config.max_request_body_bytes)?;
+        request.body = Some(
+            ffi_bytes(body_data, body_len)
+                .map_err(VaneError::InvalidRequest)?
+                .to_vec(),
+        );
+    } else {
+        request.body = None;
+    }
+    let stream = client.execute_streaming(request)?;
+    let head = stream.head();
+    let stream_id = FFI_NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    FFI_STREAMS
+        .lock()
+        // Dropping `stream` on this path closes it and discards the
+        // connection; nothing leaks for the error the caller sees.
+        .map_err(|_| VaneError::Generic("Vane FFI stream registry lock was poisoned".into()))?
+        .insert(stream_id, Arc::new(stream));
+    Ok((head, stream_id))
+}
+
+fn ffi_stream_read(stream: u64) -> VaneFfiStreamChunk {
+    // Clone the Arc out and release the registry lock BEFORE blocking in
+    // read_chunk: a pull can park for the life of a chunk, and other streams'
+    // reads and closes must not queue behind it on the map lock.
+    let entry = match FFI_STREAMS.lock() {
+        Ok(streams) => streams.get(&stream).cloned(),
+        Err(_) => {
+            return ffi_stream_chunk_error(VaneError::Generic(
+                "Vane FFI stream registry lock was poisoned".to_string(),
+            ));
+        }
+    };
+    let Some(entry) = entry else {
+        // Freed (or never issued) handle: indistinguishable from
+        // read-after-close, which the core defines as EOF.
+        return ffi_stream_chunk_eof();
+    };
+    match entry.read_chunk() {
+        Ok(Some(bytes)) => ffi_stream_chunk_body(bytes),
+        Ok(None) => ffi_stream_chunk_eof(),
+        Err(error) => ffi_stream_chunk_error(error),
+    }
 }
 
 fn ffi_set_certificate_pins(
@@ -5413,6 +5587,33 @@ fn ffi_error_response(error: VaneError) -> VaneFfiResponse {
         body_file_path: ffi_buffer_from_vec(Vec::new()),
         url: ffi_buffer_from_vec(Vec::new()),
         error: ffi_buffer_from_vec(error.to_string().into_bytes()),
+    }
+}
+
+fn ffi_stream_chunk_body(bytes: Vec<u8>) -> VaneFfiStreamChunk {
+    VaneFfiStreamChunk {
+        body: ffi_buffer_from_vec(bytes),
+        error: ffi_buffer_from_vec(Vec::new()),
+        error_kind: 0,
+        eof: false,
+    }
+}
+
+fn ffi_stream_chunk_eof() -> VaneFfiStreamChunk {
+    VaneFfiStreamChunk {
+        body: ffi_buffer_from_vec(Vec::new()),
+        error: ffi_buffer_from_vec(Vec::new()),
+        error_kind: 0,
+        eof: true,
+    }
+}
+
+fn ffi_stream_chunk_error(error: VaneError) -> VaneFfiStreamChunk {
+    VaneFfiStreamChunk {
+        body: ffi_buffer_from_vec(Vec::new()),
+        error: ffi_buffer_from_vec(error.to_string().into_bytes()),
+        error_kind: error.ffi_kind(),
+        eof: false,
     }
 }
 
@@ -5700,6 +5901,37 @@ fn ffi_bytes<'a>(data: *const u8, len: usize) -> Result<&'a [u8], String> {
 pub(crate) fn tcp_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// FFI twin of [`test_request`]: a GET `VaneFfiRequest` whose one string
+/// field borrows from `url` — keep that alive for the struct's lifetime.
+/// Shared by the unit tests in this file, `h3_offline` and `tcp::tests`.
+#[cfg(test)]
+fn test_ffi_request(url: &str) -> VaneFfiRequest {
+    let null_string = || VaneFfiString {
+        data: ptr::null(),
+        len: 0,
+    };
+    VaneFfiRequest {
+        url: VaneFfiString {
+            data: url.as_ptr(),
+            len: url.len(),
+        },
+        method: VaneFfiString {
+            data: b"GET".as_ptr(),
+            len: 3,
+        },
+        headers: ptr::null(),
+        headers_len: 0,
+        query_params: ptr::null(),
+        query_params_len: 0,
+        body_file_path: null_string(),
+        response_body_path: null_string(),
+        cancel_token_id: 0,
+        progress_id: 0,
+        timeout_seconds: -1,
+        follow_redirects: true,
+    }
 }
 
 /// Shared by the unit tests in this file and in `tcp::tests`.
@@ -7617,7 +7849,50 @@ mod tests {
     /// cannot land without the author reading that contract.
     #[test]
     fn c_abi_version_is_the_one_the_dart_bindings_expect() {
-        assert_eq!(vane_ffi_abi_version(), 2);
+        assert_eq!(vane_ffi_abi_version(), 3);
+    }
+
+    /// The registry side of the stream ABI, without a server: a handle that
+    /// was never issued (or was already closed — close frees the handle, so
+    /// the two are the same case) reads as EOF, and closing it is a safe
+    /// no-op, twice. This is what makes the Dart pump's close-then-exit
+    /// teardown unable to corrupt anything even if a message is replayed.
+    #[test]
+    fn ffi_stream_unknown_handle_reads_eof_and_closes_safely() {
+        let unknown = FFI_NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+
+        let chunk = vane_ffi_stream_read(unknown);
+        assert!(chunk.eof);
+        assert_eq!(chunk.error.len, 0);
+        assert_eq!(chunk.error_kind, 0);
+        assert_eq!(chunk.body.len, 0);
+        vane_ffi_buffer_free(chunk.body);
+        vane_ffi_buffer_free(chunk.error);
+
+        vane_ffi_stream_close(unknown);
+        vane_ffi_stream_close(unknown);
+        assert!(!FFI_STREAMS.lock().unwrap().contains_key(&unknown));
+    }
+
+    /// `vane_ffi_execute_streaming` against a bad client handle: the error
+    /// comes back through the head response with `out_stream` cleared to 0,
+    /// and nothing is registered in the stream map.
+    #[test]
+    fn ffi_execute_streaming_bad_client_reports_through_the_head() {
+        let url = "https://vane-ffi-stream.invalid/";
+        let request = test_ffi_request(url);
+
+        let mut out_stream = u64::MAX;
+        let response = vane_ffi_execute_streaming(0, &request, ptr::null(), 0, &mut out_stream);
+        assert_eq!(out_stream, 0, "a failed request must report no stream");
+        unsafe {
+            assert!((*response).error.len > 0);
+            assert_eq!(
+                (*response).error_kind,
+                VaneError::InvalidRequest(String::new()).ffi_kind()
+            );
+            vane_ffi_response_free(response);
+        }
     }
 
     #[test]

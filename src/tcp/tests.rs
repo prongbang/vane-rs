@@ -1123,6 +1123,144 @@ mod streaming {
         assert_eq!(rest.as_slice(), b"part2");
     }
 
+    /// The load-bearing FFI rule from the streaming design: a blocked
+    /// `vane_ffi_stream_read` must never hold the stream-registry lock.
+    /// Stream A's second read is parked on a server that holds its body
+    /// open; while it is provably parked, a second stream's entire
+    /// create-read-close lifecycle must complete. If the parked read held
+    /// the map lock, stream B would hang behind it and the 5-second
+    /// receive below would fail.
+    #[test]
+    fn ffi_blocked_read_does_not_hold_the_stream_registry() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let release = Arc::new(AtomicBool::new(false));
+        let release_for_server = Arc::clone(&release);
+        let connections = Arc::new(AtomicUsize::new(0));
+        // Connection 1 is stream A: half a body, then hold until released.
+        // Every later connection is stream B: a small complete body.
+        let (port, ca, _leaf) = local_tls_server(b"http/1.1", move |mut tls| {
+            read_request_head(&mut tls);
+            if connections.fetch_add(1, Ordering::SeqCst) == 0 {
+                let head = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";
+                std::io::Write::write_all(&mut tls, head.as_bytes()).ok();
+                std::io::Write::write_all(&mut tls, b"part1").ok();
+                std::io::Write::flush(&mut tls).ok();
+                while !release_for_server.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                std::io::Write::write_all(&mut tls, b"part2").ok();
+                std::io::Write::flush(&mut tls).ok();
+            } else {
+                let head = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\ndone!";
+                std::io::Write::write_all(&mut tls, head.as_bytes()).ok();
+                std::io::Write::flush(&mut tls).ok();
+            }
+        });
+        let _guard = with_test_root(ca);
+        let client = streaming_client(port);
+        let client_handle =
+            crate::FFI_NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::FFI_CLIENTS
+            .lock()
+            .unwrap()
+            .insert(client_handle, Arc::clone(&client));
+
+        // Stream A up and half-read, so its next read parks.
+        let request_a = crate::test_ffi_request("/");
+        let mut stream_a = 0u64;
+        let head_a = crate::vane_ffi_execute_streaming(
+            client_handle,
+            &request_a,
+            std::ptr::null(),
+            0,
+            &mut stream_a,
+        );
+        unsafe {
+            assert_eq!((*head_a).error.len, 0);
+            crate::vane_ffi_response_free(head_a);
+        }
+        let first = crate::vane_ffi_stream_read(stream_a);
+        assert!(!first.eof && first.error.len == 0);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(first.body.data, first.body.len) },
+            b"part1"
+        );
+        crate::vane_ffi_buffer_free(first.body);
+        crate::vane_ffi_buffer_free(first.error);
+
+        let parked = std::thread::spawn(move || {
+            let chunk = crate::vane_ffi_stream_read(stream_a);
+            let body = if chunk.body.data.is_null() {
+                Vec::new()
+            } else {
+                unsafe { std::slice::from_raw_parts(chunk.body.data, chunk.body.len) }.to_vec()
+            };
+            let failed = chunk.error.len > 0;
+            crate::vane_ffi_buffer_free(chunk.body);
+            crate::vane_ffi_buffer_free(chunk.error);
+            (body, chunk.eof, failed)
+        });
+        // Give the parked read time to enter the blocking pull. Best-effort:
+        // if it has not parked yet, the test still passes but proves less.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Stream B's whole lifecycle, off-thread so a registry deadlock
+        // fails the receive below instead of hanging the test forever.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let request_b = crate::test_ffi_request("/");
+            let mut stream_b = 0u64;
+            let head_b = crate::vane_ffi_execute_streaming(
+                client_handle,
+                &request_b,
+                std::ptr::null(),
+                0,
+                &mut stream_b,
+            );
+            unsafe {
+                assert_eq!((*head_b).error.len, 0);
+                crate::vane_ffi_response_free(head_b);
+            }
+            let mut body = Vec::new();
+            loop {
+                let chunk = crate::vane_ffi_stream_read(stream_b);
+                assert_eq!(chunk.error.len, 0);
+                if chunk.eof {
+                    crate::vane_ffi_buffer_free(chunk.body);
+                    crate::vane_ffi_buffer_free(chunk.error);
+                    break;
+                }
+                body.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(chunk.body.data, chunk.body.len)
+                });
+                crate::vane_ffi_buffer_free(chunk.body);
+                crate::vane_ffi_buffer_free(chunk.error);
+            }
+            crate::vane_ffi_stream_close(stream_b);
+            done_tx.send(body).ok();
+        });
+        let body_b = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "stream B's create/read/close must complete while stream A's read is parked — \
+                 a blocked vane_ffi_stream_read is holding the registry lock",
+            );
+        assert_eq!(body_b.as_slice(), b"done!");
+
+        // Let stream A finish and drain cleanly.
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (part2, eof, failed) = parked.join().unwrap();
+        assert!(!eof && !failed);
+        assert_eq!(part2.as_slice(), b"part2");
+        let end = crate::vane_ffi_stream_read(stream_a);
+        assert!(end.eof);
+        crate::vane_ffi_buffer_free(end.body);
+        crate::vane_ffi_buffer_free(end.error);
+        crate::vane_ffi_stream_close(stream_a);
+        crate::vane_ffi_client_close(client_handle);
+    }
+
     #[test]
     fn cancel_mid_stream_is_terminal() {
         let (port, ca, _leaf) = local_tls_server(b"http/1.1", |mut tls| {

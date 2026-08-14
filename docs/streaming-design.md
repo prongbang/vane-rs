@@ -1,9 +1,10 @@
 # Response-body streaming: core design and FFI plan
 
-Status: phase 1 (Rust core) is implemented; this document is the reviewed
-design for phase 2 (Kotlin/Swift via UniFFI, Dart via the C ABI). Nothing in
-phase 2 is built yet. Upload (request-body) streaming is out of scope and only
-sketched at the end.
+Status: phase 1 (Rust core) and phase 2b (the C ABI and the Dart pump, as
+specified below — ABI v3) are implemented. Phase 2a (Kotlin/Swift via UniFFI)
+is designed here but not built; that pass must not collide with the C ABI
+symbols, which are UniFFI-free on purpose. Upload (request-body) streaming is
+out of scope and only sketched at the end.
 
 ## The core API, as shipped
 
