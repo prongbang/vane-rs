@@ -5833,6 +5833,14 @@ pub struct VaneFfiRequest {
     pub progress_id: u64,
     pub timeout_seconds: i64,
     pub follow_redirects: bool,
+    /// A `vane_ffi_body_stream_create` id the request's body streams from;
+    /// 0 = none. Mutually exclusive with inline body bytes and
+    /// `body_file_path`, enforced by the core. Appended in ABI v4 — unlike
+    /// `VaneFfiResponse.error_kind`, which rode existing padding, a u64
+    /// cannot fit the seven tail-padding bytes after `follow_redirects`, so
+    /// this GREW the struct; appending (rather than grouping it with the
+    /// other registry ids) keeps every pre-v4 offset unchanged.
+    pub body_stream_id: u64,
 }
 
 #[repr(C)]
@@ -5932,9 +5940,17 @@ static FFI_NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 /// v3: response-body streaming — `vane_ffi_execute_streaming`,
 /// `vane_ffi_stream_read`, `vane_ffi_stream_close`, and the
 /// `VaneFfiStreamChunk` struct.
+///
+/// v4: request-body (upload) streaming — `vane_ffi_body_stream_create`,
+/// `vane_ffi_body_stream_write`, `vane_ffi_body_stream_finish`,
+/// `vane_ffi_body_stream_free`, and `VaneFfiRequest` GREW: `body_stream_id`
+/// was appended (the first struct-size change since this guard landed — a
+/// u64 cannot ride padding). A v3 plugin handed this library would read a
+/// field past its own struct; this bump is exactly the skew the check exists
+/// to refuse.
 #[unsafe(no_mangle)]
 pub extern "C" fn vane_ffi_abi_version() -> u32 {
-    3
+    4
 }
 
 #[unsafe(no_mangle)]
@@ -6051,6 +6067,106 @@ pub extern "C" fn vane_ffi_progress_snapshot(id: u64) -> VaneFfiProgress {
 #[unsafe(no_mangle)]
 pub extern "C" fn vane_ffi_progress_free(id: u64) {
     progress_free(id);
+}
+
+/// Creates a caller-pushed request body stream; the id goes in
+/// `VaneFfiRequest.body_stream_id` and feeds exactly one request. A negative
+/// `content_length` means unknown (chunked framing on HTTP/1.1) — the same
+/// negative-means-none dialect as `timeout_seconds`; `>= 0` declares the
+/// length, sends `Content-Length`, and enforces exactly that many bytes.
+///
+/// A streamed body is one-shot: the request never retries, body-keeping
+/// redirects come back refused (`vane-redirect-refused: streamed-body`),
+/// HTTP/3→TCP fallback happens only before the first consumed byte, and the
+/// whole upload must fit the request timeout. See
+/// docs/upload-streaming-design.md. Unwrapped like the cancel-token and
+/// progress creators: an infallible registry insert.
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_body_stream_create(content_length: i64) -> u64 {
+    body_stream_create(u64::try_from(content_length).ok())
+}
+
+/// Appends one chunk, BLOCKING while the transport's send window and the
+/// stream's internal buffer are full — that blocking is the backpressure, so
+/// callers run it off any thread that must stay responsive, and interrupt a
+/// parked call with `vane_ffi_body_stream_free` (or the request's cancel
+/// token), never by waiting it out. `len == 0` is an accepted no-op (chunk
+/// boundaries carry no meaning).
+///
+/// On failure `*out_error` is non-empty (caller frees it with
+/// `vane_ffi_buffer_free`) and the return value is `VaneError::ffi_kind`.
+/// The buffer, not the kind, is the success discriminator — 0 is both
+/// `Generic` and "no error", exactly as in `VaneFfiResponse`. The error is
+/// the same one the request fails with, so either side of a binding wrapper
+/// can report the outcome.
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_body_stream_write(
+    id: u64,
+    data: *const u8,
+    len: usize,
+    out_error: *mut VaneFfiBuffer,
+) -> u32 {
+    ffi_clear_error(out_error);
+    match std::panic::catch_unwind(|| ffi_body_stream_write(id, data, len)) {
+        Ok(Ok(())) => 0,
+        Ok(Err(error)) => {
+            let kind = error.ffi_kind();
+            ffi_set_error(out_error, error.to_string());
+            kind
+        }
+        Err(_) => {
+            ffi_set_error(
+                out_error,
+                "Rust panic while writing Vane body stream chunk".to_string(),
+            );
+            0
+        }
+    }
+}
+
+/// Marks the body complete. With a declared length, finishing at any other
+/// byte count fails (and fails the in-flight request). Same error contract
+/// as `vane_ffi_body_stream_write`.
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_body_stream_finish(id: u64, out_error: *mut VaneFfiBuffer) -> u32 {
+    ffi_clear_error(out_error);
+    match std::panic::catch_unwind(|| body_stream_finish(id)) {
+        Ok(Ok(())) => 0,
+        Ok(Err(error)) => {
+            let kind = error.ffi_kind();
+            ffi_set_error(out_error, error.to_string());
+            kind
+        }
+        Err(_) => {
+            ffi_set_error(
+                out_error,
+                "Rust panic while finishing Vane body stream".to_string(),
+            );
+            0
+        }
+    }
+}
+
+/// Frees the id; before a clean finish this ABORTS the in-flight request and
+/// releases a writer parked inside `vane_ffi_body_stream_write` — it is the
+/// abort path a wrapper must reach from somewhere that is not itself parked.
+/// After a clean finish it only drops the id (queued bytes still drain), so
+/// "write, finish, free, await the response" is a legal order. Idempotent
+/// and safe on unknown ids.
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_body_stream_free(id: u64) {
+    free_body_stream(id);
+}
+
+/// The pointer-decoding half of `vane_ffi_body_stream_write`, private so the
+/// exported symbol stays clean under `clippy::not_unsafe_ptr_arg_deref`.
+/// Empty chunks need no special case here: `ffi_bytes` accepts `len == 0`
+/// with any pointer, and the core's `write` no-ops empties.
+fn ffi_body_stream_write(id: u64, data: *const u8, len: usize) -> Result<(), VaneError> {
+    let chunk = ffi_bytes(data, len)
+        .map_err(VaneError::InvalidRequest)?
+        .to_vec();
+    body_stream_write(id, chunk)
 }
 
 #[unsafe(no_mangle)]
@@ -6426,9 +6542,7 @@ fn ffi_request(request: *const VaneFfiRequest) -> Result<VaneRequest, String> {
         )?,
         body: None,
         body_file_path: ffi_optional_string(request.body_file_path, "body_file_path")?,
-        // The C ABI does not carry body streams yet; that is the ABI v4 work
-        // planned in docs/upload-streaming-design.md.
-        body_stream_id: None,
+        body_stream_id: (request.body_stream_id != 0).then_some(request.body_stream_id),
         response_body_path: ffi_optional_string(request.response_body_path, "response_body_path")?,
         cancel_token_id: (request.cancel_token_id != 0).then_some(request.cancel_token_id),
         progress_id: (request.progress_id != 0).then_some(request.progress_id),
@@ -6679,6 +6793,7 @@ fn test_ffi_request(url: &str) -> VaneFfiRequest {
         progress_id: 0,
         timeout_seconds: -1,
         follow_redirects: true,
+        body_stream_id: 0,
     }
 }
 
@@ -8739,7 +8854,158 @@ mod tests {
     /// cannot land without the author reading that contract.
     #[test]
     fn c_abi_version_is_the_one_the_dart_bindings_expect() {
-        assert_eq!(vane_ffi_abi_version(), 3);
+        assert_eq!(vane_ffi_abi_version(), 4);
+    }
+
+    /// `VaneFfiRequest` layout, pinned since v4 grew it. `body_stream_id` is
+    /// APPENDED: a u64 cannot ride the seven bytes of tail padding after
+    /// `follow_redirects` (they are neither eight nor aligned), so — unlike
+    /// `error_kind`/`http_version`, which fit `VaneFfiResponse`'s padding —
+    /// this change grew the struct, and every pre-v4 field keeps its offset.
+    /// Dart mirrors the layout by declaration order, so a field *inserted*
+    /// rather than appended would silently shift every field behind it; these
+    /// assertions are what force such a change to announce itself (and bump
+    /// the ABI version).
+    #[test]
+    fn ffi_request_layout_appends_body_stream_id() {
+        use std::mem::{offset_of, size_of};
+        // Width-portable facts: the new field is last, sits after
+        // `follow_redirects`, and the struct is exactly one u64 bigger than
+        // the field's offset (no tail padding can follow a max-aligned last
+        // field).
+        assert_eq!(
+            offset_of!(VaneFfiRequest, body_stream_id),
+            size_of::<VaneFfiRequest>() - 8,
+            "body_stream_id must stay the last field"
+        );
+        assert!(
+            offset_of!(VaneFfiRequest, body_stream_id)
+                > offset_of!(VaneFfiRequest, follow_redirects)
+        );
+        // The 64-bit picture verbatim (host CI and every shipping 64-bit
+        // target): follow_redirects at 120 + 7 padding bytes, the new field
+        // at 128, size 128 -> 136.
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(offset_of!(VaneFfiRequest, cancel_token_id), 96);
+            assert_eq!(offset_of!(VaneFfiRequest, timeout_seconds), 112);
+            assert_eq!(offset_of!(VaneFfiRequest, follow_redirects), 120);
+            assert_eq!(offset_of!(VaneFfiRequest, body_stream_id), 128);
+            assert_eq!(size_of::<VaneFfiRequest>(), 136);
+        }
+    }
+
+    /// The four v4 symbols against the real registry, no server: the error
+    /// contract (the buffer is the success discriminator, the return value
+    /// the kind) and free's idempotence are what the Dart writer isolate
+    /// builds on.
+    #[test]
+    fn ffi_body_stream_symbols_round_trip_with_kinds() {
+        let empty_buffer = || VaneFfiBuffer {
+            data: ptr::null_mut(),
+            len: 0,
+            cap: 0,
+        };
+        let read_error = |buffer: &VaneFfiBuffer| -> String {
+            assert!(buffer.len > 0, "expected a non-empty error buffer");
+            String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) })
+                .into_owned()
+        };
+
+        // Declared length, enforced through the C surface: a short finish
+        // fails with InvalidRequest and a non-empty buffer.
+        let declared = vane_ffi_body_stream_create(4);
+        let mut error = empty_buffer();
+        assert_eq!(
+            vane_ffi_body_stream_write(declared, b"12".as_ptr(), 2, &mut error),
+            0
+        );
+        assert_eq!(error.len, 0, "a successful write leaves the buffer empty");
+        let kind = vane_ffi_body_stream_finish(declared, &mut error);
+        assert_eq!(kind, VaneError::InvalidRequest(String::new()).ffi_kind());
+        let message = read_error(&error);
+        assert!(message.contains("declared"), "{message}");
+        vane_ffi_buffer_free(error);
+        vane_ffi_body_stream_free(declared);
+
+        // Unknown length: an empty write is an accepted no-op, finish is
+        // clean, and a late write reports "already finished".
+        let chunked = vane_ffi_body_stream_create(-1);
+        let mut error = empty_buffer();
+        assert_eq!(
+            vane_ffi_body_stream_write(chunked, b"x".as_ptr(), 1, &mut error),
+            0
+        );
+        assert_eq!(error.len, 0);
+        assert_eq!(
+            vane_ffi_body_stream_write(chunked, ptr::null(), 0, &mut error),
+            0
+        );
+        assert_eq!(error.len, 0);
+        assert_eq!(vane_ffi_body_stream_finish(chunked, &mut error), 0);
+        assert_eq!(error.len, 0);
+        let kind = vane_ffi_body_stream_write(chunked, b"y".as_ptr(), 1, &mut error);
+        assert_eq!(kind, VaneError::InvalidRequest(String::new()).ffi_kind());
+        let message = read_error(&error);
+        assert!(message.contains("already finished"), "{message}");
+        vane_ffi_buffer_free(error);
+
+        // Free is idempotent, and a freed (or never-issued) id reports
+        // InvalidRequest — the writer isolate must be able to trust that a
+        // late call fails instead of corrupting anything.
+        vane_ffi_body_stream_free(chunked);
+        vane_ffi_body_stream_free(chunked);
+        let mut error = empty_buffer();
+        let kind = vane_ffi_body_stream_write(chunked, b"z".as_ptr(), 1, &mut error);
+        assert_eq!(kind, VaneError::InvalidRequest(String::new()).ffi_kind());
+        let message = read_error(&error);
+        assert!(message.contains("Unknown body stream id"), "{message}");
+        vane_ffi_buffer_free(error);
+        let mut error = empty_buffer();
+        let kind = vane_ffi_body_stream_finish(chunked, &mut error);
+        assert_eq!(kind, VaneError::InvalidRequest(String::new()).ffi_kind());
+        vane_ffi_buffer_free(error);
+    }
+
+    /// `VaneFfiRequest.body_stream_id` reaches the core: a request carrying
+    /// both inline body bytes and a stream id is refused by
+    /// `resolve_body_stream` with the mutual-exclusion message — which can
+    /// only happen if the new field decoded, since 0 would mean "no stream".
+    #[test]
+    fn ffi_execute_carries_the_body_stream_id_to_the_core() {
+        let mut create_error = VaneFfiBuffer {
+            data: ptr::null_mut(),
+            len: 0,
+            cap: 0,
+        };
+        let client = vane_ffi_client_create(ptr::null(), &mut create_error);
+        assert_ne!(client, 0);
+        assert_eq!(create_error.len, 0);
+
+        let url = "https://vane-ffi-upload.invalid/";
+        let stream = vane_ffi_body_stream_create(-1);
+        let mut request = test_ffi_request(url);
+        request.body_stream_id = stream;
+        let body = b"inline";
+        let response = vane_ffi_execute(client, &request, body.as_ptr(), body.len());
+        unsafe {
+            let message = String::from_utf8_lossy(std::slice::from_raw_parts(
+                (*response).error.data,
+                (*response).error.len,
+            ))
+            .into_owned();
+            assert!(
+                message.contains("cannot be combined with body"),
+                "expected the mutual-exclusion refusal, got: {message}"
+            );
+            assert_eq!(
+                (*response).error_kind,
+                VaneError::InvalidRequest(String::new()).ffi_kind()
+            );
+            vane_ffi_response_free(response);
+        }
+        vane_ffi_body_stream_free(stream);
+        vane_ffi_client_close(client);
     }
 
     /// The registry side of the stream ABI, without a server: a handle that

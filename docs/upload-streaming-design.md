@@ -1,8 +1,11 @@
 # Upload (request-body) streaming: core design and FFI plan
 
-Status: the Rust core is implemented on both transports with tests (this
-phase); the C ABI, UniFFI exports and binding wrappers are phase 4 and only
-planned here. The response-streaming doc's phase-3 sketch ("roles flip, the
+Status: the Rust core is implemented on both transports with tests; of phase
+4, the C ABI (v4 — `VaneFfiRequest` grew, see `vane_ffi_abi_version`'s log)
+and the Dart binding (`VaneRequestBuilder.bodyStream`, the push-with-pause
+`UploadStreamDriver` + writer isolate in `vane_flutter_ffi.dart`) are
+implemented; UniFFI exports and the Kotlin/Swift wrappers remain planned
+here. The response-streaming doc's phase-3 sketch ("roles flip, the
 caller pushes, backpressure is `write_chunk` blocking") survived as the
 outline; what it did not say — replay, framing, timeouts, teardown — turned
 out to be most of the design, and one of its structural choices (a
