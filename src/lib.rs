@@ -2491,11 +2491,13 @@ fn streaming_head(
 /// request. Abandoning the stream (`close`, or dropping it) discards the
 /// underlying connection; only a stream read to its end returns the
 /// connection to the pool.
+#[derive(uniffi::Object)]
 pub struct VaneResponseStream {
     head: VaneResponse,
     body: Mutex<StreamingBody>,
 }
 
+#[uniffi::export]
 impl VaneResponseStream {
     /// The response head: status, headers, final URL, cookies, protocol.
     /// `body` is empty by contract — the stream itself delivers it.
@@ -2537,6 +2539,16 @@ impl VaneResponseStream {
         }
     }
 
+    /// Releases the stream without draining it — [`Self::close`] under the
+    /// name the bindings see. It cannot export as `close`: UniFFI's Kotlin
+    /// objects already implement `AutoCloseable.close()` (free the handle),
+    /// and a same-signature exported `close()` fails to compile there.
+    pub fn close_stream(&self) {
+        self.close();
+    }
+}
+
+impl VaneResponseStream {
     /// Releases the stream without draining it. Idempotent. The connection is
     /// discarded, never pooled: an undrained body would poison the next
     /// request on it. Reading after close returns `Ok(None)`.
@@ -4936,6 +4948,17 @@ pub fn free_cancel_token(id: u64) {
 impl VaneClient {
     pub fn execute_request(&self, request: VaneRequest) -> Result<VaneResponse, VaneError> {
         self.execute(request)
+    }
+
+    /// [`Self::execute_streaming`] for the bindings: same contract, with the
+    /// stream behind an `Arc` because UniFFI hands objects out by reference.
+    /// `Arc<Self>` receiver on purpose — the stream keeps the client alive so
+    /// a drained body can return its connection to the pool.
+    pub fn execute_streaming_request(
+        self: Arc<Self>,
+        request: VaneRequest,
+    ) -> Result<Arc<VaneResponseStream>, VaneError> {
+        Ok(Arc::new(self.execute_streaming(request)?))
     }
 
     pub fn get_request(&self, url: String) -> Result<VaneResponse, VaneError> {

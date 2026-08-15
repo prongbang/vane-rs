@@ -1,10 +1,12 @@
 # Response-body streaming: core design and FFI plan
 
-Status: phase 1 (Rust core) and phase 2b (the C ABI and the Dart pump, as
-specified below — ABI v3) are implemented. Phase 2a (Kotlin/Swift via UniFFI)
-is designed here but not built; that pass must not collide with the C ABI
-symbols, which are UniFFI-free on purpose. Upload (request-body) streaming is
-out of scope and only sketched at the end.
+Status: phase 1 (Rust core), phase 2b (the C ABI and the Dart pump — ABI v3)
+and phase 2a (Kotlin/Swift via UniFFI) are implemented. The 2a section below
+was rewritten after implementation: both of its original wrapper sketches
+failed under test (details inline), and the exported names moved for reasons
+the proc-macro and uniffi's Kotlin template dictated. The C ABI symbols stay
+UniFFI-free on purpose. Upload (request-body) streaming is out of scope and
+only sketched at the end.
 
 ## The core API, as shipped
 
@@ -147,7 +149,7 @@ VaneSwift, `Dispatchers.IO` in VaneKotlin). Callback interfaces would
 reintroduce the push problems; UniFFI async would demand an async core or
 hidden spawning for zero caller-visible gain over language-side wrappers.
 
-Rust-side change (mechanical):
+Rust-side change (mechanical, with two naming forced moves):
 
 ```rust
 #[derive(uniffi::Object)]                  // added to the existing struct
@@ -157,70 +159,75 @@ pub struct VaneResponseStream { ... }
 impl VaneResponseStream {
     pub fn head(&self) -> VaneResponse;
     pub fn read_chunk(&self) -> Result<Option<Vec<u8>>, VaneError>;
-    pub fn close(&self);
+    /// Delegates to `close()`, which stays un-exported: uniffi's Kotlin
+    /// objects already implement `AutoCloseable.close()` (free the handle),
+    /// and an exported `close()` generates a same-signature duplicate that
+    /// does not compile. Verified against the generated source, uniffi 0.31.
+    pub fn close_stream(&self);
 }
 
-// added to the existing `#[uniffi::export] impl VaneClient` block:
-pub fn execute_streaming(self: Arc<Self>, request: VaneRequest)
+// added to the existing `#[uniffi::export] impl VaneClient` block —
+// `execute_streaming` itself cannot be re-declared there (same type, same
+// name, different impl block), so the export follows the existing
+// `execute`/`execute_request` convention:
+pub fn execute_streaming_request(self: Arc<Self>, request: VaneRequest)
     -> Result<Arc<VaneResponseStream>, VaneError>;
 ```
 
-The core method already takes `self: Arc<Self>` for exactly this reason; the
-export wrapper only wraps the result in `Arc`. UniFFI supports `Arc<Self>`
-receivers on exported methods; if the proc-macro rejects that form in
-practice, the fallback is a free exported function
-`execute_streaming(client: Arc<VaneClient>, request) -> Result<Arc<VaneResponseStream>>`
-— same generated surface, different spelling. Regenerating bindings changes
-the UniFFI checksum, so VaneKotlin and VaneSwift must regenerate in the same
-change.
+The `Arc<Self>` receiver compiles under the 0.31 proc-macro (settled by
+building, not reading — the free-function fallback was not needed).
+Regenerating bindings changes the UniFFI checksum, so VaneKotlin and
+VaneSwift regenerate in the same change.
 
-Generated API (what binding authors build on):
+Generated API (what the binding wrappers build on):
 
-- Kotlin: `class VaneResponseStream { fun head(): VaneResponse;
-  fun readChunk(): ByteArray?; fun close() }` (plus `Disposable`).
-- Swift: `public class VaneResponseStream { public func head() -> VaneResponse;
-  public func readChunk() throws -> Data?; public func close() }`.
+- Kotlin: `interface VaneResponseStreamInterface { fun head(): VaneResponse;
+  fun readChunk(): ByteArray?; fun closeStream() }` (class also carries
+  uniffi's `Disposable`/`AutoCloseable`, whose `close()` frees the handle —
+  dropping the last handle also discards the connection via Rust `Drop`).
+- Swift: `protocol VaneResponseStreamProtocol: AnyObject, Sendable {
+  func head() -> VaneResponse; func readChunk() throws -> Data?;
+  func closeStream() }`.
 
-Idiomatic wrappers (thin, hand-written, in each binding repo):
+Idiomatic wrappers (hand-written, in each binding repo). **Both original
+sketches for these were wrong and are preserved here only as warnings**; what
+shipped is strict demand-driven pull in both languages — the same shape as
+the Dart pump — with the invariant-carrying bridge in one internal, fake-able
+function per repo (`streamingBodyFlow` in VaneKotlin/VaneClient.kt,
+`vaneStreamingBody` in VaneSwift/VaneClient+Extension.swift).
 
-Kotlin — `Flow<ByteArray>`:
+Kotlin — `Flow<ByteArray>`. The original sketch
+(`flow { … readChunk … }.flowOn(Dispatchers.IO).onCompletion { close }`, with
+the token cancel in `onCompletion`) deadlocks by construction: `flowOn`'s
+`collect` is a `coroutineScope` that does not unwind on cancellation until
+its producer child returns from the parked FFI read, and `onCompletion` runs
+only after that unwind — so the cancel that would release the read can never
+run while the read is parked (observed as a full park-timeout wait under
+test). A failing `flowOn` producer can also overtake an already-handed-off
+chunk out-of-band (observed as a lost tail chunk). What shipped instead: no
+producer coroutine at all — the collector's own loop makes one
+`async(Dispatchers.IO) { runCatching { readChunk() } }` call per chunk,
+fires the token from the `await`-cancellation path, and closes in the flow's
+`finally`, which structurally cannot run until the read has returned.
+Backpressure is absolute: a collector that does not ask does not read.
 
-```kotlin
-suspend fun Vane.executeStreaming(request: VaneRequest): VaneStreamingResponse {
-    val inner = withContext(Dispatchers.IO) { client.executeStreaming(request) }
-    return VaneStreamingResponse(head = inner.head(), body = flow {
-        while (true) emit(inner.readChunk() ?: break)
-    }.flowOn(Dispatchers.IO).onCompletion { inner.close() })
-}
-```
+Swift — `AsyncThrowingStream<Data, Error>`. The original sketch
+(`AsyncThrowingStream { continuation in Task.detached { while … yield } }`)
+violates the backpressure requirement outright: `yield` never suspends and
+the default buffering policy is unbounded, so a slow consumer buffers the
+whole body — the exact failure pull exists to prevent — while the detached
+loop parks a cooperative-pool thread for the stream's life. What shipped:
+`AsyncThrowingStream(unfolding:)` — one closure call per consumer `next()`,
+each a `withTaskCancellationHandler`-wrapped hop to `vaneFFIQueue` (default
+QoS; see the p95 history in VaneClient+Extension.swift). No producer task,
+no buffer, and a thread is parked only while a pull is in flight.
 
-Coroutine cancellation must cancel the request's `VaneCancelToken` (the
-wrapper should create one per streaming request when the caller didn't)
-*before* `close()`: `close()` waits for an in-flight `readChunk` to return,
-and the token is what interrupts it. This ordering is the one sharp edge in
-the Kotlin wrapper; it belongs in one place — `onCompletion` — not in caller
-code.
-
-Swift — `AsyncThrowingStream<Data, Error>`:
-
-```swift
-public func executeStreaming(_ request: VaneRequest) async throws -> VaneStreamingResponse {
-    let inner = try await runBlockingFFI { try self.client.executeStreaming(request: request) }
-    let body = AsyncThrowingStream<Data, Error> { continuation in
-        let task = Task.detached {
-            do {
-                while let chunk = try inner.readChunk() { continuation.yield(chunk) }
-                continuation.finish()
-            } catch { continuation.finish(throwing: error) }
-        }
-        continuation.onTermination = { _ in task.cancel(); /* cancel token */; inner.close() }
-    }
-    return VaneStreamingResponse(head: inner.head(), body: body)
-}
-```
-
-Same cancel-token-then-close rule as Kotlin. Note the `Task.detached` loop
-parks one thread per active stream — accepted, see ceilings.
+The cancel-token-then-close rule holds in both, enforced structurally: only
+the token releases a parked read, and close sits in code that runs strictly
+after the read returns. Each wrapper creates an internal token when the
+request carries none, and each repo carries a test that cancels a parked
+read against a fake stream and asserts prompt return plus the
+token-before-close event order (design risk #3).
 
 ## Phase 2b — the C ABI and Dart
 

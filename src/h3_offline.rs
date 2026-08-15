@@ -752,6 +752,31 @@ mod tests {
         crate::free_progress(progress_id);
     }
 
+    /// The UniFFI-facing wrapper (`execute_streaming_request` returning
+    /// `Arc<VaneResponseStream>`, plus `close_stream`, the export-safe name
+    /// for `close`) delegates to the same stream the core test above proves.
+    #[test]
+    fn streaming_uniffi_export_surface_delegates_to_the_core_stream() {
+        let server = TestH3Server::start();
+        let client = Arc::new(offline_client(VaneClientConfig::default()));
+
+        let stream = Arc::clone(&client)
+            .execute_streaming_request(stream_request(&server))
+            .unwrap();
+        assert!(stream.head().is_success);
+        assert!(stream.read_chunk().unwrap().is_some());
+
+        // close_stream is close: idempotent, and reads after it report EOF.
+        stream.close_stream();
+        stream.close_stream();
+        assert!(stream.read_chunk().unwrap().is_none());
+        assert_eq!(
+            client.pool.lock().unwrap().len(),
+            0,
+            "an abandoned stream must discard its connection, never pool it"
+        );
+    }
+
     #[test]
     fn streaming_redirect_chain_streams_the_final_hop() {
         let server = TestH3Server::start();
