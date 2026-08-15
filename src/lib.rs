@@ -5623,35 +5623,47 @@ pub fn create_cancel_token() -> u64 {
     cancel_token_create()
 }
 
-// Body-stream surface for callers and, in the next phase, the FFI layers.
-// Deliberately not UniFFI-exported yet: the export set is part of the
-// cross-binding design under review (docs/upload-streaming-design.md), and
-// phase 2a proved export names are cheapest to fix before bindings exist.
+// Body-stream surface, exported in the cancel-token/progress dialect (free
+// functions over a registry id) so every binding speaks the id it already
+// puts in `VaneRequest::body_stream_id`. Free functions have no method-name
+// or `AutoCloseable.close()` collision surface — the two traps the response
+// stream's exports hit — and none of these four names collides with an
+// existing export (verified against the regenerated Kotlin and Swift
+// sources). The C ABI (`vane_ffi_body_stream_*`) stays UniFFI-free.
 
 /// Creates a caller-pushed request body stream and returns its id, to be set
 /// as [`VaneRequest::body_stream_id`]. `content_length` of `Some(n)` sends
 /// `content-length: n` and enforces exactly `n` bytes; `None` sends no length
 /// (chunked on HTTP/1.1). One stream feeds exactly one request.
+#[uniffi::export]
 pub fn create_body_stream(content_length: Option<u64>) -> u64 {
     body_stream_create(content_length)
 }
 
 /// Appends one chunk. Blocks while the transport's send window and the
-/// stream's internal buffer are full — this blocking is the backpressure.
-/// Fails once the stream or its request is dead; the error is the same one
-/// the request fails with, so either side of the caller learns the outcome.
+/// stream's internal buffer are full — this blocking is the backpressure, so
+/// bindings run it off any thread that must stay responsive and interrupt a
+/// parked call with [`free_body_stream`] (or the request's cancel token),
+/// never by waiting it out. Fails once the stream or its request is dead;
+/// the error is the same one the request fails with, so either side of the
+/// caller learns the outcome.
+#[uniffi::export]
 pub fn write_body_stream_chunk(id: u64, chunk: Vec<u8>) -> Result<(), VaneError> {
     body_stream_write(id, chunk)
 }
 
 /// Marks the body complete. With a declared length, finishing at any other
 /// byte count is an `InvalidRequest` that also fails the in-flight request.
+#[uniffi::export]
 pub fn finish_body_stream(id: u64) -> Result<(), VaneError> {
     body_stream_finish(id)
 }
 
-/// Frees the id; aborts the request if the stream was not finished. Safe on
-/// unknown or already-freed ids.
+/// Frees the id; aborts the request if the stream was not finished (and
+/// releases a writer parked inside [`write_body_stream_chunk`] — this is the
+/// abort path a wrapper must reach from somewhere that is not itself
+/// parked). Safe on unknown or already-freed ids.
+#[uniffi::export]
 pub fn free_body_stream(id: u64) {
     body_stream_free(id)
 }

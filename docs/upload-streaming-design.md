@@ -1,11 +1,13 @@
 # Upload (request-body) streaming: core design and FFI plan
 
-Status: the Rust core is implemented on both transports with tests; of phase
-4, the C ABI (v4 — `VaneFfiRequest` grew, see `vane_ffi_abi_version`'s log)
-and the Dart binding (`VaneRequestBuilder.bodyStream`, the push-with-pause
-`UploadStreamDriver` + writer isolate in `vane_flutter_ffi.dart`) are
-implemented; UniFFI exports and the Kotlin/Swift wrappers remain planned
-here. The response-streaming doc's phase-3 sketch ("roles flip, the
+Status: implemented end to end. The Rust core runs on both transports with
+tests; the C ABI (v4 — `VaneFfiRequest` grew, see `vane_ffi_abi_version`'s
+log) and the Dart binding (`VaneRequestBuilder.bodyStream`, the
+push-with-pause `UploadStreamDriver` + writer isolate in
+`vane_flutter_ffi.dart`) shipped with it; phase 4a added the UniFFI exports
+and the Kotlin/Swift wrappers (`executeAsync(request, body: Flow)` /
+`execute(_:body:)` plus builder `bodyStream`, both described below as
+shipped). The response-streaming doc's phase-3 sketch ("roles flip, the
 caller pushes, backpressure is `write_chunk` blocking") survived as the
 outline; what it did not say — replay, framing, timeouts, teardown — turned
 out to be most of the design, and one of its structural choices (a
@@ -226,42 +228,65 @@ stream) or neither.
 
 ## Phase 4 — how it crosses the three bindings
 
-Nothing here is implemented; this is the reviewable plan, shaped by what
-phases 1→2 proved about each boundary.
-
 **Why caller-push works everywhere pull did:** every binding *initiates* a
 blocking call into the core — the direction that always works. Upload is the
 caller making `write` calls instead of `read_chunk` calls; the core never
 calls out. No callback interfaces anywhere, same as the response side.
 
-**UniFFI (Kotlin, Swift).** Export the four functions exactly as cancel
-tokens were exported (task #1 precedent):
+**UniFFI (Kotlin, Swift) — as shipped (phase 4a).** The four functions are
+exported exactly as cancel tokens were (task #1 precedent):
 `create_body_stream(content_length: Option<u64>) -> u64`,
 `write_body_stream_chunk(id, chunk) -> Result`, `finish_body_stream(id) ->
-Result`, `free_body_stream(id)`. `VaneRequest` already carries
-`body_stream_id: Option<u64>` with `#[uniffi(default = None)]`, so decoding
-stays compatible for callers that never set it. Checksums change; both
-binding repos regenerate in the same change, as always.
+Result`, `free_body_stream(id)`. Free functions have none of the collision
+surface that bit the response stream's exports (method-name shadowing,
+`AutoCloseable.close()`), and the generated names —
+`createBodyStream`/`writeBodyStreamChunk`/`finishBodyStream`/`freeBodyStream`
+in both languages — collide with nothing, verified against the regenerated
+sources. `VaneRequest` already carried `body_stream_id: Option<u64>` with
+`#[uniffi(default = None)]`, so only the functions were new. Checksums
+moved; both binding repos regenerated in the same change. (One regeneration
+lesson: VaneSwift's generated file carries a deliberate hand-patch — the
+BOM-preserving native UTF-8 decoder in `FfiConverterString` — that stock
+regeneration reverts; it must be re-applied on every regen.)
 
-- Kotlin wrapper: `VaneRequestBuilder.body(flow: Flow<ByteArray>)` (and a
-  `body(InputStream)` convenience). Implementation: create the id; launch
-  the upload as `async(Dispatchers.IO)` *sibling* of the execute call —
-  collect the flow, one blocking `write` per element, then `finish`;
-  `free` in a `finally`. The phase-2a lesson applies verbatim: the writer
-  coroutine parks a thread inside `write`, and only the core's release
-  latch (or `free`) unparks it — so cancellation must fire
-  `free_body_stream` (and the request's cancel token) from a
-  non-parked path, never wait for the collector to notice. The
-  execute-side wrapper is unchanged.
-- Swift wrapper: `body(_ stream: AsyncSequence<Data>)`; a `Task` iterates
-  and calls `write` via the existing `vaneFFIQueue` hop (QoS note from
-  phase 2a applies — these calls park like reads do), `finish` at the end,
-  `free` on cancellation or error. Same rule: abort = token +
-  `free_body_stream`, both callable while a `write` is parked.
-- Both must surface the write-side error to the caller's stream (the error
-  IS the request's error) without double-reporting against the execute
-  result — suggested rule: the execute result is authoritative, the writer
-  loop just stops on first error.
+What shipped in each wrapper is the download wrapper's mirror image, with
+`free` in the role the cancel token plays there, and the same
+plan-vs-reality note as phase 2a: the sketch above said "async sibling +
+free in a finally", and the load-bearing part turned out to be the
+*cancellation route to free* — each binding carries a test that cancels
+with a write parked and a mutation-proof that the naive spelling deadlocks.
+
+- Kotlin: `VaneClient.executeAsync(request, body: Flow<ByteArray>,
+  contentLength)` and `VaneRequestBuilder.bodyStream(...)` (through the
+  session executor, so request interceptors compose — the response side
+  cannot say the same). The bridge is `withStreamedBody` in
+  VaneClient.kt: a `launch`ed writer collects the flow — one
+  `async(Dispatchers.IO)` blocking write per element, awaited before the
+  next emit can resume, which is the whole backpressure story — then
+  finishes; every writer terminal frees. Cancellation while a write is
+  parked reaches `free` in the `await`-cancellation catch, before the
+  scope waits for the parked worker (`readChunkCancellably`'s twin). The
+  `body(InputStream)` convenience was skipped: `Flow` composes with the
+  ecosystem and an InputStream-to-Flow adapter is a caller one-liner.
+- Swift: `VaneClient.execute(_:body:contentLength:)` (generic over
+  `AsyncSequence where Element == Data`) and
+  `VaneRequestBuilder.bodyStream(...)`, which erases via
+  `AsyncThrowingStream(unfolding:)` — one pull per demand; a
+  continuation-pumping erasure would buffer the whole body. The bridge is
+  `vaneStreamedUpload` in VaneClient+Extension.swift: an unstructured
+  writer `Task` iterates the sequence, each write a
+  `withTaskCancellationHandler`-wrapped `vaneFFIQueue` hop whose
+  `onCancel` frees; the execute side carries its own `onCancel` free
+  because caller cancellation does not propagate to an unstructured task.
+  Blocking calls never touch the cooperative pool (the phase-2a p95
+  lesson).
+- Error routing, both languages, as the plan suggested: the execute result
+  is authoritative — a core-failed write stops the writer quietly — and
+  only a failure of the caller's own source replaces the `Cancelled` its
+  abort induces. Neither wrapper owns a cancel token (mirroring Dart):
+  `free` aborts the request at its next body pull, and a request stuck in
+  a phase with no pulls is bounded by its own deadline; callers wanting a
+  prompt abort in every phase attach a `VaneCancelToken`.
 
 **C ABI / Dart — ABI v3 → v4.** New exported symbols
 (`vane_ffi_body_stream_create/write/finish/free`, all `catch_unwind`-wrapped,
@@ -281,6 +306,14 @@ own `BODY_STREAMS`.
   The execute call itself runs on its worker isolate exactly as today.
 - The response-side rule holds mirrored: the pump must never buffer ahead
   (no free-running `listen` that queues chunks while a write is in flight).
+- A teardown nuance the tests surfaced: while a write is in flight the
+  subscription is paused, and Dart buffers a paused subscription's error
+  event — so a source error cannot abort a *parked* upload; only the
+  platform's `dispose` (run when the request settles) can. The
+  free-must-not-ride-the-mailbox invariant in `startUpload`'s `onFree` is
+  pinned against the real registry by the teardown-while-parked test in
+  `vane_flutter_ffi_test.dart`, whose mutation-proof shows every
+  driver-level test staying green under a mailbox-routed free.
 
 **Binding-visible decisions to document on every surface:** one stream per
 request; streamed requests never retry; 307/308 come back refused with
@@ -319,7 +352,10 @@ Ranked, most worrying first:
 2. **Kotlin/Swift abort-while-parked.** A writer parked in `write` is only
    released by the core's latch; a wrapper that routes cancellation through
    the parked path deadlocks. Each binding needs the "abort from a non-parked
-   path" test, mirroring the phase-2a cancel-ordering tests.
+   path" test, mirroring the phase-2a cancel-ordering tests. *(Shipped in
+   phase 4a: `cancellingAnUploadWhoseWriteIsParkedFreesTheStreamPromptly` in
+   both repos, each proven by running the naive spelling and watching it park
+   until the fake core's bail-out.)*
 3. **`VaneFfiRequest` layout change.** Mechanical, but it is the first
    struct-shape change since the ABI guard landed; the v4 bump must move in
    lockstep with the Dart constant or old plugins load a new core.
