@@ -12,6 +12,354 @@ fn client_with(config: VaneClientConfig) -> VaneClient {
     VaneClient::new(config).unwrap()
 }
 
+/// Upload (request-body) streaming over the TCP backend: wire framing,
+/// writer backpressure, and the permitting half of the H3→TCP fallback
+/// decision (nothing consumed yet). The refusing half — consumed bytes — is
+/// `h3_offline::tests::streamed_upload_mid_body_transport_failure_does_not_fall_back`.
+mod upload {
+    use std::io::{Read as _, Write as _};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use std::collections::HashMap;
+
+    use super::{CertificateDer, TlsStream, local_tls_server, with_test_root};
+    use crate::h3_offline::{TEST_HOST, body_pattern, sha256_hex, test_pki};
+    use crate::{
+        VaneClientConfig, VaneError, VaneHttpVersion, VaneProtocolMode, create_body_stream,
+        finish_body_stream, free_body_stream, test_request, write_body_stream_chunk,
+    };
+
+    /// Reads up to the end of the request head; returns it plus any body
+    /// bytes that arrived in the same reads.
+    fn read_head(tls: &mut TlsStream) -> (String, Vec<u8>) {
+        let mut buf = [0u8; 8192];
+        let mut pending = Vec::new();
+        loop {
+            if let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&pending[..end]).into_owned();
+                let rest = pending[end + 4..].to_vec();
+                return (head, rest);
+            }
+            match tls.read(&mut buf) {
+                Ok(0) | Err(_) => return (String::new(), Vec::new()),
+                Ok(n) => pending.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+
+    fn header_value(head: &str, name: &str) -> Option<String> {
+        head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+    }
+
+    fn read_exact_body(tls: &mut TlsStream, mut pending: Vec<u8>, len: usize) -> Vec<u8> {
+        let mut buf = [0u8; 8192];
+        while pending.len() < len {
+            match tls.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => pending.extend_from_slice(&buf[..n]),
+            }
+        }
+        pending.truncate(len);
+        pending
+    }
+
+    /// Minimal `Transfer-Encoding: chunked` decoder — enough for hyper's own
+    /// output, which is all it ever reads.
+    fn read_chunked_body(tls: &mut TlsStream, mut pending: Vec<u8>) -> Vec<u8> {
+        let mut buf = [0u8; 8192];
+        let mut body = Vec::new();
+        let mut offset = 0;
+        loop {
+            let line_end = loop {
+                if let Some(pos) = pending[offset..].windows(2).position(|w| w == b"\r\n") {
+                    break offset + pos;
+                }
+                match tls.read(&mut buf) {
+                    Ok(0) | Err(_) => return body,
+                    Ok(n) => pending.extend_from_slice(&buf[..n]),
+                }
+            };
+            let size_text = String::from_utf8_lossy(&pending[offset..line_end]).into_owned();
+            let Ok(size) = usize::from_str_radix(size_text.trim(), 16) else {
+                return body;
+            };
+            if size == 0 {
+                return body;
+            }
+            let chunk_start = line_end + 2;
+            while pending.len() < chunk_start + size + 2 {
+                match tls.read(&mut buf) {
+                    Ok(0) | Err(_) => return body,
+                    Ok(n) => pending.extend_from_slice(&buf[..n]),
+                }
+            }
+            body.extend_from_slice(&pending[chunk_start..chunk_start + size]);
+            offset = chunk_start + size + 2;
+        }
+    }
+
+    /// Answers with the received body's digest plus which framing carried it,
+    /// so a test asserts what went over the wire, not what Vane meant to send.
+    fn respond_with_digest(tls: &mut TlsStream, framing: &str, body: &[u8]) {
+        let payload = format!(
+            "{{\"len\": {}, \"sha256\": \"{}\", \"framing\": \"{framing}\"}}",
+            body.len(),
+            sha256_hex(body)
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        );
+        tls.write_all(response.as_bytes()).ok();
+        tls.flush().ok();
+    }
+
+    fn upload_handler(mut tls: TlsStream) {
+        let (head, rest) = read_head(&mut tls);
+        if let Some(len) = header_value(&head, "content-length") {
+            let body = read_exact_body(&mut tls, rest, len.parse().unwrap_or(0));
+            respond_with_digest(&mut tls, "sized", &body);
+        } else if header_value(&head, "transfer-encoding").as_deref() == Some("chunked") {
+            let body = read_chunked_body(&mut tls, rest);
+            respond_with_digest(&mut tls, "chunked", &body);
+        } else {
+            respond_with_digest(&mut tls, "missing", &[]);
+        }
+    }
+
+    fn spawn_writer(
+        id: u64,
+        body: Vec<u8>,
+        chunk: usize,
+    ) -> std::thread::JoinHandle<Result<(), VaneError>> {
+        std::thread::spawn(move || {
+            for part in body.chunks(chunk) {
+                write_body_stream_chunk(id, part.to_vec())?;
+            }
+            finish_body_stream(id)
+        })
+    }
+
+    /// The Content-Length answer on the wire: a declared length arrives as
+    /// `Content-Length` with the exact bytes; an undeclared one arrives as
+    /// `Transfer-Encoding: chunked` and reassembles byte-identical.
+    #[test]
+    fn streamed_upload_sends_content_length_when_declared_and_chunked_otherwise() {
+        let (port, ca, _leaf) = local_tls_server(b"http/1.1", upload_handler);
+        let _root = with_test_root(ca);
+        let client = super::client_with(VaneClientConfig {
+            protocol_mode: VaneProtocolMode::Http1Only,
+            connection_pool_enabled: false,
+            timeout_seconds: Some(20),
+            ..VaneClientConfig::default()
+        });
+        // Larger than the stream buffer, so the reqwest pump and the writer
+        // really interleave.
+        let body = body_pattern(700 * 1024);
+        let expected_sha = sha256_hex(&body);
+
+        let id = create_body_stream(Some(body.len() as u64));
+        let writer = spawn_writer(id, body.clone(), 64 * 1024);
+        let mut sized = test_request(&format!("https://localhost:{port}/upload"));
+        sized.method = "PUT".to_string();
+        sized.body_stream_id = Some(id);
+        let response = client.execute(sized).unwrap();
+        writer.join().unwrap().unwrap();
+        assert!(response.is_success);
+        let text = String::from_utf8_lossy(&response.body).into_owned();
+        assert!(text.contains("\"framing\": \"sized\""), "{text}");
+        assert!(text.contains(&expected_sha), "{text}");
+        free_body_stream(id);
+
+        let id = create_body_stream(None);
+        let writer = spawn_writer(id, body, 64 * 1024);
+        let mut chunked = test_request(&format!("https://localhost:{port}/upload"));
+        chunked.method = "PUT".to_string();
+        chunked.body_stream_id = Some(id);
+        let response = client.execute(chunked).unwrap();
+        writer.join().unwrap().unwrap();
+        assert!(response.is_success);
+        let text = String::from_utf8_lossy(&response.body).into_owned();
+        assert!(text.contains("\"framing\": \"chunked\""), "{text}");
+        assert!(text.contains(&expected_sha), "{text}");
+        free_body_stream(id);
+    }
+
+    /// Backpressure through the reqwest bridge: while the server reads
+    /// nothing, the writer must park — hyper stops pulling the reader once
+    /// the send buffers fill, which stops the queue draining — and the body
+    /// is far too large for the kernel's loopback buffers to swallow.
+    #[test]
+    fn streamed_upload_backpressure_parks_the_writer_until_the_server_reads() {
+        const TOTAL: usize = 24 * 1024 * 1024;
+        let hold = Arc::new(AtomicBool::new(true));
+        let (port, ca, _leaf) = local_tls_server(b"http/1.1", {
+            let hold = Arc::clone(&hold);
+            move |mut tls| {
+                let (head, rest) = read_head(&mut tls);
+                let len: usize = header_value(&head, "content-length")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                while hold.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let body = read_exact_body(&mut tls, rest, len);
+                respond_with_digest(&mut tls, "sized", &body);
+            }
+        });
+        let _root = with_test_root(ca);
+        let client = Arc::new(super::client_with(VaneClientConfig {
+            protocol_mode: VaneProtocolMode::Http1Only,
+            connection_pool_enabled: false,
+            timeout_seconds: Some(30),
+            ..VaneClientConfig::default()
+        }));
+        let body = body_pattern(TOTAL);
+        let expected_sha = sha256_hex(&body);
+        let id = create_body_stream(Some(TOTAL as u64));
+
+        let written = Arc::new(AtomicU64::new(0));
+        let writer = std::thread::spawn({
+            let written = Arc::clone(&written);
+            move || -> Result<(), VaneError> {
+                for part in body.chunks(256 * 1024) {
+                    write_body_stream_chunk(id, part.to_vec())?;
+                    written.fetch_add(part.len() as u64, Ordering::Relaxed);
+                }
+                finish_body_stream(id)
+            }
+        });
+        let exec = std::thread::spawn({
+            let client = Arc::clone(&client);
+            let url = format!("https://localhost:{port}/upload");
+            move || {
+                let mut request = test_request(&url);
+                request.method = "PUT".to_string();
+                request.body_stream_id = Some(id);
+                client.execute(request)
+            }
+        });
+
+        // Parked: the counter stops moving with most of the body unwritten —
+        // socket buffers are finite and nothing else drains the pipe.
+        let mut last = u64::MAX;
+        let mut stable = 0;
+        while stable < 3 {
+            std::thread::sleep(Duration::from_millis(150));
+            let now = written.load(Ordering::Relaxed);
+            if now == last {
+                stable += 1;
+            } else {
+                stable = 0;
+                last = now;
+            }
+        }
+        let parked_at = written.load(Ordering::Relaxed);
+        assert!(
+            parked_at < TOTAL as u64,
+            "no backpressure: the writer pushed 24 MiB while the server read nothing"
+        );
+
+        hold.store(false, Ordering::Relaxed);
+        let response = exec.join().unwrap().unwrap();
+        writer.join().unwrap().unwrap();
+        assert!(response.is_success);
+        assert!(String::from_utf8_lossy(&response.body).contains(&expected_sha));
+        assert_eq!(written.load(Ordering::Relaxed), TOTAL as u64);
+        free_body_stream(id);
+    }
+
+    /// A TCP twin of the offline HTTP/3 host: serves `h3.test` over TLS on a
+    /// TCP port using the same per-process PKI, so the H3→TCP fallback can be
+    /// exercised for one origin with one trust anchor.
+    fn h3_test_tls_server<F>(handle: F) -> u16
+    where
+        F: Fn(TlsStream) + Send + Sync + 'static,
+    {
+        use rustls::pki_types::PrivateKeyDer;
+        use rustls::{ServerConfig, ServerConnection};
+
+        let pki = test_pki();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(pki.leaf_der.clone())],
+                PrivateKeyDer::try_from(pki.leaf_key_der.clone()).unwrap(),
+            )
+            .unwrap();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let config = Arc::new(config);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = Arc::new(handle);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let config = config.clone();
+                let handle = handle.clone();
+                std::thread::spawn(move || {
+                    stream.set_nodelay(true).ok();
+                    let Ok(conn) = ServerConnection::new(config) else {
+                        return;
+                    };
+                    handle(rustls::StreamOwned::new(conn, stream));
+                });
+            }
+        });
+        port
+    }
+
+    /// The fallback decision, permitting half: nothing listens on UDP, so the
+    /// HTTP/3 attempt dies at connect with zero streamed bytes consumed — and
+    /// the TCP fallback takes over the intact stream from byte 0 and
+    /// completes the upload. (PUT, so the method gate is not what permits it;
+    /// the consumed-bytes gate is the decision under test.)
+    #[test]
+    fn streamed_upload_falls_back_to_tcp_while_nothing_was_consumed() {
+        let port = h3_test_tls_server(upload_handler);
+        let _root = with_test_root(CertificateDer::from(test_pki().ca_der.clone()));
+        let client = super::client_with(VaneClientConfig {
+            protocol_mode: VaneProtocolMode::Http3ThenHttp2ThenHttp1,
+            dns_overrides: HashMap::from([(TEST_HOST.to_string(), "127.0.0.1".to_string())]),
+            connection_pool_enabled: false,
+            // Bounds the H3 attempt even where the refused UDP port is not
+            // reported via ICMP and the handshake has to time out instead.
+            timeout_seconds: Some(3),
+            ..VaneClientConfig::default()
+        });
+        let body = body_pattern(300 * 1024);
+        let expected_sha = sha256_hex(&body);
+        let id = create_body_stream(Some(body.len() as u64));
+        let writer = spawn_writer(id, body, 64 * 1024);
+
+        let mut request = test_request(&format!("https://{TEST_HOST}:{port}/upload"));
+        request.method = "PUT".to_string();
+        request.body_stream_id = Some(id);
+        let response = client.execute(request).unwrap();
+        writer.join().unwrap().unwrap();
+
+        assert!(response.is_success);
+        assert_eq!(
+            response.http_version,
+            Some(VaneHttpVersion::Http11),
+            "the response must have come over the TCP fallback"
+        );
+        let text = String::from_utf8_lossy(&response.body).into_owned();
+        assert!(text.contains("\"framing\": \"sized\""), "{text}");
+        assert!(text.contains(&expected_sha), "{text}");
+        free_body_stream(id);
+    }
+}
+
 type TlsStream = rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>;
 
 /// A localhost TLS listener with a per-run CA, so a test can drive the real

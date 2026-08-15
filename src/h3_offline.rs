@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use quiche::h3::NameValue;
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+use sha2::{Digest, Sha256};
 
 /// Hostname every test server answers as; tests point it at 127.0.0.1 through
 /// `dns_overrides`, so resolution never leaves the process's control.
@@ -38,6 +39,14 @@ pub(crate) struct TestPki {
     key_pem_path: PathBuf,
     /// Leaf DER, so tests can compute the pin the server actually presents.
     pub(crate) leaf_der: Vec<u8>,
+    /// CA DER, so a TCP test server can present this same PKI through
+    /// `tcp::TEST_ROOT` — the H3→TCP fallback tests serve both transports
+    /// for one host and need one trust anchor covering both.
+    #[cfg(feature = "tcp-fallback")]
+    pub(crate) ca_der: Vec<u8>,
+    /// Leaf key DER (PKCS#8), for the same TCP twin server.
+    #[cfg(feature = "tcp-fallback")]
+    pub(crate) leaf_key_der: Vec<u8>,
 }
 
 static TEST_PKI: OnceLock<TestPki> = OnceLock::new();
@@ -87,8 +96,39 @@ pub(crate) fn test_pki() -> &'static TestPki {
             cert_pem_path: write("cert.pem", &leaf.pem()),
             key_pem_path: write("key.pem", &leaf_key.serialize_pem()),
             leaf_der: leaf.der().to_vec(),
+            #[cfg(feature = "tcp-fallback")]
+            ca_der: ca.der().to_vec(),
+            #[cfg(feature = "tcp-fallback")]
+            leaf_key_der: leaf_key.serialize_der(),
         }
     })
+}
+
+/// One request the server finished receiving, for upload assertions: which
+/// attempt/hop arrived, what framing it declared, and what bytes it carried
+/// (as a digest, so multi-megabyte bodies don't sit in the log).
+#[derive(Clone)]
+pub(crate) struct SeenRequest {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    /// The request's `content-length` header, verbatim, if it sent one.
+    pub(crate) content_length: Option<String>,
+    pub(crate) body_len: usize,
+    pub(crate) body_sha256: String,
+}
+
+/// Knobs for the upload tests. `Default` is the plain server every existing
+/// test uses.
+#[derive(Default)]
+pub(crate) struct ServerTuning {
+    /// Overrides the connection and per-stream flow-control windows. Small
+    /// values cap how far a client upload can run ahead of the server's
+    /// reads, which is what makes writer backpressure observable.
+    pub(crate) flow_window: Option<u64>,
+    /// While true, the serve loop still ACKs packets but never polls HTTP/3 —
+    /// so received stream data is never consumed, no window credit is ever
+    /// granted, and an uploading client stalls against `flow_window`.
+    pub(crate) hold_h3: Option<Arc<AtomicBool>>,
 }
 
 /// A localhost HTTP/3 origin on an ephemeral port, served from one background
@@ -97,12 +137,17 @@ pub(crate) fn test_pki() -> &'static TestPki {
 pub(crate) struct TestH3Server {
     port: u16,
     handshakes: Arc<Mutex<Vec<bool>>>,
+    requests: Arc<Mutex<Vec<SeenRequest>>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl TestH3Server {
     pub(crate) fn start() -> Self {
+        Self::start_tuned(ServerTuning::default())
+    }
+
+    pub(crate) fn start_tuned(tuning: ServerTuning) -> Self {
         let pki = test_pki();
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         // The tick that bounds every loop below: recv wakes at least this
@@ -126,23 +171,37 @@ impl TestH3Server {
         config.set_max_recv_udp_payload_size(MAX_SERVER_DATAGRAM);
         config.set_max_send_udp_payload_size(MAX_SERVER_DATAGRAM);
         config.enable_dgram(true, 16, 16);
-        config.set_initial_max_data(10_000_000);
-        config.set_initial_max_stream_data_bidi_local(1_000_000);
-        config.set_initial_max_stream_data_bidi_remote(1_000_000);
-        config.set_initial_max_stream_data_uni(1_000_000);
+        let flow_window = tuning.flow_window;
+        config.set_initial_max_data(flow_window.unwrap_or(10_000_000));
+        config.set_initial_max_stream_data_bidi_local(flow_window.unwrap_or(1_000_000));
+        config.set_initial_max_stream_data_bidi_remote(flow_window.unwrap_or(1_000_000));
+        config.set_initial_max_stream_data_uni(flow_window.unwrap_or(1_000_000));
         config.set_initial_max_streams_bidi(100);
         config.set_initial_max_streams_uni(100);
 
         let handshakes = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let hold_h3 = tuning.hold_h3;
         let thread = std::thread::spawn({
             let handshakes = Arc::clone(&handshakes);
+            let requests = Arc::clone(&requests);
             let stop = Arc::clone(&stop);
-            move || serve(&socket, config, &handshakes, &stop)
+            move || {
+                serve(
+                    &socket,
+                    config,
+                    &handshakes,
+                    &requests,
+                    hold_h3.as_deref(),
+                    &stop,
+                )
+            }
         });
         Self {
             port,
             handshakes,
+            requests,
             stop,
             thread: Some(thread),
         }
@@ -155,6 +214,16 @@ impl TestH3Server {
     /// Snapshot of the per-connection resumption log, in accept order.
     pub(crate) fn handshakes(&self) -> Vec<bool> {
         self.handshakes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Snapshot of every fully-received request, in arrival order. The retry
+    /// and redirect decision tests count and inspect entries here: what the
+    /// server actually saw is the ground truth for "was it replayed".
+    pub(crate) fn requests(&self) -> Vec<SeenRequest> {
+        self.requests
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -189,6 +258,7 @@ struct PendingBody {
 
 #[derive(Default)]
 struct PendingRequest {
+    method: String,
     path: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
@@ -198,6 +268,8 @@ fn serve(
     socket: &UdpSocket,
     mut config: quiche::Config,
     handshakes: &Mutex<Vec<bool>>,
+    requests_log: &Mutex<Vec<SeenRequest>>,
+    hold_h3: Option<&AtomicBool>,
     stop: &AtomicBool,
 ) {
     let local_addr = socket.local_addr().unwrap();
@@ -264,12 +336,21 @@ fn serve(
                 server_conn.h3 =
                     quiche::h3::Connection::with_transport(&mut server_conn.conn, &h3_config).ok();
             }
-            if let Some(h3) = server_conn.h3.as_mut() {
+            // While held, packets are still received and ACKed above but no
+            // HTTP/3 event is consumed: stream data stays in quiche's buffers
+            // and no flow-control credit is granted, so an uploading client
+            // runs out of window and its writer blocks. Releasing the flag
+            // drains everything normally.
+            let held = hold_h3.is_some_and(|hold| hold.load(Ordering::Relaxed));
+            if let Some(h3) = server_conn.h3.as_mut()
+                && !held
+            {
                 poll_h3(
                     h3,
                     &mut server_conn.conn,
                     &mut server_conn.requests,
                     &mut server_conn.pending_bodies,
+                    requests_log,
                 );
                 drain_pending_bodies(h3, &mut server_conn.conn, &mut server_conn.pending_bodies);
             }
@@ -303,6 +384,7 @@ fn poll_h3(
     conn: &mut quiche::Connection,
     requests: &mut HashMap<u64, PendingRequest>,
     pending_bodies: &mut HashMap<u64, PendingBody>,
+    requests_log: &Mutex<Vec<SeenRequest>>,
 ) {
     loop {
         match h3.poll(conn) {
@@ -314,11 +396,26 @@ fn poll_h3(
                     if name == ":path" {
                         request.path = value.clone();
                     }
+                    if name == ":method" {
+                        request.method = value.clone();
+                    }
                     request.headers.push((name, value));
                 }
                 requests.insert(stream_id, request);
             }
             Ok((stream_id, quiche::h3::Event::Data)) => {
+                // The consumed-bytes fallback discriminator: once any body
+                // byte for this path has arrived, kill the whole connection
+                // abruptly. The client is left with a transport error and a
+                // partially-consumed body stream — the exact state in which
+                // the TCP fallback must NOT run.
+                if requests
+                    .get(&stream_id)
+                    .is_some_and(|request| request.path == "/upload-die")
+                {
+                    conn.close(false, 0x2, b"mid-upload abort").ok();
+                    return;
+                }
                 let mut chunk = [0u8; 4096];
                 while let Ok(read) = h3.recv_body(conn, stream_id, &mut chunk) {
                     if let Some(request) = requests.get_mut(&stream_id) {
@@ -328,7 +425,7 @@ fn poll_h3(
             }
             Ok((stream_id, quiche::h3::Event::Finished)) => {
                 if let Some(request) = requests.remove(&stream_id) {
-                    respond(h3, conn, stream_id, &request, pending_bodies);
+                    respond(h3, conn, stream_id, &request, pending_bodies, requests_log);
                 }
             }
             Ok(_) => {}
@@ -344,7 +441,22 @@ fn respond(
     stream_id: u64,
     request: &PendingRequest,
     pending_bodies: &mut HashMap<u64, PendingBody>,
+    requests_log: &Mutex<Vec<SeenRequest>>,
 ) {
+    requests_log
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(SeenRequest {
+            method: request.method.clone(),
+            path: request.path.clone(),
+            content_length: request
+                .headers
+                .iter()
+                .find(|(name, _)| name == "content-length")
+                .map(|(_, value)| value.clone()),
+            body_len: request.body.len(),
+            body_sha256: sha256_hex(&request.body),
+        });
     let (status, extra_headers, body) = route(request);
     let content_length = body.len().to_string();
     let mut headers = vec![
@@ -412,6 +524,48 @@ fn route(request: &PendingRequest) -> (String, Vec<(String, String)>, Vec<u8>) {
     if path == "/get" || path == "/post" {
         return ("200".to_string(), Vec::new(), echo_body(request, query));
     }
+    // Upload sink: answers with the received body's length and digest (so a
+    // multi-megabyte body is verified without echoing it) and mirrors the
+    // request's own framing back for the content-length assertions.
+    if path == "/upload" {
+        let framing = request
+            .headers
+            .iter()
+            .find(|(name, _)| name == "content-length")
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| "none".to_string());
+        return (
+            "200".to_string(),
+            vec![("x-request-content-length".to_string(), framing)],
+            format!(
+                "{{\"len\": {}, \"sha256\": \"{}\"}}",
+                request.body.len(),
+                sha256_hex(&request.body)
+            )
+            .into_bytes(),
+        );
+    }
+    // Same-origin 307: preserves method and body, so a buffered upload
+    // follows it and a streamed one must refuse it.
+    if path == "/upload-307" {
+        return (
+            "307".to_string(),
+            vec![("location".to_string(), "/upload".to_string())],
+            Vec::new(),
+        );
+    }
+    // 303: rewrites to a bodyless GET, which even a streamed upload follows.
+    if path == "/upload-303" {
+        return (
+            "303".to_string(),
+            vec![("location".to_string(), "/get".to_string())],
+            Vec::new(),
+        );
+    }
+    // Always-5xx endpoint for the retry-decision tests.
+    if let Some(code) = path.strip_prefix("/status/") {
+        return (code.to_string(), Vec::new(), Vec::new());
+    }
     if let Some(pair) = path.strip_prefix("/cookies/set/") {
         let (name, value) = pair.split_once('/').unwrap_or((pair, ""));
         return (
@@ -471,6 +625,17 @@ fn route(request: &PendingRequest) -> (String, Vec<(String, String)>, Vec<u8>) {
 /// body can be checked for both length and content.
 pub(crate) fn body_pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// Hex SHA-256, shared by the request log and the tests asserting against it.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Loose JSON echo in httpbin's shape — tests assert with `contains`, so the
@@ -918,6 +1083,464 @@ mod tests {
             assert!(stream.read_chunk().unwrap().is_some());
         }
         assert!(client.pool.lock().unwrap().is_empty());
+    }
+
+    // ---------- Upload (request-body) streaming ----------
+
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use super::{ServerTuning, sha256_hex};
+    use crate::{
+        VaneRequest, create_body_stream, finish_body_stream, free_body_stream,
+        write_body_stream_chunk,
+    };
+
+    /// One MiB: larger than `BODY_STREAM_BUFFER_BYTES`, so a passing
+    /// round-trip proves the writer and the drive loop really interleave
+    /// rather than the queue swallowing the whole body up front.
+    const UPLOAD_BODY_LEN: usize = 1024 * 1024;
+
+    fn upload_request(server: &TestH3Server, path: &str, method: &str, id: u64) -> VaneRequest {
+        let mut request = test_request(&server.url(path));
+        request.method = method.to_string();
+        request.body_stream_id = Some(id);
+        request
+    }
+
+    fn spawn_writer(
+        id: u64,
+        body: Vec<u8>,
+        chunk: usize,
+    ) -> std::thread::JoinHandle<Result<(), VaneError>> {
+        std::thread::spawn(move || {
+            for part in body.chunks(chunk) {
+                write_body_stream_chunk(id, part.to_vec())?;
+            }
+            finish_body_stream(id)
+        })
+    }
+
+    /// Declared length: `content-length` goes on the wire, the body arrives
+    /// byte-exact, progress publishes sent == total, and the connection pools
+    /// exactly like a buffered upload's.
+    #[test]
+    fn streamed_upload_round_trips_with_content_length_and_pools_the_connection() {
+        let server = TestH3Server::start();
+        let client = offline_client(VaneClientConfig::default());
+        let body = body_pattern(UPLOAD_BODY_LEN);
+        let expected_sha = sha256_hex(&body);
+        let id = create_body_stream(Some(UPLOAD_BODY_LEN as u64));
+        let progress_id = crate::create_progress();
+        let writer = spawn_writer(id, body, 64 * 1024);
+
+        let mut request = upload_request(&server, "/upload", "POST", id);
+        request.progress_id = Some(progress_id);
+        let response = client.execute(request).unwrap();
+        writer.join().unwrap().unwrap();
+
+        assert!(response.is_success);
+        let text = String::from_utf8_lossy(&response.body).into_owned();
+        assert!(text.contains(&expected_sha), "body digest mismatch: {text}");
+        assert_eq!(
+            response
+                .headers
+                .get("x-request-content-length")
+                .map(String::as_str),
+            Some(UPLOAD_BODY_LEN.to_string().as_str()),
+            "a declared length must go on the wire as content-length"
+        );
+        let seen = server.requests();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].body_len, UPLOAD_BODY_LEN);
+        assert_eq!(seen[0].body_sha256, expected_sha);
+
+        let progress = crate::progress_snapshot_by_id(progress_id);
+        assert!(progress.done);
+        assert_eq!(progress.upload_sent, UPLOAD_BODY_LEN as u64);
+        assert_eq!(progress.upload_total, UPLOAD_BODY_LEN as u64);
+
+        // Pool invariant: a cleanly-completed streamed upload pools its
+        // connection and the follow-up request rides it.
+        assert_eq!(client.pool.lock().unwrap().len(), 1);
+        assert!(
+            client
+                .execute(test_request(&server.url("/get")))
+                .unwrap()
+                .is_success
+        );
+        assert_eq!(server.handshakes().len(), 1);
+        crate::free_progress(progress_id);
+        free_body_stream(id);
+    }
+
+    /// Unknown length: no `content-length` anywhere, plain DATA + FIN, body
+    /// still byte-exact.
+    #[test]
+    fn streamed_upload_of_unknown_length_sends_no_content_length() {
+        let server = TestH3Server::start();
+        let client = offline_client(VaneClientConfig::default());
+        let body = body_pattern(UPLOAD_BODY_LEN);
+        let expected_sha = sha256_hex(&body);
+        let id = create_body_stream(None);
+        let writer = spawn_writer(id, body, 64 * 1024);
+
+        let response = client
+            .execute(upload_request(&server, "/upload", "POST", id))
+            .unwrap();
+        writer.join().unwrap().unwrap();
+
+        assert!(response.is_success);
+        assert_eq!(
+            response
+                .headers
+                .get("x-request-content-length")
+                .map(String::as_str),
+            Some("none"),
+            "an undeclared length must not invent a content-length"
+        );
+        let seen = server.requests();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].content_length, None);
+        assert_eq!(seen[0].body_len, UPLOAD_BODY_LEN);
+        assert_eq!(seen[0].body_sha256, expected_sha);
+        free_body_stream(id);
+    }
+
+    /// The retry decision: a streamed body runs exactly one attempt, whatever
+    /// the retry config says. The buffered control first proves the config
+    /// really does retry against this endpoint — without it a broken
+    /// discriminator would pass vacuously.
+    #[test]
+    fn streamed_upload_is_attempted_exactly_once_despite_retry_config() {
+        let server = TestH3Server::start();
+        let client = offline_client(VaneClientConfig {
+            retry_max_attempts: 3,
+            retry_unsafe_methods: true,
+            retry_initial_delay_millis: 1,
+            retry_max_delay_millis: 1,
+            ..VaneClientConfig::default()
+        });
+
+        let mut buffered = test_request(&server.url("/status/500"));
+        buffered.method = "POST".to_string();
+        buffered.body = Some(b"retry-me".to_vec());
+        let response = client.execute(buffered).unwrap();
+        assert_eq!(response.status_code, 500);
+        assert_eq!(
+            server.requests().len(),
+            3,
+            "control: a buffered POST must burn every configured attempt"
+        );
+
+        let id = create_body_stream(None);
+        write_body_stream_chunk(id, b"stream-once".to_vec()).unwrap();
+        finish_body_stream(id).unwrap();
+        let response = client
+            .execute(upload_request(&server, "/status/500", "POST", id))
+            .unwrap();
+        assert_eq!(response.status_code, 500);
+        assert_eq!(
+            server.requests().len(),
+            4,
+            "a streamed body is attempted exactly once, 5xx or not"
+        );
+        free_body_stream(id);
+    }
+
+    /// The redirect decision, half one: a same-origin 307 — which a buffered
+    /// body follows by replaying itself (the control) — is handed back
+    /// refused for a streamed body, marked `streamed-body`.
+    #[test]
+    fn streamed_upload_refuses_the_same_origin_307_a_buffered_body_follows() {
+        let server = TestH3Server::start();
+        let client = offline_client(VaneClientConfig::default());
+
+        let mut buffered = test_request(&server.url("/upload-307"));
+        buffered.method = "PUT".to_string();
+        buffered.body = Some(b"replayable".to_vec());
+        let response = client.execute(buffered).unwrap();
+        assert!(response.is_success);
+        assert!(response.url.ends_with("/upload"));
+        {
+            let seen = server.requests();
+            assert_eq!(seen.len(), 2, "control: the buffered 307 must be followed");
+            assert_eq!(seen[1].path, "/upload");
+            assert_eq!(seen[1].body_len, "replayable".len());
+        }
+
+        let id = create_body_stream(None);
+        write_body_stream_chunk(id, b"one-shot".to_vec()).unwrap();
+        finish_body_stream(id).unwrap();
+        let response = client
+            .execute(upload_request(&server, "/upload-307", "PUT", id))
+            .unwrap();
+        assert_eq!(response.status_code, 307);
+        assert_eq!(
+            response
+                .headers
+                .get(crate::REDIRECT_REFUSED_HEADER)
+                .map(String::as_str),
+            Some(crate::REDIRECT_REFUSED_STREAMED_BODY)
+        );
+        let seen = server.requests();
+        assert_eq!(seen.len(), 3, "the streamed 307 must not be followed");
+        assert_eq!(seen[2].path, "/upload-307");
+        free_body_stream(id);
+    }
+
+    /// The redirect decision, half two: a 303 rewrites to a bodyless GET, so
+    /// even a streamed upload follows it — nothing needs replaying.
+    #[test]
+    fn streamed_upload_follows_a_303_as_a_bodyless_get() {
+        let server = TestH3Server::start();
+        let client = offline_client(VaneClientConfig::default());
+
+        let id = create_body_stream(None);
+        write_body_stream_chunk(id, b"posted-then-redirected".to_vec()).unwrap();
+        finish_body_stream(id).unwrap();
+        let response = client
+            .execute(upload_request(&server, "/upload-303", "POST", id))
+            .unwrap();
+        assert!(response.is_success);
+        assert!(response.url.ends_with("/get"));
+        let seen = server.requests();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].method, "POST");
+        assert_eq!(seen[0].body_len, "posted-then-redirected".len());
+        assert_eq!(seen[1].method, "GET");
+        assert_eq!(seen[1].body_len, 0, "the 303 hop must carry no body");
+        free_body_stream(id);
+    }
+
+    /// Backpressure: with the server's flow-control window pinned small and
+    /// its HTTP/3 reads held, the writer must park inside
+    /// `write_body_stream_chunk` after roughly window + stream buffer bytes —
+    /// nowhere near the full body — and complete only once the server reads.
+    #[test]
+    fn streamed_upload_backpressure_parks_the_writer_against_the_flow_window() {
+        const WINDOW: u64 = 64 * 1024;
+        let hold = Arc::new(AtomicBool::new(true));
+        let server = TestH3Server::start_tuned(ServerTuning {
+            flow_window: Some(WINDOW),
+            hold_h3: Some(Arc::clone(&hold)),
+        });
+        let client = Arc::new(offline_client(VaneClientConfig::default()));
+        let body = body_pattern(UPLOAD_BODY_LEN);
+        let expected_sha = sha256_hex(&body);
+        let id = create_body_stream(Some(UPLOAD_BODY_LEN as u64));
+
+        let written = Arc::new(AtomicU64::new(0));
+        let writer = std::thread::spawn({
+            let written = Arc::clone(&written);
+            move || -> Result<(), VaneError> {
+                for part in body.chunks(32 * 1024) {
+                    write_body_stream_chunk(id, part.to_vec())?;
+                    written.fetch_add(part.len() as u64, Ordering::Relaxed);
+                }
+                finish_body_stream(id)
+            }
+        });
+        let request = upload_request(&server, "/upload", "POST", id);
+        let exec = std::thread::spawn({
+            let client = Arc::clone(&client);
+            move || client.execute(request)
+        });
+
+        // The writer has parked once its counter stops moving: everything the
+        // flow window plus the stream buffer can absorb has been absorbed.
+        let mut last = u64::MAX;
+        let mut stable = 0;
+        while stable < 3 {
+            std::thread::sleep(Duration::from_millis(100));
+            let now = written.load(Ordering::Relaxed);
+            if now == last {
+                stable += 1;
+            } else {
+                stable = 0;
+                last = now;
+            }
+        }
+        let parked_at = written.load(Ordering::Relaxed);
+        assert!(
+            parked_at < UPLOAD_BODY_LEN as u64,
+            "no backpressure: the writer pushed the whole body while the server read nothing"
+        );
+        assert!(
+            parked_at <= WINDOW + crate::BODY_STREAM_BUFFER_BYTES as u64 + 2 * 32 * 1024,
+            "writer ran further ahead than the window + buffer allow: {parked_at}"
+        );
+
+        hold.store(false, Ordering::Relaxed);
+        let response = exec.join().unwrap().unwrap();
+        writer.join().unwrap().unwrap();
+        assert!(response.is_success);
+        assert!(String::from_utf8_lossy(&response.body).contains(&expected_sha));
+        assert_eq!(written.load(Ordering::Relaxed), UPLOAD_BODY_LEN as u64);
+        free_body_stream(id);
+    }
+
+    /// The fallback decision, refusing half: the server kills the connection
+    /// after body bytes were consumed, and the TCP fallback must NOT run —
+    /// PUT is a retryable method and the failure is a transport failure, so
+    /// the consumed-bytes gate is the only thing standing in the way. (Its
+    /// permitting half, consumed == 0, lives in `tcp::tests::upload`.)
+    #[cfg(feature = "tcp-fallback")]
+    #[test]
+    fn streamed_upload_mid_body_transport_failure_does_not_fall_back() {
+        let server = TestH3Server::start();
+        let client = offline_client(VaneClientConfig {
+            protocol_mode: crate::VaneProtocolMode::Http3ThenHttp2ThenHttp1,
+            ..VaneClientConfig::default()
+        });
+        let id = create_body_stream(None);
+        let writer = std::thread::spawn(move || {
+            for _ in 0..64 {
+                if write_body_stream_chunk(id, vec![7u8; 16 * 1024]).is_err() {
+                    // The abort reached the writer — expected once the
+                    // connection died mid-upload.
+                    return;
+                }
+            }
+            finish_body_stream(id).ok();
+        });
+
+        let err = client
+            .execute(upload_request(&server, "/upload-die", "PUT", id))
+            .unwrap_err();
+        writer.join().unwrap();
+        assert!(
+            matches!(err, VaneError::Transport(_) | VaneError::Timeout(_)),
+            "{err}"
+        );
+        assert!(
+            !err.to_string().contains("TCP fallback also failed"),
+            "the TCP fallback ran despite consumed streamed bytes: {err}"
+        );
+        assert!(
+            client.pool.lock().unwrap().is_empty(),
+            "a connection that died mid-upload must not pool"
+        );
+        free_body_stream(id);
+    }
+
+    /// Freeing the id mid-flight is the abort path: the request fails
+    /// `Cancelled`, exactly like freeing a half-read response stream.
+    #[test]
+    fn streamed_upload_freed_mid_flight_cancels_the_request() {
+        let server = TestH3Server::start();
+        let client = offline_client(VaneClientConfig::default());
+        let id = create_body_stream(None);
+        write_body_stream_chunk(id, vec![1u8; 8 * 1024]).unwrap();
+        let free = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            free_body_stream(id);
+        });
+        let err = client
+            .execute(upload_request(&server, "/upload", "POST", id))
+            .unwrap_err();
+        free.join().unwrap();
+        assert!(matches!(err, VaneError::Cancelled(_)), "{err}");
+    }
+
+    /// A writer that never calls `finish()` cannot hang the request forever:
+    /// the shared deadline fires, and the writer-side handle then reports the
+    /// request's end instead of blocking.
+    #[test]
+    fn streamed_upload_whose_writer_never_finishes_times_out() {
+        let server = TestH3Server::start();
+        let client = offline_client(VaneClientConfig::default());
+        let id = create_body_stream(None);
+        write_body_stream_chunk(id, b"stuck".to_vec()).unwrap();
+        let mut request = upload_request(&server, "/upload", "POST", id);
+        request.timeout_seconds = Some(1);
+        let err = client.execute(request).unwrap_err();
+        assert!(matches!(err, VaneError::Timeout(_)), "{err}");
+        assert!(
+            matches!(
+                write_body_stream_chunk(id, b"late".to_vec()),
+                Err(VaneError::Cancelled(_))
+            ),
+            "a write after the request died must report it, not park"
+        );
+        free_body_stream(id);
+    }
+
+    /// `max_request_body_bytes` binds a stream of unknown length at the exact
+    /// configured byte: the request fails `BodyLimitExceeded` and the writer
+    /// gets the same error instead of blocking forever.
+    #[test]
+    fn streamed_upload_enforces_the_request_body_limit_incrementally() {
+        let server = TestH3Server::start();
+        let client = offline_client(VaneClientConfig {
+            max_request_body_bytes: 64 * 1024,
+            ..VaneClientConfig::default()
+        });
+        let id = create_body_stream(None);
+        let writer = std::thread::spawn(move || {
+            loop {
+                if let Err(err) = write_body_stream_chunk(id, vec![9u8; 32 * 1024]) {
+                    return err;
+                }
+            }
+        });
+        let err = client
+            .execute(upload_request(&server, "/upload", "POST", id))
+            .unwrap_err();
+        assert!(matches!(err, VaneError::BodyLimitExceeded(_)), "{err}");
+        let writer_err = writer.join().unwrap();
+        assert!(
+            matches!(writer_err, VaneError::BodyLimitExceeded(_)),
+            "{writer_err}"
+        );
+        free_body_stream(id);
+    }
+
+    /// A body short of its declared length must never FIN cleanly: `finish`
+    /// refuses, the request fails, and the server sees no completed request.
+    #[test]
+    fn streamed_upload_short_of_its_declared_length_fails_the_request() {
+        let server = TestH3Server::start();
+        let client = offline_client(VaneClientConfig::default());
+        let id = create_body_stream(Some(10));
+        write_body_stream_chunk(id, b"four".to_vec()).unwrap();
+        assert!(matches!(
+            finish_body_stream(id),
+            Err(VaneError::InvalidRequest(_))
+        ));
+        let err = client
+            .execute(upload_request(&server, "/upload", "POST", id))
+            .unwrap_err();
+        assert!(matches!(err, VaneError::InvalidRequest(_)), "{err}");
+        assert!(
+            server.requests().is_empty(),
+            "a short body must never reach the server as a finished request"
+        );
+        free_body_stream(id);
+    }
+
+    /// Upload streaming composes with response streaming: the request body is
+    /// caller-pushed, and the response comes back through the pull API.
+    #[test]
+    fn execute_streaming_accepts_a_streamed_upload() {
+        let server = TestH3Server::start();
+        let client = Arc::new(offline_client(VaneClientConfig::default()));
+        let body = body_pattern(512 * 1024);
+        let expected_sha = sha256_hex(&body);
+        let id = create_body_stream(Some(body.len() as u64));
+        let writer = spawn_writer(id, body, 64 * 1024);
+
+        let stream = Arc::clone(&client)
+            .execute_streaming(upload_request(&server, "/upload", "POST", id))
+            .unwrap();
+        writer.join().unwrap().unwrap();
+        assert!(stream.head().is_success);
+        let mut received = Vec::new();
+        while let Some(chunk) = stream.read_chunk().unwrap() {
+            received.extend_from_slice(&chunk);
+        }
+        assert!(String::from_utf8_lossy(&received).contains(&expected_sha));
+        free_body_stream(id);
     }
 
     /// The whole C ABI stream lifecycle against the in-process server, byte

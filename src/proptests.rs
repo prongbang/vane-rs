@@ -686,15 +686,30 @@ fn check_cross_origin_header_policy(name: &str) {
     }
 }
 
-/// A request body is never replayed at a different origin: any cross-origin
-/// hop that still has a body either drops it (GET rewrite) or is refused.
-fn check_redirect_rewrite(status: u16, method: &str, has_body: bool, cross_origin: bool) {
-    let rewrite = redirect_rewrite(status, method, has_body, cross_origin);
+/// A request body is never replayed at a different origin, and a *streamed*
+/// body is never replayed at all: any hop that still has a body to send
+/// either drops it (GET rewrite) or is refused. `Keep` with a streamed body
+/// would mean re-sending bytes the caller can no longer produce.
+fn check_redirect_rewrite(
+    status: u16,
+    method: &str,
+    has_body: bool,
+    streamed: bool,
+    cross_origin: bool,
+) {
+    let rewrite = redirect_rewrite(status, method, has_body, streamed, cross_origin);
     if has_body && cross_origin {
         assert_ne!(
             rewrite,
             RedirectRewrite::Keep,
             "cross-origin body replay permitted: {status} {method}"
+        );
+    }
+    if streamed {
+        assert_ne!(
+            rewrite,
+            RedirectRewrite::Keep,
+            "streamed body replay permitted: {status} {method} cross_origin={cross_origin}"
         );
     }
 }
@@ -845,9 +860,10 @@ proptest! {
         status in 200u16..600,
         method in prop::sample::select(["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "get", "Post"].as_slice()),
         has_body in any::<bool>(),
+        streamed in any::<bool>(),
         cross_origin in any::<bool>(),
     ) {
-        check_redirect_rewrite(status, method, has_body, cross_origin);
+        check_redirect_rewrite(status, method, has_body, streamed, cross_origin);
     }
 }
 

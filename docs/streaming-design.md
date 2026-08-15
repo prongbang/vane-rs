@@ -368,10 +368,12 @@ Ranked, most worrying first:
 
 ## Does the shape extend to upload streaming?
 
-Yes, mirrored. For upload the *core* is the consumer, so the roles flip: the
-caller pushes with blocking calls — `request_body_stream()` returning a
-handle with `write_chunk(bytes)` / `finish()` — and backpressure is the
-`write_chunk` call blocking while QUIC/TCP send windows are full. That is
-caller-driven push *into* the core, which works on Dart for the same reason
-pull works (Dart initiates every call). It does not require callback
-interfaces on any binding. Not designed further here; phase 3.
+Yes, mirrored — now designed and implemented in the core; see
+`upload-streaming-design.md`. The sketch that used to live here (roles flip,
+caller pushes with blocking calls, backpressure is the write blocking) held
+up as an outline, but the load-bearing parts turned out to be what it did
+not say: a streamed body cannot be replayed, which forces explicit decisions
+on retry, redirects and the H3→TCP fallback; the handle became a registry id
+(`create_body_stream` + `VaneRequest.body_stream_id`, the cancel-token
+dialect); and the request timeout is a *total* budget over the upload. The
+new doc records each decision with its test, plus the phase-4 binding plan.

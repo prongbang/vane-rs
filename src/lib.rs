@@ -10,6 +10,7 @@ mod h3_offline;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::fs::{self, File};
 use std::io;
@@ -17,7 +18,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -105,6 +106,17 @@ static NEXT_CANCEL_TOKEN_ID: AtomicU64 = AtomicU64::new(1);
 static PROGRESS_STATES: LazyLock<Mutex<HashMap<u64, Arc<VaneProgressState>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_PROGRESS_ID: AtomicU64 = AtomicU64::new(1);
+static BODY_STREAMS: LazyLock<Mutex<HashMap<u64, Arc<RequestBodyStream>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_BODY_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Cap on bytes parked between a body-stream writer and the transport that
+/// consumes them. `write_body_stream_chunk` blocks while the queue is at or
+/// over this, which is the whole backpressure story on the writer's side: the
+/// transport only drains the queue as fast as the peer's flow-control window
+/// (H3) or the TCP send path accepts bytes. One caller chunk may straddle the
+/// cap, so the true bound is this plus one chunk.
+const BODY_STREAM_BUFFER_BYTES: usize = 256 * 1024;
 
 /// Shared progress counters for one request. The global map only resolves ids
 /// to handles; the transfer loop writes the atomics directly so it never takes
@@ -125,6 +137,279 @@ impl VaneProgressState {
         self.upload_total.store(upload_total, Ordering::Relaxed);
         self.download_received.store(0, Ordering::Relaxed);
         self.download_total.store(0, Ordering::Relaxed);
+    }
+}
+
+/// What one non-blocking pull off a [`RequestBodyStream`] produced.
+enum BodyPull {
+    Chunk(Vec<u8>),
+    /// `finish_body_stream` was called and every queued byte is out.
+    Finished,
+    /// Nothing queued yet; the writer is still producing.
+    Pending,
+    /// The stream is dead; the error is also what the request must fail with.
+    Failed(VaneError),
+}
+
+/// A caller-pushed request body: the writer feeds chunks in with blocking
+/// calls, the transport pulls them out as its send window opens.
+///
+/// **Consumed bytes are gone.** The writer's chunks are handed to the
+/// transport exactly once, so anything that would need the body a second time
+/// — a retry attempt, a body-preserving redirect hop, the HTTP/3→TCP fallback
+/// after bytes went out — is refused while a stream is attached (see the call
+/// sites in `execute_with_retry`, `redirect_rewrite` and `dispatch_via`).
+/// `consumed()` is the one gate for that: `0` means the queue is intact and a
+/// different transport may still take over from the start.
+///
+/// All coordination lives on one mutex + condvar: the writer blocks while the
+/// queue holds [`BODY_STREAM_BUFFER_BYTES`] or the declared length is spent,
+/// and the terminal error latches once — every later write, finish or pull
+/// replays it, exactly like a response stream's terminal state.
+struct RequestBodyStream {
+    /// Declared once at creation. `Some` sends `content-length` on both
+    /// transports and holds the writer to the exact byte count; `None` sends
+    /// no length (chunked framing on HTTP/1.1, plain DATA/FIN on H3 and h2).
+    content_length: Option<u64>,
+    inner: Mutex<BodyStreamInner>,
+    cond: Condvar,
+}
+
+struct BodyStreamInner {
+    queue: VecDeque<Vec<u8>>,
+    queued_bytes: usize,
+    /// Bytes accepted from the writer, including everything still queued.
+    written: u64,
+    /// Bytes handed to a transport. These cannot be recovered: quiche or
+    /// hyper may have put any prefix of them on the wire already.
+    consumed: u64,
+    finished: bool,
+    /// Set by the first request that uses the stream; a body stream is
+    /// one-shot and a second request must be refused, not fed a re-run.
+    attached: bool,
+    terminal: Option<VaneError>,
+}
+
+impl RequestBodyStream {
+    fn new(content_length: Option<u64>) -> Self {
+        Self {
+            content_length,
+            inner: Mutex::new(BodyStreamInner {
+                queue: VecDeque::new(),
+                queued_bytes: 0,
+                written: 0,
+                consumed: 0,
+                finished: false,
+                attached: false,
+                terminal: None,
+            }),
+            cond: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, BodyStreamInner>, VaneError> {
+        self.inner
+            .lock()
+            .map_err(|_| VaneError::Generic("Request body stream lock was poisoned".to_string()))
+    }
+
+    /// Claims the stream for one request. Called once per `execute*` call,
+    /// before any transport attempt, so every attempt (including the TCP
+    /// fallback) shares the same claim.
+    fn attach(&self) -> Result<(), VaneError> {
+        let mut inner = self.lock()?;
+        if inner.attached {
+            return Err(VaneError::InvalidRequest(
+                "A body stream can only be used by one request".to_string(),
+            ));
+        }
+        inner.attached = true;
+        Ok(())
+    }
+
+    /// Blocking write. Returns once the chunk is queued, which can be after an
+    /// arbitrary wait: the queue only drains as the transport sends, so this
+    /// blocking IS the caller-visible backpressure.
+    fn write(&self, chunk: Vec<u8>) -> Result<(), VaneError> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.lock()?;
+        loop {
+            if let Some(err) = &inner.terminal {
+                return Err(err.clone());
+            }
+            if inner.finished {
+                return Err(VaneError::InvalidRequest(
+                    "Request body stream is already finished".to_string(),
+                ));
+            }
+            if let Some(declared) = self.content_length
+                && inner.written + chunk.len() as u64 > declared
+            {
+                // The request in flight declared `content-length: declared`;
+                // extra bytes would make that a lie, so the stream (and with
+                // it the request) is failed rather than silently truncated.
+                let err = VaneError::InvalidRequest(format!(
+                    "Request body stream exceeded its declared length of {declared} bytes"
+                ));
+                inner.terminal = Some(err.clone());
+                self.cond.notify_all();
+                return Err(err);
+            }
+            if inner.queued_bytes < BODY_STREAM_BUFFER_BYTES {
+                inner.queued_bytes += chunk.len();
+                inner.written += chunk.len() as u64;
+                inner.queue.push_back(chunk);
+                self.cond.notify_all();
+                return Ok(());
+            }
+            inner = self.cond.wait(inner).map_err(|_| {
+                VaneError::Generic("Request body stream lock was poisoned".to_string())
+            })?;
+        }
+    }
+
+    /// Marks the body complete. With a declared length, anything but the exact
+    /// byte count is an error that also fails the in-flight request — a short
+    /// body must never turn into a clean FIN under a longer `content-length`.
+    fn finish(&self) -> Result<(), VaneError> {
+        let mut inner = self.lock()?;
+        if let Some(err) = &inner.terminal {
+            return Err(err.clone());
+        }
+        if inner.finished {
+            return Ok(());
+        }
+        if let Some(declared) = self.content_length
+            && inner.written != declared
+        {
+            let err = VaneError::InvalidRequest(format!(
+                "Request body stream finished after {} bytes but declared {declared}",
+                inner.written
+            ));
+            inner.terminal = Some(err.clone());
+            self.cond.notify_all();
+            return Err(err);
+        }
+        inner.finished = true;
+        self.cond.notify_all();
+        Ok(())
+    }
+
+    /// One non-blocking pull, for the HTTP/3 drive loop. `limit` is the
+    /// client's `max_request_body_bytes`, enforced here — at the moment bytes
+    /// become unrecoverable — so a stream of unknown length hits the cap at
+    /// the exact configured byte on every transport.
+    fn try_pull(&self, limit: u64) -> BodyPull {
+        let mut inner = match self.lock() {
+            Ok(inner) => inner,
+            Err(err) => return BodyPull::Failed(err),
+        };
+        if let Some(err) = &inner.terminal {
+            return BodyPull::Failed(err.clone());
+        }
+        let Some(chunk) = inner.queue.pop_front() else {
+            return if inner.finished {
+                BodyPull::Finished
+            } else {
+                BodyPull::Pending
+            };
+        };
+        if inner.consumed + chunk.len() as u64 > limit {
+            // Refused before any of the chunk is handed out, so the failure
+            // is exact and nothing over the limit reaches the wire.
+            let err = VaneError::BodyLimitExceeded(format!("Request body exceeded {limit} bytes"));
+            inner.terminal = Some(err.clone());
+            self.cond.notify_all();
+            return BodyPull::Failed(err);
+        }
+        inner.queued_bytes -= chunk.len();
+        inner.consumed += chunk.len() as u64;
+        // The writer may be parked on a full queue.
+        self.cond.notify_all();
+        BodyPull::Chunk(chunk)
+    }
+
+    /// Blocking pull for the TCP `Read` bridge. Waits in `tick`-sized slices
+    /// so a cancel interrupts a parked upload promptly; a fired token latches
+    /// `Cancelled` as the stream's terminal state, which is also what the
+    /// request then fails with. `Ok(None)` is the clean end of body.
+    #[cfg(feature = "tcp-fallback")]
+    fn pull_blocking(
+        &self,
+        limit: u64,
+        cancel: Option<&AtomicBool>,
+        tick: Duration,
+    ) -> Result<Option<Vec<u8>>, VaneError> {
+        loop {
+            match self.try_pull(limit) {
+                BodyPull::Chunk(chunk) => return Ok(Some(chunk)),
+                BodyPull::Finished => return Ok(None),
+                BodyPull::Failed(err) => return Err(err),
+                BodyPull::Pending => {}
+            }
+            if let Err(err) = check_cancelled(cancel) {
+                self.fail(err.clone());
+                return Err(err);
+            }
+            let inner = self.lock()?;
+            // Woken by a write, finish, fail or free — or by the tick, to
+            // re-check the cancel token.
+            drop(
+                self.cond
+                    .wait_timeout(inner, tick)
+                    .map_err(|_| {
+                        VaneError::Generic("Request body stream lock was poisoned".to_string())
+                    })?
+                    .0,
+            );
+        }
+    }
+
+    /// Bytes irrevocably handed to a transport. The replay gate: retry,
+    /// redirect replay and the H3→TCP fallback all key off this being zero.
+    fn consumed(&self) -> u64 {
+        self.lock().map(|inner| inner.consumed).unwrap_or(u64::MAX)
+    }
+
+    /// The latched terminal error, if the stream (not the transport) is what
+    /// killed the request. The TCP path prefers this over reqwest's own
+    /// send-error text, so a cancel, a body limit or a declared-length
+    /// violation keeps its precise kind instead of collapsing to `Transport`.
+    #[cfg(feature = "tcp-fallback")]
+    fn latched_error(&self) -> Option<VaneError> {
+        self.lock().ok().and_then(|inner| inner.terminal.clone())
+    }
+
+    /// Latches `err` as terminal and wakes a parked writer. Idempotent-first:
+    /// an already-latched error is never overwritten, so the first cause wins.
+    fn fail(&self, err: VaneError) {
+        if let Ok(mut inner) = self.inner.lock()
+            && inner.terminal.is_none()
+        {
+            inner.terminal = Some(err);
+            self.cond.notify_all();
+        }
+    }
+
+    /// Called when the request stops consuming the stream — it completed,
+    /// failed, or a redirect rewrote the body away. A cleanly-drained stream
+    /// (finished, queue empty) is left alone; anything else gets `Cancelled`
+    /// latched so a parked or late writer returns promptly instead of waiting
+    /// on a request that will never read again.
+    fn release(&self) {
+        if let Ok(mut inner) = self.inner.lock()
+            && inner.terminal.is_none()
+            && !(inner.finished && inner.queue.is_empty())
+        {
+            inner.terminal = Some(VaneError::Cancelled(
+                "Request no longer consumes the body stream; it completed, failed or dropped \
+                 the body on a redirect"
+                    .to_string(),
+            ));
+            self.cond.notify_all();
+        }
     }
 }
 
@@ -427,6 +712,13 @@ pub struct VaneRequest {
     pub query_params: HashMap<String, String>,
     pub body: Option<Vec<u8>>,
     pub body_file_path: Option<String>,
+    /// A [`create_body_stream`] id: the caller pushes the body in chunks
+    /// instead of materializing it. Mutually exclusive with `body` and
+    /// `body_file_path`. A streamed body is one-shot — see the streamed-body
+    /// rules on retry, redirects and transport fallback in
+    /// `docs/upload-streaming-design.md`.
+    #[uniffi(default = None)]
+    pub body_stream_id: Option<u64>,
     pub response_body_path: Option<String>,
     pub cancel_token_id: Option<u64>,
     pub progress_id: Option<u64>,
@@ -810,13 +1102,54 @@ impl VaneClient {
             self.config.max_request_body_bytes,
         )?;
         let body = request_body.as_ref();
+        let body_stream = self.resolve_body_stream(&request)?;
 
-        let result = self.dispatch(&request, &url, body);
+        let result = self.dispatch(&request, &url, body, body_stream.as_ref());
+        // The request is over either way; a writer still parked in
+        // `write_body_stream_chunk` must learn that rather than wait forever.
+        if let Some(stream) = &body_stream {
+            stream.release();
+        }
         // Marked done once, when the caller-visible request ends. Doing it per
         // transport attempt would flip `done` true between the HTTP/3 failure
         // and the TCP fallback, and a poller that latched it would stop early.
         progress_done(progress_handle(request.progress_id).as_deref());
         result
+    }
+
+    /// Resolves and claims the request's body stream, and rejects up front
+    /// everything that can be rejected before a connection exists: a second
+    /// body source on the same request, an unknown (or already freed) id, a
+    /// declared length over the configured limit, and reuse across requests.
+    fn resolve_body_stream(
+        &self,
+        request: &VaneRequest,
+    ) -> Result<Option<Arc<RequestBodyStream>>, VaneError> {
+        let Some(id) = request.body_stream_id else {
+            return Ok(None);
+        };
+        if request.body.as_ref().is_some_and(|body| !body.is_empty())
+            || request
+                .body_file_path
+                .as_deref()
+                .is_some_and(|path| !path.is_empty())
+        {
+            return Err(VaneError::InvalidRequest(
+                "bodyStreamId cannot be combined with body or bodyFilePath".to_string(),
+            ));
+        }
+        let Some(stream) = body_stream_handle(id) else {
+            return Err(VaneError::InvalidRequest(format!(
+                "Unknown body stream id {id}"
+            )));
+        };
+        if let Some(declared) = stream.content_length {
+            // Same refusal (and message) an oversized buffered body gets,
+            // before anything is written or connected.
+            validate_request_body_limit(declared, self.config.max_request_body_bytes)?;
+        }
+        stream.attach()?;
+        Ok(Some(stream))
     }
 
     /// Like [`Self::execute`], but returns as soon as the final response's
@@ -871,12 +1204,25 @@ impl VaneClient {
             this.config.max_request_body_bytes,
         )?;
         let body = request_body.as_ref();
+        let body_stream = this.resolve_body_stream(request)?;
 
-        this.dispatch_via(
+        let result = this.dispatch_via(
             request,
-            || Self::execute_http3_streaming(this, request, &url, body),
-            || this.execute_tcp_streaming(request, &url, body),
-        )
+            body_stream.as_ref(),
+            || Self::execute_http3_streaming(this, request, &url, body, body_stream.as_ref()),
+            || this.execute_tcp_streaming(request, &url, body, body_stream.as_ref()),
+        );
+        // On success the writer's release is owned by whoever still consumes
+        // the stream: the H3 continuation releases at its own end when the
+        // server answered before the upload finished, and every other success
+        // path released before returning its hop. Failure has no such owner,
+        // so a parked writer is released here.
+        if result.is_err()
+            && let Some(stream) = &body_stream
+        {
+            stream.release();
+        }
+        result
     }
 
     /// Without the TCP backend the TCP-only modes cannot work; fail before
@@ -899,11 +1245,13 @@ impl VaneClient {
         request: &VaneRequest,
         url: &Url,
         body: &[u8],
+        body_stream: Option<&Arc<RequestBodyStream>>,
     ) -> Result<VaneResponse, VaneError> {
         self.dispatch_via(
             request,
-            || self.execute_http3(request, url, body),
-            || self.execute_tcp(request, url, body),
+            body_stream,
+            || self.execute_http3(request, url, body, body_stream),
+            || self.execute_tcp(request, url, body, body_stream),
         )
     }
 
@@ -914,6 +1262,7 @@ impl VaneClient {
     fn dispatch_via<R>(
         &self,
         request: &VaneRequest,
+        body_stream: Option<&Arc<RequestBodyStream>>,
         http3: impl Fn() -> Result<R, VaneError>,
         tcp: impl Fn() -> Result<R, VaneError>,
     ) -> Result<R, VaneError> {
@@ -950,6 +1299,13 @@ impl VaneClient {
                     {
                         Err(err)
                     }
+                    // A streamed body the HTTP/3 attempt already consumed from
+                    // cannot be replayed: the bytes are in quiche's buffers or
+                    // on the wire, and the caller cannot produce them again.
+                    // Zero consumed — the usual shape when UDP is blocked and
+                    // the handshake itself failed — leaves the whole stream
+                    // intact, and the TCP attempt takes it over from byte 0.
+                    Err(err) if body_stream.is_some_and(|stream| stream.consumed() > 0) => Err(err),
                     Err(err) => {
                         if check_cancelled(cancel_token(request.cancel_token_id).as_deref())
                             .is_err()
@@ -981,8 +1337,11 @@ impl VaneClient {
         request: &VaneRequest,
         url: &Url,
         body: &[u8],
+        body_stream: Option<&Arc<RequestBodyStream>>,
     ) -> Result<VaneResponse, VaneError> {
-        self.execute_with_retry(request, || self.follow_http3_redirects(request, url, body))
+        self.execute_with_retry(request, body_stream.is_some(), || {
+            self.follow_http3_redirects(request, url, body, body_stream)
+        })
     }
 
     /// One attempt: the redirect chain. Each hop is a full HTTP/3 request
@@ -996,6 +1355,7 @@ impl VaneClient {
         request: &VaneRequest,
         url: &Url,
         request_body: &[u8],
+        body_stream: Option<&Arc<RequestBodyStream>>,
     ) -> Result<VaneResponse, VaneError> {
         let timeout = Duration::from_secs(
             request
@@ -1007,13 +1367,14 @@ impl VaneClient {
         // Once per attempt, not per hop: resetting the counters mid-chain would
         // walk a progress bar backwards. `execute` marks the request done once
         // the whole dispatch resolves.
-        let progress = progress_init(request.progress_id, request_body.len() as u64);
+        let progress = progress_init(request.progress_id, upload_total(request_body, body_stream));
         // Snapshotted once so a concurrent `set_certificate_pins` cannot change
         // what the hop gate allows halfway down a chain.
         let certificate_pins = self.certificate_pins_snapshot()?;
 
         RedirectChain {
             request,
+            body_stream,
             certificate_pins: &certificate_pins,
             cancel_token: cancel_token.as_deref(),
             progress: progress.as_deref(),
@@ -1045,9 +1406,10 @@ impl VaneClient {
         request: &VaneRequest,
         url: &Url,
         body: &[u8],
+        body_stream: Option<&Arc<RequestBodyStream>>,
     ) -> Result<VaneResponseStream, VaneError> {
-        this.execute_with_retry(request, || {
-            Self::follow_http3_redirects_streaming(this, request, url, body)
+        this.execute_with_retry(request, body_stream.is_some(), || {
+            Self::follow_http3_redirects_streaming(this, request, url, body, body_stream)
         })
     }
 
@@ -1060,6 +1422,7 @@ impl VaneClient {
         request: &VaneRequest,
         url: &Url,
         request_body: &[u8],
+        body_stream: Option<&Arc<RequestBodyStream>>,
     ) -> Result<VaneResponseStream, VaneError> {
         let timeout = Duration::from_secs(
             request
@@ -1068,11 +1431,12 @@ impl VaneClient {
                 .unwrap_or(30),
         );
         let cancel_token = cancel_token(request.cancel_token_id);
-        let progress = progress_init(request.progress_id, request_body.len() as u64);
+        let progress = progress_init(request.progress_id, upload_total(request_body, body_stream));
         let certificate_pins = this.certificate_pins_snapshot()?;
 
         let hop_result = RedirectChain {
             request,
+            body_stream,
             certificate_pins: &certificate_pins,
             cancel_token: cancel_token.as_deref(),
             progress: progress.as_deref(),
@@ -1115,8 +1479,11 @@ impl VaneClient {
         request: &VaneRequest,
         url: &Url,
         body: &[u8],
+        body_stream: Option<&Arc<RequestBodyStream>>,
     ) -> Result<VaneResponse, VaneError> {
-        self.execute_with_retry(request, || tcp::execute_tcp_once(self, request, url, body))
+        self.execute_with_retry(request, body_stream.is_some(), || {
+            tcp::execute_tcp_once(self, request, url, body, body_stream)
+        })
     }
 
     #[cfg(not(feature = "tcp-fallback"))]
@@ -1125,6 +1492,7 @@ impl VaneClient {
         _request: &VaneRequest,
         _url: &Url,
         _body: &[u8],
+        _body_stream: Option<&Arc<RequestBodyStream>>,
     ) -> Result<VaneResponse, VaneError> {
         Err(unsupported_tcp_backend_error())
     }
@@ -1135,9 +1503,10 @@ impl VaneClient {
         request: &VaneRequest,
         url: &Url,
         body: &[u8],
+        body_stream: Option<&Arc<RequestBodyStream>>,
     ) -> Result<VaneResponseStream, VaneError> {
-        self.execute_with_retry(request, || {
-            tcp::execute_tcp_streaming_once(self, request, url, body)
+        self.execute_with_retry(request, body_stream.is_some(), || {
+            tcp::execute_tcp_streaming_once(self, request, url, body, body_stream)
         })
     }
 
@@ -1147,6 +1516,7 @@ impl VaneClient {
         _request: &VaneRequest,
         _url: &Url,
         _body: &[u8],
+        _body_stream: Option<&Arc<RequestBodyStream>>,
     ) -> Result<VaneResponseStream, VaneError> {
         Err(unsupported_tcp_backend_error())
     }
@@ -1284,11 +1654,25 @@ impl VaneClient {
     /// Generic over the delivery mode: a streaming attempt whose status the
     /// policy retries is simply dropped — nothing of its body was handed out,
     /// and dropping a live stream tears its connection down.
+    ///
+    /// `streamed` short-circuits the whole policy: a caller-pushed body is
+    /// consumed as it is sent and cannot be produced again, so a streamed
+    /// request runs exactly one attempt per transport — no error retry and no
+    /// 5xx retry, whatever the retry config says. Deliberately not gated on
+    /// "nothing consumed yet": that would make retry behavior depend on how
+    /// fast the writer thread happened to be, and a policy that fires on a
+    /// timing race is worse than one that never fires. The one replay a
+    /// streamed request gets is the H3→TCP fallback, and only while
+    /// `consumed() == 0` (see `dispatch_via`).
     fn execute_with_retry<R: RedirectHopResponse>(
         &self,
         request: &VaneRequest,
+        streamed: bool,
         attempt_once: impl Fn() -> Result<R, VaneError>,
     ) -> Result<R, VaneError> {
+        if streamed {
+            return attempt_once();
+        }
         let max_attempts = self.config.retry_max_attempts.max(1);
         let mut attempt = 1u64;
         let mut last_error = None;
@@ -1400,6 +1784,11 @@ impl VaneClient {
             hop.origin,
             cookie_header.as_deref(),
             hop.body_dropped,
+            // A streamed body of known length declares it; RESERVED_HEADERS
+            // keeps callers from setting a conflicting one. (The buffered H3
+            // path historically sends no content-length — FIN delimits — and
+            // this change leaves that as it was.)
+            hop.body_stream.and_then(|stream| stream.content_length),
         )?;
         let pool_key = PoolKey::new(url, &self.config, certificate_pins);
         let mut allow_pooled = self.config.connection_pool_enabled;
@@ -1434,6 +1823,8 @@ impl VaneClient {
             let options = H3RequestOptions {
                 headers: &headers,
                 request_body,
+                body_stream: hop.body_stream,
+                max_request_body_bytes: self.config.max_request_body_bytes,
                 deadline: hop.timeouts.deadline,
                 url,
                 max_response_body_bytes: self.config.max_response_body_bytes,
@@ -1512,8 +1903,14 @@ impl VaneClient {
                                 // Whole body already read: an intermediate 3xx
                                 // always, and any final response small enough
                                 // to arrive with its headers. Nothing keeps
-                                // the transport, so it can be parked now.
+                                // the transport, so it can be parked now — and
+                                // nothing will consume the upload stream
+                                // again, so a still-pushing writer is released
+                                // here rather than left parked.
                                 self.park_or_close_h3(transport)?;
+                                if let Some(upload) = &exchange.upload {
+                                    upload.source.release();
+                                }
                                 StreamingBodySource::Buffered(std::mem::take(
                                     &mut exchange.response.body,
                                 ))
@@ -1535,6 +1932,11 @@ impl VaneClient {
                                     stream_id: exchange.stream_id,
                                     request_body,
                                     body_offset,
+                                    // A still-running streamed upload rides
+                                    // along: the stream's pulls keep pumping
+                                    // it, and its writer is released when the
+                                    // stream ends in any way.
+                                    upload: exchange.upload.take(),
                                     report_upload: hop.report_upload,
                                     idle: hop.timeouts.idle,
                                 }))
@@ -1557,7 +1959,19 @@ impl VaneClient {
                     // safe even for non-idempotent methods. `allow_pooled` is
                     // cleared first, so this can happen at most once. A cancelled
                     // request must not pay for another handshake to fail again.
-                    if reused && !response_started && check_cancelled(cancel_token).is_ok() {
+                    //
+                    // A streamed body additionally requires that nothing was
+                    // consumed: chunks already fed to the dead connection are
+                    // gone, so the retry could only send a truncated body. In
+                    // practice quiche buffers body bytes before the death is
+                    // noticed, so a stale pooled connection usually fails a
+                    // streamed upload instead of silently retrying — the
+                    // documented cost of a one-shot body (as in OkHttp/Go).
+                    if reused
+                        && !response_started
+                        && check_cancelled(cancel_token).is_ok()
+                        && hop.body_stream.is_none_or(|stream| stream.consumed() == 0)
+                    {
                         allow_pooled = false;
                         continue;
                     }
@@ -1946,6 +2360,7 @@ impl VaneClient {
             query_params: HashMap::new(),
             body,
             body_file_path: None,
+            body_stream_id: None,
             response_body_path: None,
             cancel_token_id: None,
             progress_id: None,
@@ -2026,6 +2441,11 @@ impl RedirectHopResponse for VaneResponse {
 /// only a live server could reach.
 struct RedirectChain<'a> {
     request: &'a VaneRequest,
+    /// The caller-pushed body, if this request streams one. Only ever
+    /// consumed on hops before a rewrite: a rewrite either drops the body
+    /// (`ToGet`) or is refused outright (`Refuse`), so no later hop can need
+    /// bytes an earlier hop already consumed.
+    body_stream: Option<&'a Arc<RequestBodyStream>>,
     certificate_pins: &'a HashMap<String, Vec<String>>,
     cancel_token: Option<&'a AtomicBool>,
     progress: Option<&'a VaneProgressState>,
@@ -2048,6 +2468,7 @@ impl RedirectChain<'_> {
         let mut current = url.clone();
         let mut method = self.request.method.clone();
         let mut body = request_body;
+        let mut body_stream = self.body_stream;
         let mut body_dropped = false;
         let mut hops = 0usize;
 
@@ -2059,6 +2480,7 @@ impl RedirectChain<'_> {
                 url: &current,
                 method: &method,
                 body,
+                body_stream,
                 body_dropped,
                 origin: (&origin.0, origin.1),
                 timeouts: self.timeouts,
@@ -2100,17 +2522,23 @@ impl RedirectChain<'_> {
                 response.status_code(),
                 &method,
                 !body.is_empty(),
+                body_stream.is_some(),
                 cross_origin,
             ) {
-                RedirectRewrite::Refuse => {
+                RedirectRewrite::Refuse(reason) => {
                     let mut response = response;
-                    response.mark_refused(REDIRECT_REFUSED_CROSS_ORIGIN_BODY);
+                    response.mark_refused(reason);
                     return Ok(self.finish(response, downloaded));
                 }
                 RedirectRewrite::ToGet => {
                     method = "GET".to_string();
                     body = &[];
                     body_dropped = true;
+                    // The rewrite dropped the body for good; a writer still
+                    // pushing must learn that now, not at chain end.
+                    if let Some(stream) = body_stream.take() {
+                        stream.release();
+                    }
                 }
                 RedirectRewrite::Keep => {}
             }
@@ -2154,6 +2582,9 @@ struct Http3Hop<'a> {
     /// Uppercased; a 303 rewrites it to GET.
     method: &'a str,
     body: &'a [u8],
+    /// The caller-pushed body; `body` is empty whenever this is set. Cleared
+    /// by a `ToGet` rewrite exactly like `body`.
+    body_stream: Option<&'a Arc<RequestBodyStream>>,
     /// Set once a rewrite dropped the body, so a caller `content-type` goes too.
     body_dropped: bool,
     /// Host and port the caller addressed. Caller headers are cut to
@@ -2680,6 +3111,10 @@ struct H3BodyStream {
     /// Unsent request-body tail; empty in the common fully-uploaded case.
     request_body: Vec<u8>,
     body_offset: usize,
+    /// A caller-pushed upload the server answered before the end of; pulls
+    /// keep pumping it so the exchange can finish. Its writer is released
+    /// when this stream terminates in any way.
+    upload: Option<StreamedUpload>,
     report_upload: bool,
     /// Per-pull inactivity budget: the request's configured timeout, the same
     /// value the connection's QUIC idle timeout was armed with.
@@ -2708,17 +3143,22 @@ impl H3BodyStream {
                 transport.read_packets()?;
                 // A server may answer before consuming the whole request
                 // body; keep feeding it so the exchange can finish.
-                if let Some(stream_id) = self.stream_id
-                    && self.body_offset < self.request_body.len()
-                {
-                    send_request_body(
-                        transport,
-                        stream_id,
-                        &self.request_body,
-                        &mut self.body_offset,
-                        self.report_upload,
-                        progress,
-                    )?;
+                if let Some(stream_id) = self.stream_id {
+                    if self.body_offset < self.request_body.len() {
+                        send_request_body(
+                            transport,
+                            stream_id,
+                            &self.request_body,
+                            &mut self.body_offset,
+                            self.report_upload,
+                            progress,
+                        )?;
+                    }
+                    if let Some(upload) = self.upload.as_mut()
+                        && !upload.finished
+                    {
+                        upload.pump(transport, stream_id, self.report_upload, progress)?;
+                    }
                 }
                 let mut response_started = true;
                 process_h3_events(
@@ -2751,7 +3191,12 @@ impl H3BodyStream {
             }
         }
         // Body complete: park the connection and publish the final figure so
-        // a poller sees received == total even without a content-length.
+        // a poller sees received == total even without a content-length. An
+        // upload the exchange no longer needs releases its writer — pulls are
+        // over, so nothing would ever consume it again.
+        if let Some(upload) = &self.upload {
+            upload.source.release();
+        }
         if let Some(transport) = self.transport.take() {
             self.client.park_or_close_h3(transport)?;
         }
@@ -2769,6 +3214,9 @@ impl H3BodyStream {
     /// without wedging the pool; one extra handshake after an abandon is the
     /// price until a real workload earns the upgrade.
     fn abandon(&mut self) {
+        if let Some(upload) = &self.upload {
+            upload.source.release();
+        }
         if let Some(mut transport) = self.transport.take() {
             transport.conn.close(true, 0x00, b"stream abandoned").ok();
             transport.flush_packets().ok();
@@ -3564,6 +4012,11 @@ fn masque_path_component(value: &str) -> String {
 struct H3RequestOptions<'a> {
     headers: &'a [quiche::h3::Header],
     request_body: &'a [u8],
+    /// Caller-pushed body; `request_body` is empty whenever this is set.
+    body_stream: Option<&'a Arc<RequestBodyStream>>,
+    /// Enforced at the moment streamed bytes are pulled; see
+    /// [`RequestBodyStream::try_pull`].
+    max_request_body_bytes: u64,
     /// Shared with every other stage of the request; see [`HopTimeouts`].
     deadline: Instant,
     url: &'a Url,
@@ -3582,6 +4035,124 @@ struct H3ExchangeState {
     /// `None` while quiche has asked us to retry `send_request`.
     stream_id: Option<u64>,
     body_offset: usize,
+    /// The streamed-upload pump, present exactly when the request streams its
+    /// body. Lives here so a streaming-response caller that stops at the
+    /// headers can keep pumping the upload from `H3BodyStream::next`.
+    upload: Option<StreamedUpload>,
+}
+
+/// Feeds a [`RequestBodyStream`] into one HTTP/3 request stream, as far as
+/// quiche's send capacity allows per pass.
+///
+/// Backpressure is the composition of two bounds: quiche accepts at most the
+/// peer's flow-control credit (`send_body` returns `Done` past it, keeping
+/// `pending` parked here), and the stream's queue holds at most
+/// [`BODY_STREAM_BUFFER_BYTES`], which is where the writer's
+/// `write_body_stream_chunk` blocks. Nothing in between buffers unboundedly.
+struct StreamedUpload {
+    source: Arc<RequestBodyStream>,
+    /// The chunk currently being fed to quiche. Pulled bytes count as
+    /// consumed the moment they leave the queue: quiche may hold any prefix
+    /// of `pending` in its send buffers, so no part of it is replayable.
+    pending: Vec<u8>,
+    pending_offset: usize,
+    /// Set once quiche accepted the FIN.
+    finished: bool,
+    limit: u64,
+}
+
+impl StreamedUpload {
+    fn new(source: &Arc<RequestBodyStream>, limit: u64) -> Self {
+        Self {
+            source: Arc::clone(source),
+            pending: Vec::new(),
+            pending_offset: 0,
+            finished: false,
+            limit,
+        }
+    }
+
+    /// Bytes quiche has accepted so far — consumed minus the unfed remainder.
+    fn sent(&self) -> u64 {
+        self.source
+            .consumed()
+            .saturating_sub((self.pending.len() - self.pending_offset) as u64)
+    }
+
+    fn report(&self, report_upload: bool, progress: Option<&VaneProgressState>) {
+        if !report_upload {
+            return;
+        }
+        let sent = self.sent();
+        let total = match self.source.content_length {
+            Some(declared) => declared,
+            // Unknown length mirrors the download side: 0 while running, and
+            // the final figure once the body is done.
+            None if self.finished => sent,
+            None => 0,
+        };
+        progress_upload(progress, sent, total);
+    }
+
+    /// Sends whatever the writer has queued and quiche will take. Returns on
+    /// `Done` (no send capacity), on an empty queue, or once the FIN is out;
+    /// the drive loop calls it again next pass. An error is the request's
+    /// error: the stream failed (limit, abort, declared-length violation) or
+    /// the transport did.
+    fn pump(
+        &mut self,
+        transport: &mut PooledHttp3Connection,
+        stream_id: u64,
+        report_upload: bool,
+        progress: Option<&VaneProgressState>,
+    ) -> Result<(), VaneError> {
+        while !self.finished {
+            if self.pending_offset >= self.pending.len() {
+                match self.source.try_pull(self.limit) {
+                    BodyPull::Chunk(chunk) => {
+                        self.pending = chunk;
+                        self.pending_offset = 0;
+                    }
+                    BodyPull::Finished => {
+                        // Empty body with fin=true is quiche's documented way
+                        // to finish a stream without a DATA frame; `Done`
+                        // means no capacity for even that and retries later.
+                        match transport
+                            .http3
+                            .send_body(&mut transport.conn, stream_id, &[], true)
+                        {
+                            Ok(_) => {
+                                self.finished = true;
+                                self.report(report_upload, progress);
+                            }
+                            Err(quiche::h3::Error::Done) => return Ok(()),
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    BodyPull::Pending => return Ok(()),
+                    BodyPull::Failed(err) => return Err(err),
+                }
+                continue;
+            }
+            match transport.http3.send_body(
+                &mut transport.conn,
+                stream_id,
+                &self.pending[self.pending_offset..],
+                // Never FIN on a data chunk: the writer may still push more.
+                // The FIN goes out through the empty-body call above, once
+                // the source reports Finished.
+                false,
+            ) {
+                Ok(written) => {
+                    self.pending_offset += written;
+                    self.report(report_upload, progress);
+                }
+                Err(quiche::h3::Error::Done) => return Ok(()),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// How far [`drive_h3_exchange`] runs before returning control.
@@ -3618,19 +4189,41 @@ fn begin_h3_exchange(
         response,
         stream_id: send_h3_request(transport, options)?,
         body_offset: 0,
+        upload: options
+            .body_stream
+            .map(|stream| StreamedUpload::new(stream, options.max_request_body_bytes)),
     };
     if let Some(stream_id) = exchange.stream_id {
-        send_request_body(
+        advance_request_body(transport, stream_id, &mut exchange, options)?;
+    }
+    transport.flush_packets()?;
+    Ok(exchange)
+}
+
+/// One pass of request-body sending, buffered or streamed — the one place the
+/// two shapes fork, so the drive loop and the begin path cannot disagree.
+fn advance_request_body(
+    transport: &mut PooledHttp3Connection,
+    stream_id: u64,
+    exchange: &mut H3ExchangeState,
+    options: &H3RequestOptions<'_>,
+) -> Result<(), VaneError> {
+    match exchange.upload.as_mut() {
+        Some(upload) => upload.pump(
+            transport,
+            stream_id,
+            options.report_upload,
+            options.progress,
+        ),
+        None => send_request_body(
             transport,
             stream_id,
             options.request_body,
             &mut exchange.body_offset,
             options.report_upload,
             options.progress,
-        )?;
+        ),
     }
-    transport.flush_packets()?;
-    Ok(exchange)
 }
 
 fn drive_h3_exchange(
@@ -3651,14 +4244,7 @@ fn drive_h3_exchange(
             exchange.stream_id = send_h3_request(transport, options)?;
         }
         if let Some(stream_id) = exchange.stream_id {
-            send_request_body(
-                transport,
-                stream_id,
-                options.request_body,
-                &mut exchange.body_offset,
-                options.report_upload,
-                options.progress,
-            )?;
+            advance_request_body(transport, stream_id, exchange, options)?;
         }
 
         process_h3_events(
@@ -3681,9 +4267,19 @@ fn drive_h3_exchange(
         }
 
         if transport.conn.is_closed() {
-            return Err(VaneError::Transport(
-                "QUIC connection closed before response completed".to_string(),
-            ));
+            // The QUIC idle timeout is armed with the request timeout, so the
+            // two expire together and race by a tick. An idle-timeout death
+            // IS the request timing out — a silent peer, or a body-stream
+            // writer that never finishes — and must not masquerade as a
+            // transport failure.
+            return Err(if transport.conn.is_timed_out() {
+                VaneError::Timeout(format!(
+                    "HTTP/3 request to {} timed out",
+                    redact_url_userinfo(&options.url.to_string())
+                ))
+            } else {
+                VaneError::Transport("QUIC connection closed before response completed".to_string())
+            });
         }
     }
 
@@ -3705,7 +4301,8 @@ fn send_h3_request(
     match transport.http3.send_request(
         &mut transport.conn,
         options.headers,
-        options.request_body.is_empty(),
+        // fin on the headers only when no body of either shape follows.
+        options.request_body.is_empty() && options.body_stream.is_none(),
     ) {
         Ok(stream_id) => Ok(Some(stream_id)),
         Err(
@@ -4179,6 +4776,61 @@ fn cancel_token_free(id: u64) {
     }
 }
 
+// Body-stream registry, the same id-based shape as cancel tokens and progress
+// so every FFI surface already knows how to speak it. Ids are never reused;
+// free mid-upload is the abort path, not an error.
+fn body_stream_create(content_length: Option<u64>) -> u64 {
+    let id = NEXT_BODY_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut streams) = BODY_STREAMS.lock() {
+        streams.insert(id, Arc::new(RequestBodyStream::new(content_length)));
+    }
+    id
+}
+
+/// Resolves a body-stream id to its handle, like [`cancel_token`]. Unlike a
+/// missing cancel token, a missing body stream is an error at the call sites:
+/// a request cannot silently send an empty body the caller meant to stream.
+fn body_stream_handle(id: u64) -> Option<Arc<RequestBodyStream>> {
+    BODY_STREAMS.lock().ok()?.get(&id).cloned()
+}
+
+fn body_stream_write(id: u64, chunk: Vec<u8>) -> Result<(), VaneError> {
+    let Some(stream) = body_stream_handle(id) else {
+        return Err(VaneError::InvalidRequest(format!(
+            "Unknown body stream id {id}"
+        )));
+    };
+    stream.write(chunk)
+}
+
+fn body_stream_finish(id: u64) -> Result<(), VaneError> {
+    let Some(stream) = body_stream_handle(id) else {
+        return Err(VaneError::InvalidRequest(format!(
+            "Unknown body stream id {id}"
+        )));
+    };
+    stream.finish()
+}
+
+/// Frees the id. On an unfinished stream this is the abort path: the
+/// in-flight request fails with `Cancelled`, exactly like freeing a half-read
+/// response stream discards its connection. A `finish()`ed stream is left to
+/// drain — the transport holds its own `Arc` — so "write, finish, free, await
+/// the response" is a legal call order for a binding.
+fn body_stream_free(id: u64) {
+    let stream = BODY_STREAMS
+        .lock()
+        .ok()
+        .and_then(|mut streams| streams.remove(&id));
+    if let Some(stream) = stream
+        && !stream.lock().map(|inner| inner.finished).unwrap_or(true)
+    {
+        stream.fail(VaneError::Cancelled(
+            "Request body stream was freed before finish()".to_string(),
+        ));
+    }
+}
+
 fn progress_init(progress_id: Option<u64>, upload_total: u64) -> Option<Arc<VaneProgressState>> {
     let state = progress_handle(progress_id)?;
     state.reset(upload_total);
@@ -4193,6 +4845,17 @@ fn progress_init(progress_id: Option<u64>, upload_total: u64) -> Option<Arc<Vane
 fn progress_handle(progress_id: Option<u64>) -> Option<Arc<VaneProgressState>> {
     let id = progress_id?;
     PROGRESS_STATES.lock().ok()?.get(&id).cloned()
+}
+
+/// The `upload_total` a request's progress counters start from: a streamed
+/// body reports its declared length, or 0 for "unknown" — the same convention
+/// the download side uses for a missing `content-length` — and the final
+/// `sent == total` is published when the stream finishes.
+fn upload_total(request_body: &[u8], body_stream: Option<&Arc<RequestBodyStream>>) -> u64 {
+    match body_stream {
+        Some(stream) => stream.content_length.unwrap_or(0),
+        None => request_body.len() as u64,
+    }
 }
 
 fn progress_upload(progress: Option<&VaneProgressState>, sent: u64, total: u64) {
@@ -4296,6 +4959,7 @@ fn sleep_before_retry(attempt: u64, config: &VaneClientConfig) {
 /// addressed; once a redirect has moved us to a different one, caller-supplied
 /// headers are cut down to [`CROSS_ORIGIN_SAFE_HEADERS`]. `method` is passed in
 /// rather than read off the request because a 303 rewrites it to GET.
+#[allow(clippy::too_many_arguments)]
 fn build_h3_headers(
     url: &Url,
     request: &VaneRequest,
@@ -4304,6 +4968,7 @@ fn build_h3_headers(
     origin: (&str, u16),
     cookie_header: Option<&str>,
     body_dropped: bool,
+    stream_content_length: Option<u64>,
 ) -> Result<Vec<quiche::h3::Header>, VaneError> {
     // Port is part of the origin: app.example.com and app.example.com:8443 are
     // different security origins on multi-tenant and dev/staging hosts.
@@ -4360,6 +5025,16 @@ fn build_h3_headers(
     // them through the cross-origin filter would just discard them.
     if let Some(cookie_header) = cookie_header.filter(|header| !header.is_empty()) {
         headers.push(quiche::h3::Header::new(b"cookie", cookie_header.as_bytes()));
+    }
+
+    // A streamed body with a declared length says so, exactly like the TCP
+    // path's sized body does. `content-length` is in RESERVED_HEADERS, so no
+    // caller value can conflict with it.
+    if let Some(declared) = stream_content_length {
+        headers.push(quiche::h3::Header::new(
+            b"content-length",
+            declared.to_string().as_bytes(),
+        ));
     }
 
     Ok(headers)
@@ -4431,6 +5106,7 @@ const REDIRECT_REFUSED_DOWNGRADE: &str = "downgrade";
 const REDIRECT_REFUSED_PINNED_HOST: &str = "pinned-host";
 const REDIRECT_REFUSED_HOP_CAP: &str = "hop-cap";
 const REDIRECT_REFUSED_CROSS_ORIGIN_BODY: &str = "cross-origin-body";
+const REDIRECT_REFUSED_STREAMED_BODY: &str = "streamed-body";
 
 /// What the redirect gate decided about one response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4502,8 +5178,9 @@ enum RedirectRewrite {
     Keep,
     /// Bodyless GET; a caller `content-type` goes with the body.
     ToGet,
-    /// Refuse the hop and hand the 3xx back to the caller.
-    Refuse,
+    /// Refuse the hop and hand the 3xx back to the caller, with the named
+    /// reason on the `vane-redirect-refused` header.
+    Refuse(&'static str),
 }
 
 /// A hop that would replay a request body at a different origin is refused: the
@@ -4515,17 +5192,29 @@ enum RedirectRewrite {
 /// body from a GET (GraphQL-over-GET and Elasticsearch `_search` are the real
 /// shapes). The rewriting statuses below drop the body first, so they never
 /// reach this.
+///
+/// A *streamed* body is refused on every body-keeping hop, same origin or not:
+/// the bytes were consumed as they were sent and cannot be produced again.
+/// Deliberately not softened to "unless nothing was consumed yet" — a 307 that
+/// lands before the writer's first chunk would then follow while the same 307
+/// a millisecond later refuses, and a redirect policy that depends on writer
+/// timing is a coin flip, not a policy. The `ToGet` rewrites stay followable:
+/// they drop the body, so nothing needs replaying.
 fn redirect_rewrite(
     status_code: u16,
     method: &str,
     has_body: bool,
+    streamed: bool,
     cross_origin: bool,
 ) -> RedirectRewrite {
-    if has_body && cross_origin && !rewrites_to_get(status_code, method) {
-        return RedirectRewrite::Refuse;
-    }
     if rewrites_to_get(status_code, method) {
         return RedirectRewrite::ToGet;
+    }
+    if streamed {
+        return RedirectRewrite::Refuse(REDIRECT_REFUSED_STREAMED_BODY);
+    }
+    if has_body && cross_origin {
+        return RedirectRewrite::Refuse(REDIRECT_REFUSED_CROSS_ORIGIN_BODY);
     }
     RedirectRewrite::Keep
 }
@@ -4932,6 +5621,39 @@ pub fn free_progress(id: u64) {
 #[uniffi::export]
 pub fn create_cancel_token() -> u64 {
     cancel_token_create()
+}
+
+// Body-stream surface for callers and, in the next phase, the FFI layers.
+// Deliberately not UniFFI-exported yet: the export set is part of the
+// cross-binding design under review (docs/upload-streaming-design.md), and
+// phase 2a proved export names are cheapest to fix before bindings exist.
+
+/// Creates a caller-pushed request body stream and returns its id, to be set
+/// as [`VaneRequest::body_stream_id`]. `content_length` of `Some(n)` sends
+/// `content-length: n` and enforces exactly `n` bytes; `None` sends no length
+/// (chunked on HTTP/1.1). One stream feeds exactly one request.
+pub fn create_body_stream(content_length: Option<u64>) -> u64 {
+    body_stream_create(content_length)
+}
+
+/// Appends one chunk. Blocks while the transport's send window and the
+/// stream's internal buffer are full — this blocking is the backpressure.
+/// Fails once the stream or its request is dead; the error is the same one
+/// the request fails with, so either side of the caller learns the outcome.
+pub fn write_body_stream_chunk(id: u64, chunk: Vec<u8>) -> Result<(), VaneError> {
+    body_stream_write(id, chunk)
+}
+
+/// Marks the body complete. With a declared length, finishing at any other
+/// byte count is an `InvalidRequest` that also fails the in-flight request.
+pub fn finish_body_stream(id: u64) -> Result<(), VaneError> {
+    body_stream_finish(id)
+}
+
+/// Frees the id; aborts the request if the stream was not finished. Safe on
+/// unknown or already-freed ids.
+pub fn free_body_stream(id: u64) {
+    body_stream_free(id)
 }
 
 #[uniffi::export]
@@ -5704,6 +6426,9 @@ fn ffi_request(request: *const VaneFfiRequest) -> Result<VaneRequest, String> {
         )?,
         body: None,
         body_file_path: ffi_optional_string(request.body_file_path, "body_file_path")?,
+        // The C ABI does not carry body streams yet; that is the ABI v4 work
+        // planned in docs/upload-streaming-design.md.
+        body_stream_id: None,
         response_body_path: ffi_optional_string(request.response_body_path, "response_body_path")?,
         cancel_token_id: (request.cancel_token_id != 0).then_some(request.cancel_token_id),
         progress_id: (request.progress_id != 0).then_some(request.progress_id),
@@ -5967,6 +6692,7 @@ fn test_request(url: &str) -> VaneRequest {
         query_params: HashMap::new(),
         body: None,
         body_file_path: None,
+        body_stream_id: None,
         response_body_path: None,
         cancel_token_id: None,
         progress_id: None,
@@ -5990,6 +6716,7 @@ mod tests {
             query_params: HashMap::new(),
             body: None,
             body_file_path: None,
+            body_stream_id: None,
             response_body_path: None,
             cancel_token_id: None,
             progress_id: None,
@@ -6952,6 +7679,7 @@ mod tests {
             ("example.com", 443),
             None,
             false,
+            None,
         )
         .unwrap();
         let pairs: Vec<(String, String)> = headers
@@ -7280,6 +8008,7 @@ mod tests {
         let url = Url::parse(&request.url).unwrap();
         let result = RedirectChain {
             request,
+            body_stream: None,
             certificate_pins,
             cancel_token: None,
             progress,
@@ -7502,26 +8231,162 @@ mod tests {
     #[test]
     fn redirect_rewrite_refuses_cross_origin_bodies_and_rewrites_to_get() {
         use RedirectRewrite::{Keep, Refuse, ToGet};
+        let cross_origin_body = Refuse(REDIRECT_REFUSED_CROSS_ORIGIN_BODY);
 
         // A body that would be replayed at a different origin is refused,
         // whatever status carries it: stripping headers does not protect the
         // payload, and a 301/302 on a GET keeps its body too (GraphQL-over-GET).
-        assert_eq!(redirect_rewrite(307, "POST", true, true), Refuse);
-        assert_eq!(redirect_rewrite(308, "POST", true, true), Refuse);
-        assert_eq!(redirect_rewrite(302, "GET", true, true), Refuse);
-        assert_eq!(redirect_rewrite(301, "GET", true, true), Refuse);
+        assert_eq!(
+            redirect_rewrite(307, "POST", true, false, true),
+            cross_origin_body
+        );
+        assert_eq!(
+            redirect_rewrite(308, "POST", true, false, true),
+            cross_origin_body
+        );
+        assert_eq!(
+            redirect_rewrite(302, "GET", true, false, true),
+            cross_origin_body
+        );
+        assert_eq!(
+            redirect_rewrite(301, "GET", true, false, true),
+            cross_origin_body
+        );
         // A rewrite to GET drops the body first, so it never replays one.
-        assert_eq!(redirect_rewrite(303, "POST", true, true), ToGet);
-        assert_eq!(redirect_rewrite(302, "POST", true, true), ToGet);
+        assert_eq!(redirect_rewrite(303, "POST", true, false, true), ToGet);
+        assert_eq!(redirect_rewrite(302, "POST", true, false, true), ToGet);
         // Same origin, or nothing to replay: the hop is safe.
-        assert_eq!(redirect_rewrite(307, "POST", true, false), Keep);
-        assert_eq!(redirect_rewrite(308, "POST", false, true), Keep);
+        assert_eq!(redirect_rewrite(307, "POST", true, false, false), Keep);
+        assert_eq!(redirect_rewrite(308, "POST", false, false, true), Keep);
         // 303 always becomes a GET; 301/302 do on a non-GET method.
-        assert_eq!(redirect_rewrite(303, "POST", true, false), ToGet);
-        assert_eq!(redirect_rewrite(303, "GET", false, false), ToGet);
-        assert_eq!(redirect_rewrite(301, "POST", true, false), ToGet);
-        assert_eq!(redirect_rewrite(302, "put", true, false), ToGet);
-        assert_eq!(redirect_rewrite(302, "GET", false, false), Keep);
+        assert_eq!(redirect_rewrite(303, "POST", true, false, false), ToGet);
+        assert_eq!(redirect_rewrite(303, "GET", false, false, false), ToGet);
+        assert_eq!(redirect_rewrite(301, "POST", true, false, false), ToGet);
+        assert_eq!(redirect_rewrite(302, "put", true, false, false), ToGet);
+        assert_eq!(redirect_rewrite(302, "GET", false, false, false), Keep);
+    }
+
+    /// Writer-side rules that need no server: declared-length enforcement in
+    /// both directions, finish idempotence, and the id lifecycle.
+    #[test]
+    fn body_stream_write_and_finish_enforce_the_declared_length() {
+        // Overshoot fails the write and latches.
+        let id = create_body_stream(Some(4));
+        write_body_stream_chunk(id, b"1234".to_vec()).unwrap();
+        assert!(matches!(
+            write_body_stream_chunk(id, b"5".to_vec()),
+            Err(VaneError::InvalidRequest(_))
+        ));
+        free_body_stream(id);
+
+        // Exact length: finish succeeds and is idempotent; writing after it
+        // is refused.
+        let id = create_body_stream(Some(4));
+        write_body_stream_chunk(id, b"1234".to_vec()).unwrap();
+        finish_body_stream(id).unwrap();
+        finish_body_stream(id).unwrap();
+        assert!(matches!(
+            write_body_stream_chunk(id, b"x".to_vec()),
+            Err(VaneError::InvalidRequest(_))
+        ));
+        free_body_stream(id);
+
+        // Short finish refuses and latches: the error replays.
+        let id = create_body_stream(Some(4));
+        write_body_stream_chunk(id, b"12".to_vec()).unwrap();
+        assert!(matches!(
+            finish_body_stream(id),
+            Err(VaneError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            finish_body_stream(id),
+            Err(VaneError::InvalidRequest(_))
+        ));
+        free_body_stream(id);
+
+        // Unknown and freed ids are errors for write/finish, no-ops for free.
+        assert!(matches!(
+            write_body_stream_chunk(u64::MAX, b"x".to_vec()),
+            Err(VaneError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            finish_body_stream(u64::MAX),
+            Err(VaneError::InvalidRequest(_))
+        ));
+        free_body_stream(u64::MAX);
+        let id = create_body_stream(None);
+        write_body_stream_chunk(id, b"x".to_vec()).unwrap();
+        free_body_stream(id);
+        free_body_stream(id);
+        assert!(matches!(
+            write_body_stream_chunk(id, b"y".to_vec()),
+            Err(VaneError::InvalidRequest(_))
+        ));
+    }
+
+    /// Request-level gates that fire before anything connects: conflicting
+    /// body sources, a declared length over the configured limit, and the
+    /// one-request-per-stream claim.
+    #[test]
+    fn body_stream_requests_reject_conflicts_reuse_and_oversized_declarations() {
+        let client = VaneClient::new(VaneClientConfig {
+            max_request_body_bytes: 8,
+            ..VaneClientConfig::default()
+        })
+        .unwrap();
+
+        // A second body source on the same request.
+        let id = create_body_stream(None);
+        let mut conflicted = request("https://example.com/");
+        conflicted.body_stream_id = Some(id);
+        conflicted.body = Some(b"inline".to_vec());
+        assert!(matches!(
+            client.execute(conflicted).unwrap_err(),
+            VaneError::InvalidRequest(_)
+        ));
+
+        // A declared length over max_request_body_bytes fails before any
+        // connection exists — same refusal an oversized buffered body gets.
+        let big = create_body_stream(Some(64));
+        let mut oversized = request("https://example.com/");
+        oversized.body_stream_id = Some(big);
+        assert!(matches!(
+            client.execute(oversized).unwrap_err(),
+            VaneError::BodyLimitExceeded(_)
+        ));
+
+        // One stream feeds one request: the claim is exclusive.
+        let handle = body_stream_handle(id).unwrap();
+        handle.attach().unwrap();
+        assert!(matches!(handle.attach(), Err(VaneError::InvalidRequest(_))));
+        free_body_stream(id);
+        free_body_stream(big);
+    }
+
+    /// The streamed-body redirect decision: a caller-pushed body cannot be
+    /// replayed, so every body-keeping hop is refused — same origin included,
+    /// and regardless of how much (if anything) was consumed, because a
+    /// policy keyed to writer timing would follow or refuse the same 307 by
+    /// coin flip. The GET rewrites drop the body and stay followable.
+    #[test]
+    fn redirect_rewrite_refuses_streamed_bodies_on_every_body_keeping_hop() {
+        use RedirectRewrite::{Refuse, ToGet};
+        let streamed = Refuse(REDIRECT_REFUSED_STREAMED_BODY);
+
+        // 307/308 preserve method and body: refused even same-origin, which
+        // is exactly where the buffered path would have replayed.
+        assert_eq!(redirect_rewrite(307, "POST", false, true, false), streamed);
+        assert_eq!(redirect_rewrite(308, "PUT", false, true, false), streamed);
+        assert_eq!(redirect_rewrite(307, "POST", false, true, true), streamed);
+        // A 301/302 on GET keeps its body too, so a streamed GET is refused.
+        assert_eq!(redirect_rewrite(301, "GET", false, true, false), streamed);
+        assert_eq!(redirect_rewrite(302, "GET", false, true, true), streamed);
+        // The rewrites drop the body: nothing needs replaying, so the chain
+        // continues as a bodyless GET on both origins.
+        assert_eq!(redirect_rewrite(303, "POST", false, true, false), ToGet);
+        assert_eq!(redirect_rewrite(303, "PUT", false, true, true), ToGet);
+        assert_eq!(redirect_rewrite(301, "POST", false, true, false), ToGet);
+        assert_eq!(redirect_rewrite(302, "PATCH", false, true, true), ToGet);
     }
 
     #[test]
@@ -7548,6 +8413,7 @@ mod tests {
                 ("api.example.com", 443),
                 Some("session=abc"),
                 body_dropped,
+                None,
             )
             .unwrap()
             .iter()
@@ -7593,6 +8459,7 @@ mod tests {
             ("example.com", 443),
             Some("session=abc; theme=dark"),
             false,
+            None,
         )
         .unwrap();
         let pairs: Vec<(String, String)> = headers

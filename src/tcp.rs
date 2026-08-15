@@ -27,13 +27,13 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, NamedGroup, SignatureScheme};
 
 use super::{
-    BodyStep, H3_BODY_BUFFER_BYTES, REDIRECT_REFUSED_CROSS_ORIGIN_BODY, REDIRECT_REFUSED_HEADER,
-    RedirectDecision, RedirectRewrite, ResponseState, StreamingBodySource, StreamingHopResult, Url,
-    VaneClient, VaneError, VaneHttpVersion, VaneProgressState, VaneProtocolMode, VaneRequest,
-    VaneResponse, VaneResponseStream, cancel_token, check_cancelled, for_each_regular_header,
+    BodyStep, H3_BODY_BUFFER_BYTES, REDIRECT_REFUSED_HEADER, RedirectDecision, RedirectRewrite,
+    RequestBodyStream, ResponseState, StreamingBodySource, StreamingHopResult, Url, VaneClient,
+    VaneError, VaneHttpVersion, VaneProgressState, VaneProtocolMode, VaneRequest, VaneResponse,
+    VaneResponseStream, cancel_token, check_cancelled, for_each_regular_header,
     header_survives_origin_change, may_resume_tls_session, next_redirect_url, origin_port,
-    progress_download, progress_init, progress_upload, redact_url_userinfo, redirect_rewrite,
-    resolve_peer_addr, streaming_head, verify_certificate_pins,
+    progress_download, progress_handle, progress_init, progress_upload, redact_url_userinfo,
+    redirect_rewrite, resolve_peer_addr, streaming_head, upload_total, verify_certificate_pins,
 };
 
 /// Wraps the platform's own certificate verifier and adds Vane's host-scoped
@@ -780,6 +780,7 @@ pub(crate) fn execute_tcp_once(
     request: &VaneRequest,
     url: &Url,
     request_body: &[u8],
+    body_stream: Option<&Arc<RequestBodyStream>>,
 ) -> Result<VaneResponse, VaneError> {
     // Same guard as the HTTP/3 path. Without it an `http://` URL is sent in the
     // clear with no TLS and therefore no pin check — and in the fallback mode
@@ -792,7 +793,7 @@ pub(crate) fn execute_tcp_once(
     }
 
     let cancel_token = cancel_token(request.cancel_token_id);
-    let progress = progress_init(request.progress_id, request_body.len() as u64);
+    let progress = progress_init(request.progress_id, upload_total(request_body, body_stream));
     // `execute` marks the request done once the whole dispatch resolves, so a
     // poller never sees `done` flip while a fallback is still to come.
     follow_and_read(
@@ -800,16 +801,19 @@ pub(crate) fn execute_tcp_once(
         request,
         url,
         request_body,
+        body_stream,
         cancel_token.as_deref(),
         progress.as_deref(),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn follow_and_read(
     client: &VaneClient,
     request: &VaneRequest,
     url: &Url,
     request_body: &[u8],
+    body_stream: Option<&Arc<RequestBodyStream>>,
     cancel_token: Option<&AtomicBool>,
     progress: Option<&VaneProgressState>,
 ) -> Result<VaneResponse, VaneError> {
@@ -831,6 +835,7 @@ fn follow_and_read(
         request,
         url,
         request_body,
+        body_stream,
         cancel_token,
         progress,
         &http,
@@ -890,6 +895,7 @@ fn follow(
     request: &VaneRequest,
     url: &Url,
     request_body: &[u8],
+    body_stream: Option<&Arc<RequestBodyStream>>,
     cancel_token: Option<&AtomicBool>,
     progress: Option<&VaneProgressState>,
     http: &Client,
@@ -906,6 +912,7 @@ fn follow(
             VaneError::InvalidRequest(format!("Invalid HTTP method {}", request.method))
         })?;
     let mut body = request_body;
+    let mut body_stream = body_stream;
     let mut body_dropped = false;
     let mut hops = 0usize;
     // Names why a redirect chain stopped, so a caller cannot mistake a refusal
@@ -944,7 +951,32 @@ fn follow(
                     body_dropped,
                 )?)
                 .timeout(remaining);
-            if !body.is_empty() {
+            if let Some(stream) = body_stream {
+                // The reqwest blocking client pumps this reader on the
+                // calling thread through a rendezvous channel that hyper
+                // drains as the connection accepts bytes (verified against
+                // reqwest 0.13.4, blocking/body.rs `send_future`), so a full
+                // send window parks the reader and, through it, the writer.
+                // `sized` sends `Content-Length`; `new` has no length and
+                // sends chunked on HTTP/1.1, plain DATA on h2.
+                //
+                // The per-request timeout above covers the whole body send
+                // plus the wait for headers as ONE budget — reqwest wraps
+                // them in a single `wait::timeout` — so a streamed TCP upload
+                // must complete within the request timeout. Documented
+                // ceiling; the response-body phase re-anchors per read as
+                // before.
+                let reader = BodyStreamReader::new(
+                    stream,
+                    client.config.max_request_body_bytes,
+                    request.cancel_token_id,
+                    request.progress_id,
+                );
+                builder = builder.body(match stream.content_length {
+                    Some(declared) => reqwest::blocking::Body::sized(reader, declared),
+                    None => reqwest::blocking::Body::new(reader),
+                });
+            } else if !body.is_empty() {
                 // reqwest owns the body; the HTTP/3 path can borrow, this
                 // cannot.
                 builder = builder.body(body.to_vec());
@@ -968,20 +1000,27 @@ fn follow(
                 // genuine failures, not a stale checkout — `is_connect` is
                 // checked directly since `classify_send_error` folds
                 // connect-without-timeout into `Transport`.
+                //
+                // A streamed body additionally requires that nothing was
+                // consumed: bytes hyper already pulled died with the stale
+                // connection and cannot be sent again.
                 let stale_pooled_connection = allow_reuse_retry
                     && client.config.connection_pool_enabled
                     && !error.is_timeout()
                     && !error.is_connect()
-                    && check_cancelled(cancel_token).is_ok();
+                    && check_cancelled(cancel_token).is_ok()
+                    && body_stream.is_none_or(|stream| stream.consumed() == 0);
                 if !stale_pooled_connection {
-                    return Err(classify_send_error(error));
+                    return Err(streamed_send_error(body_stream, error));
                 }
                 allow_reuse_retry = false;
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Err(VaneError::Timeout("HTTP request timed out".to_string()));
                 }
-                build(remaining)?.send().map_err(classify_send_error)?
+                build(remaining)?
+                    .send()
+                    .map_err(|error| streamed_send_error(body_stream, error))?
             }
         };
         // Belt and braces for the host we based every security decision on:
@@ -995,12 +1034,20 @@ fn follow(
         // The caller's body is uploaded once, on the first hop; a later hop
         // whose body was dropped has nothing more to send. Reporting that
         // hop's (zero) length would walk the progress bar backwards, so the
-        // cumulative figure stands.
-        progress_upload(
-            progress,
-            request_body.len() as u64,
-            request_body.len() as u64,
-        );
+        // cumulative figure stands. A streamed body reported its own counters
+        // from the reader as chunks were consumed; publish its final figure
+        // instead of stomping them with the empty slice's zero.
+        match body_stream {
+            Some(stream) => {
+                let sent = stream.consumed();
+                progress_upload(progress, sent, sent);
+            }
+            None => progress_upload(
+                progress,
+                request_body.len() as u64,
+                request_body.len() as u64,
+            ),
+        }
 
         // Harvested per hop: only the final response reaches the body read, so
         // a `Set-Cookie` on a 302 would otherwise be dropped and the caller
@@ -1029,17 +1076,24 @@ fn follow(
             response.status().as_u16(),
             method.as_str(),
             !body.is_empty(),
+            body_stream.is_some(),
             cross_origin,
         ) {
-            // The hop would replay the body at a different origin.
-            RedirectRewrite::Refuse => {
-                refused = Some(REDIRECT_REFUSED_CROSS_ORIGIN_BODY);
+            // The hop would need the body again — replayed at a different
+            // origin, or replayed at all for a one-shot streamed body.
+            RedirectRewrite::Refuse(reason) => {
+                refused = Some(reason);
                 break response;
             }
             RedirectRewrite::ToGet => {
                 method = reqwest::Method::GET;
                 body = &[];
                 body_dropped = true;
+                // The rewrite dropped the body for good; a writer still
+                // pushing must learn that now, not at chain end.
+                if let Some(stream) = body_stream.take() {
+                    stream.release();
+                }
             }
             RedirectRewrite::Keep => {}
         }
@@ -1054,6 +1108,86 @@ fn follow(
     })
 }
 
+/// The `Read` bridge that feeds a [`RequestBodyStream`] into a reqwest
+/// blocking body. reqwest reads it on the request's calling thread and only
+/// as hyper drains its rendezvous channel, so `read` blocking on the caller's
+/// pushes IS how transport backpressure reaches the writer.
+struct BodyStreamReader {
+    source: Arc<RequestBodyStream>,
+    limit: u64,
+    /// Owned handles, re-resolved by id: the reader outlives `follow`'s
+    /// borrowed copies inside reqwest's request object.
+    cancel: Option<Arc<AtomicBool>>,
+    progress: Option<Arc<VaneProgressState>>,
+    current: Vec<u8>,
+    offset: usize,
+}
+
+impl BodyStreamReader {
+    fn new(
+        source: &Arc<RequestBodyStream>,
+        limit: u64,
+        cancel_token_id: Option<u64>,
+        progress_id: Option<u64>,
+    ) -> Self {
+        Self {
+            source: Arc::clone(source),
+            limit,
+            cancel: cancel_token(cancel_token_id),
+            progress: progress_handle(progress_id),
+            current: Vec::new(),
+            offset: 0,
+        }
+    }
+}
+
+impl io::Read for BodyStreamReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.offset >= self.current.len() {
+            // Waits in 50 ms slices so a cancel interrupts a parked upload
+            // promptly; the terminal error this latches is also what the
+            // request fails with (see `streamed_send_error`).
+            match self.source.pull_blocking(
+                self.limit,
+                self.cancel.as_deref(),
+                Duration::from_millis(50),
+            ) {
+                Ok(Some(chunk)) => {
+                    self.current = chunk;
+                    self.offset = 0;
+                    let sent = self.source.consumed();
+                    let total = self.source.content_length.unwrap_or(0);
+                    progress_upload(self.progress.as_deref(), sent, total);
+                }
+                // Clean end of body. A short body under a declared length
+                // cannot reach here: `finish()` refuses the mismatch and
+                // latches the stream's terminal error instead.
+                Ok(None) => return Ok(0),
+                Err(err) => return Err(io::Error::other(err.to_string())),
+            }
+        }
+        let n = buf.len().min(self.current.len() - self.offset);
+        buf[..n].copy_from_slice(&self.current[self.offset..self.offset + n]);
+        self.offset += n;
+        Ok(n)
+    }
+}
+
+/// Send-failure classification for a request with a streamed body. The
+/// stream's own latched terminal error — a cancel, the body limit, a
+/// declared-length violation, a freed writer — wins over reqwest's generic
+/// send error, which by then only says "error sending request: body error".
+/// Without a latched error the failure is the transport's and classifies as
+/// always.
+fn streamed_send_error(
+    body_stream: Option<&Arc<RequestBodyStream>>,
+    error: reqwest::Error,
+) -> VaneError {
+    body_stream
+        .and_then(|stream| stream.latched_error())
+        .unwrap_or_else(|| classify_send_error(error))
+}
+
 /// Streaming twin of [`execute_tcp_once`]: identical up to the final hop's
 /// headers, after which the unread reqwest response becomes the stream's body
 /// source. The per-request timeout armed on the hop keeps working after this
@@ -1064,6 +1198,7 @@ pub(crate) fn execute_tcp_streaming_once(
     request: &VaneRequest,
     url: &Url,
     request_body: &[u8],
+    body_stream: Option<&Arc<RequestBodyStream>>,
 ) -> Result<VaneResponseStream, VaneError> {
     // Same guard as the HTTP/3 path; see `execute_tcp_once`.
     if url.scheme() != "https" {
@@ -1073,7 +1208,7 @@ pub(crate) fn execute_tcp_streaming_once(
     }
 
     let cancel_token = cancel_token(request.cancel_token_id);
-    let progress = progress_init(request.progress_id, request_body.len() as u64);
+    let progress = progress_init(request.progress_id, upload_total(request_body, body_stream));
     let deadline = request_deadline(client, request);
     let (http, certificate_pins) = shared_client(client)?;
     // No body file: `execute_streaming` already refused `response_body_path`.
@@ -1084,12 +1219,22 @@ pub(crate) fn execute_tcp_streaming_once(
         request,
         url,
         request_body,
+        body_stream,
         cancel_token.as_deref(),
         progress.as_deref(),
         &http,
         &certificate_pins,
         deadline,
     )?;
+    // The blocking client finishes sending the body before it surfaces the
+    // response headers (reqwest 0.13.4 `execute_request` awaits `body.send()`
+    // ahead of the response oneshot), so by this point the upload phase is
+    // over on TCP — successful or abandoned by an early-answering server —
+    // and a still-pushing writer can be released without waiting for the
+    // response stream to end.
+    if let Some(stream) = body_stream {
+        stream.release();
+    }
 
     let http_version = http_version_of(hop.response.version());
     merge_response_head(&hop.response, &mut state);
