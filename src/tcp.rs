@@ -29,11 +29,12 @@ use rustls::{ClientConfig, DigitallySignedStruct, NamedGroup, SignatureScheme};
 use super::{
     BodyStep, H3_BODY_BUFFER_BYTES, REDIRECT_REFUSED_HEADER, RedirectDecision, RedirectRewrite,
     RequestBodyStream, ResponseState, StreamingBodySource, StreamingHopResult, Url, VaneClient,
-    VaneError, VaneHttpVersion, VaneProgressState, VaneProtocolMode, VaneRequest, VaneResponse,
-    VaneResponseStream, VaneTlsVersion, cancel_token, check_cancelled, for_each_regular_header,
-    header_survives_origin_change, may_resume_tls_session, next_redirect_url, origin_port,
-    progress_download, progress_handle, progress_init, progress_upload, redact_url_userinfo,
-    redirect_rewrite, resolve_peer_addr, streaming_head, upload_total, verify_certificate_pins,
+    VaneError, VaneHeader, VaneHttpVersion, VaneProgressState, VaneProtocolMode, VaneRequest,
+    VaneResponse, VaneResponseStream, VaneTlsVersion, cancel_token, check_cancelled,
+    for_each_regular_header, header_survives_origin_change, may_resume_tls_session,
+    next_redirect_url, origin_port, progress_download, progress_handle, progress_init,
+    progress_upload, redact_url_userinfo, redirect_rewrite, resolve_peer_addr, streaming_head,
+    upload_total, verify_certificate_pins,
 };
 
 /// Wraps the platform's own certificate verifier and adds Vane's host-scoped
@@ -861,14 +862,15 @@ fn follow_and_read(
     )?;
 
     // Read off the final hop only — Vane runs `redirect::Policy::none()` and
-    // does its own hops — and before `read_body` moves the response.
+    // does its own hops — and before `read_body` moves the response. Through
+    // a CONNECT proxy `remote_addr` reports the socket peer (the proxy),
+    // consistent with the H3 MASQUE rule by construction.
     let http_version = http_version_of(hop.response.version());
+    let remote_ip = hop.response.remote_addr().map(|addr| addr.ip().to_string());
     read_body(hop.response, &mut state, cancel_token, progress)?;
 
     if let Some(reason) = hop.refused {
-        state
-            .headers
-            .insert(REDIRECT_REFUSED_HEADER.to_string(), reason.to_string());
+        state.push_header(REDIRECT_REFUSED_HEADER.to_string(), reason.to_string());
     }
 
     let status_code = state.status_code;
@@ -879,8 +881,8 @@ fn follow_and_read(
         body_file_path: state.body_file_path,
         is_success: (200..=299).contains(&status_code),
         url: hop.url.to_string(),
-        set_cookie: state.set_cookie_headers,
         http_version,
+        remote_ip,
     })
 }
 
@@ -1261,11 +1263,14 @@ pub(crate) fn execute_tcp_streaming_once(
     }
 
     let http_version = http_version_of(hop.response.version());
+    let remote_ip = hop.response.remote_addr().map(|addr| addr.ip().to_string());
     merge_response_head(&hop.response, &mut state);
-    let mut head = streaming_head(&mut state, &hop.url, http_version);
+    let mut head = streaming_head(&mut state, &hop.url, http_version, remote_ip);
     if let Some(reason) = hop.refused {
-        head.headers
-            .insert(REDIRECT_REFUSED_HEADER.to_string(), reason.to_string());
+        head.headers.push(VaneHeader {
+            name: REDIRECT_REFUSED_HEADER.to_string(),
+            value: reason.to_string(),
+        });
     }
 
     let source = StreamingBodySource::Tcp(Box::new(TcpBodyStream {
@@ -1457,13 +1462,14 @@ fn redirect_target(
 fn merge_response_head(response: &reqwest::blocking::Response, state: &mut ResponseState) {
     state.status_code = response.status().as_u16();
     for (name, value) in response.headers() {
-        // One `(name, value)` pair per occurrence; the shared merge joins
-        // repeats and diverts `set-cookie` to its own list, so the map cannot
-        // depend on which transport served the response. `Set-Cookie` is
-        // surfaced even with the jar off — the cookie harvest in `follow` is
+        // One `(name, value)` pair per occurrence, appended in `HeaderMap`
+        // iteration order (duplicates of a name grouped), so the list cannot
+        // depend on which transport served the response. `Set-Cookie` rides
+        // inline even with the jar off — the cookie harvest in `follow` is
         // gated on `cookies_enabled`, this is not, or the caller loses it
-        // entirely.
-        state.merge_header(
+        // entirely. `from_utf8_lossy` rather than a `to_str` skip: a garbled
+        // byte becomes U+FFFD, not a vanished header.
+        state.push_header(
             name.as_str().to_string(),
             String::from_utf8_lossy(value.as_bytes()).to_string(),
         );

@@ -818,7 +818,7 @@ fn redirect_chain_honours_the_configured_hop_cap() {
     let refused = client(2).execute(crate::test_request("/a")).unwrap();
     assert_eq!(refused.status_code, 302);
     assert_eq!(
-        refused.headers.get(REDIRECT_REFUSED_HEADER).map(|s| &**s),
+        crate::first_header_value(&refused.headers, REDIRECT_REFUSED_HEADER),
         Some(crate::REDIRECT_REFUSED_HOP_CAP)
     );
 
@@ -1121,28 +1121,31 @@ mod response_metadata {
         // the per-hop harvest was gated, so `Set-Cookie` vanished entirely.
         for cookies_enabled in [true, false] {
             let response = get(port, cookies_enabled);
+            let cookies: Vec<&str> = response
+                .headers
+                .iter()
+                .filter(|header| header.name == "set-cookie")
+                .map(|header| header.value.as_str())
+                .collect();
             assert_eq!(
-                response.set_cookie,
-                vec!["a=1; Path=/".to_string(), "b=2; Path=/".to_string()],
+                cookies,
+                vec!["a=1; Path=/", "b=2; Path=/"],
                 "cookies_enabled={cookies_enabled}"
-            );
-            assert!(
-                !response.headers.contains_key("set-cookie"),
-                "set-cookie must never collapse into the header map"
             );
             assert_eq!(response.http_version, Some(VaneHttpVersion::Http11));
         }
     }
 
-    /// The TCP half of the join rule pinned by
-    /// `repeated_h3_headers_comma_join_across_header_blocks` in the crate
-    /// tests: the same repeated wire shape must yield the same `", "`-joined
-    /// map entry here, or which headers a caller sees depends on whether UDP
-    /// happened to work. Hyper lowercases the mixed-case spelling; hyper also
-    /// rejects differing repeated `Content-Length` values outright, so that
-    /// edge is pinned on the H3 merge, which this response cannot reach.
+    /// The TCP half of the list rule pinned by
+    /// `repeated_h3_headers_are_preserved_in_order_across_header_blocks` in
+    /// the crate tests: the same repeated wire shape must yield the same
+    /// ordered, duplicate-preserving list here, or which headers a caller
+    /// sees depends on whether UDP happened to work. Hyper lowercases the
+    /// mixed-case spelling; hyper also rejects differing repeated
+    /// `Content-Length` values outright, so that edge is pinned on the H3
+    /// merge, which this response cannot reach.
     #[test]
-    fn repeated_headers_comma_join_identically_on_both_transports() {
+    fn repeated_headers_are_preserved_identically_on_both_transports() {
         // A 200, so the repeated `Location` reaches the shared merge instead
         // of the redirect machinery.
         const REPEATS: &str = concat!(
@@ -1161,22 +1164,26 @@ mod response_metadata {
         let _guard = with_test_root(ca);
 
         let response = get(port, true);
+        let multi: Vec<&str> = response
+            .headers
+            .iter()
+            .filter(|header| header.name == "x-multi")
+            .map(|header| header.value.as_str())
+            .collect();
+        assert_eq!(multi, vec!["a", "b"], "duplicates must survive, in order");
+        let cookies: Vec<&str> = response
+            .headers
+            .iter()
+            .filter(|header| header.name == "set-cookie")
+            .map(|header| header.value.as_str())
+            .collect();
+        assert_eq!(cookies, vec!["a=1; Path=/", "b=2; Path=/"]);
+        // Both `location` occurrences stay in the list as data; the first is
+        // the value `redirect_target`'s `HeaderMap::get` would act on.
         assert_eq!(
-            response.headers.get("x-multi").map(String::as_str),
-            Some("a, b")
-        );
-        // `location` is the join's exception on both transports: first
-        // occurrence whole, repeats dropped — the value `redirect_target`'s
-        // `HeaderMap::get` would act on, now also the one the caller sees.
-        assert_eq!(
-            response.headers.get("location").map(String::as_str),
+            crate::first_header_value(&response.headers, "location"),
             Some("https://first.example/")
         );
-        assert_eq!(
-            response.set_cookie,
-            vec!["a=1; Path=/".to_string(), "b=2; Path=/".to_string()]
-        );
-        assert!(!response.headers.contains_key("set-cookie"));
     }
 
     #[test]
@@ -1214,7 +1221,13 @@ mod response_metadata {
         });
         let response = client.execute(crate::test_request("/")).unwrap();
 
-        assert_eq!(response.set_cookie, vec!["final=2; Path=/".to_string()]);
+        let cookies: Vec<&str> = response
+            .headers
+            .iter()
+            .filter(|header| header.name == "set-cookie")
+            .map(|header| header.value.as_str())
+            .collect();
+        assert_eq!(cookies, vec!["final=2; Path=/"]);
         // Surfacing the final hop must not have disturbed the per-hop harvest.
         let jar = client
             .cookie_header(&Url::parse(&format!("https://localhost:{port}/")).unwrap())
@@ -1224,6 +1237,19 @@ mod response_metadata {
             "jar lost the intermediate hop: {jar}"
         );
         assert!(jar.contains("final=2"), "jar lost the final hop: {jar}");
+    }
+
+    /// The TCP half of `h3_offline`'s `remote_ip_is_the_socket_peer`: the
+    /// field reports the peer reqwest actually connected to, captured before
+    /// `read_body` moves the response. Through a CONNECT proxy this would be
+    /// the proxy — the only address `remote_addr()` can report.
+    #[test]
+    fn remote_ip_is_the_socket_peer() {
+        let (port, ca) = raw_http_server(&[("/", TWO_COOKIES)]);
+        let _guard = with_test_root(ca);
+
+        let response = get(port, false);
+        assert_eq!(response.remote_ip.as_deref(), Some("127.0.0.1"));
     }
 
     /// The version has to come off the status line, not from the mode the

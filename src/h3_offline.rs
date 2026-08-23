@@ -660,7 +660,7 @@ mod tests {
     use super::{TEST_HOST, TestH3Server, test_pki};
     use crate::{
         REDIRECT_REFUSED_HEADER, REDIRECT_REFUSED_HOP_CAP, VaneClient, VaneClientConfig,
-        sha256_pin, test_request,
+        first_header_value, sha256_pin, test_request,
     };
 
     fn offline_client(config: VaneClientConfig) -> VaneClient {
@@ -810,6 +810,29 @@ mod tests {
         );
     }
 
+    /// `remote_ip` on the wire: the H3 response reports the socket peer of
+    /// the connection that served it — the resolved origin, which the
+    /// override map pins to 127.0.0.1 here. The TCP twin is
+    /// `tcp::tests::response_metadata::remote_ip_is_the_socket_peer`; the
+    /// MASQUE arm (`outer.peer_addr`) is pinned by
+    /// `masque_remote_ip_is_the_outer_socket_peer` at the selection point.
+    #[test]
+    fn remote_ip_is_the_socket_peer() {
+        let server = TestH3Server::start();
+        let client = offline_client(VaneClientConfig::default());
+
+        let response = client.execute(test_request(&server.url("/get"))).unwrap();
+        assert!(response.is_success);
+        assert_eq!(response.remote_ip.as_deref(), Some("127.0.0.1"));
+
+        // The streaming head carries the same peer.
+        let stream = std::sync::Arc::new(offline_client(VaneClientConfig::default()))
+            .execute_streaming(test_request(&server.url("/get")))
+            .unwrap();
+        assert_eq!(stream.head().remote_ip.as_deref(), Some("127.0.0.1"));
+        while stream.read_chunk().unwrap().is_some() {}
+    }
+
     /// Multi-hop redirect chain on the wire — previously only reachable
     /// against live pie.dev.
     #[test]
@@ -844,7 +867,7 @@ mod tests {
         .unwrap();
         assert_eq!(refused.status_code, 302);
         assert_eq!(
-            refused.headers.get(REDIRECT_REFUSED_HEADER).map(|s| &**s),
+            first_header_value(&refused.headers, REDIRECT_REFUSED_HEADER),
             Some(REDIRECT_REFUSED_HOP_CAP)
         );
 
@@ -913,7 +936,7 @@ mod tests {
         assert_eq!(head.status_code, 200);
         assert!(head.body.is_empty(), "the stream head carries no body");
         assert_eq!(
-            head.headers.get("content-length").map(String::as_str),
+            first_header_value(&head.headers, "content-length"),
             Some(STREAM_BODY_LEN.to_string().as_str())
         );
 
@@ -1017,9 +1040,7 @@ mod tests {
         let head = stream.head();
         assert_eq!(head.status_code, 302);
         assert_eq!(
-            head.headers
-                .get(crate::REDIRECT_REFUSED_HEADER)
-                .map(String::as_str),
+            crate::first_header_value(&head.headers, crate::REDIRECT_REFUSED_HEADER),
             Some(crate::REDIRECT_REFUSED_DOWNGRADE)
         );
         assert!(stream.read_chunk().unwrap().is_none());
@@ -1180,10 +1201,7 @@ mod tests {
         let text = String::from_utf8_lossy(&response.body).into_owned();
         assert!(text.contains(&expected_sha), "body digest mismatch: {text}");
         assert_eq!(
-            response
-                .headers
-                .get("x-request-content-length")
-                .map(String::as_str),
+            crate::first_header_value(&response.headers, "x-request-content-length"),
             Some(UPLOAD_BODY_LEN.to_string().as_str()),
             "a declared length must go on the wire as content-length"
         );
@@ -1229,10 +1247,7 @@ mod tests {
 
         assert!(response.is_success);
         assert_eq!(
-            response
-                .headers
-                .get("x-request-content-length")
-                .map(String::as_str),
+            crate::first_header_value(&response.headers, "x-request-content-length"),
             Some("none"),
             "an undeclared length must not invent a content-length"
         );
@@ -1314,10 +1329,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status_code, 307);
         assert_eq!(
-            response
-                .headers
-                .get(crate::REDIRECT_REFUSED_HEADER)
-                .map(String::as_str),
+            crate::first_header_value(&response.headers, crate::REDIRECT_REFUSED_HEADER),
             Some(crate::REDIRECT_REFUSED_STREAMED_BODY)
         );
         let seen = server.requests();

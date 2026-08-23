@@ -723,36 +723,44 @@ pub struct VaneRequest {
     pub follow_redirects: bool,
 }
 
+/// One response header occurrence: an ordered `(name, value)` pair.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct VaneHeader {
+    pub name: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct VaneResponse {
     pub status_code: u16,
-    /// One entry per header name, keyed lowercase. A name the server repeated
-    /// carries its values comma-joined in wire order (`"a, b"`, RFC 9110
-    /// §5.2) — identically on both transports. Two exceptions: `set-cookie`
-    /// (see [`Self::set_cookie`]) and `location`, which is single-valued by
-    /// RFC 9110 §10.2.2 and keeps its first occurrence — the one the redirect
-    /// gate acts on — rather than joining into a non-URL.
-    pub headers: HashMap<String, String>,
+    /// Ordered `(name, value)` pairs, names lowercased, duplicates preserved,
+    /// `set-cookie` inline in arrival position — including cookies the jar
+    /// refused (a `Domain` that is a public suffix, or an IP literal), because
+    /// this reports what the server sent. On HTTP/3 this is wire order; on TCP
+    /// it is reqwest `HeaderMap` order (duplicates of a name grouped). The
+    /// redirect gate acts on the FIRST `location` occurrence (RFC 9110
+    /// §10.2.2); derived map views are first-wins and live binding-side.
+    ///
+    /// Redirects: the final response only. Intermediate hops still reach the
+    /// cookie jar as before.
+    pub headers: Vec<VaneHeader>,
     pub body: Vec<u8>,
     pub body_file_path: Option<String>,
     pub is_success: bool,
     pub url: String,
-    /// Raw `Set-Cookie` values from the final response, in wire order.
-    ///
-    /// Unfiltered: a cookie the jar refused (a `Domain` that is a public
-    /// suffix, or an IP literal) still appears here, because this reports what
-    /// the server sent. Never folded into `headers` — a `HashMap` cannot hold
-    /// repeats and RFC 6265 forbids comma-joining `Set-Cookie` (an `Expires`
-    /// value contains a comma, so the join is unsplittable).
-    ///
-    /// Redirects: the final response only. Intermediate hops still reach the
-    /// cookie jar as before.
-    #[uniffi(default = [])]
-    pub set_cookie: Vec<String>,
     /// Protocol that served the final response. `None` when no exchange
     /// completed, or when the transport could not say.
     #[uniffi(default = None)]
     pub http_version: Option<VaneHttpVersion>,
+    /// IP literal of the socket peer of the connection that produced the
+    /// final hop's response — `"203.0.113.7"`, `"2001:db8::1"`: no port, no
+    /// brackets. Direct HTTP/3: the resolved origin. Via a MASQUE (H3) or
+    /// CONNECT (TCP) proxy: the proxy — the actual socket peer, which is all
+    /// reqwest can ever report, and the H3 side matches it rather than
+    /// inventing a per-transport difference. `None` when the transport could
+    /// not say.
+    #[uniffi(default = None)]
+    pub remote_ip: Option<String>,
 }
 
 /// Protocol a response was actually served over, as opposed to the
@@ -1980,8 +1988,13 @@ impl VaneClient {
             match result {
                 Ok(mut exchange) => {
                     if self.config.cookies_enabled {
-                        self.store_response_cookies(url, &exchange.response.set_cookie_headers)?;
+                        self.store_response_cookies(url, &exchange.response.set_cookie_values())?;
                     }
+                    // The connection's own peer, not the in-scope resolved
+                    // address: a pooled connection reports the address it
+                    // actually connected to.
+                    let remote_ip =
+                        response_remote_ip(transport.peer_addr, transport.io.outer_peer_addr());
                     // The server's NewSessionTicket normally lands after the
                     // handshake loop already returned, so this is the point
                     // where a resumable ticket actually exists. For a live
@@ -2002,10 +2015,10 @@ impl VaneClient {
                                 body_len: exchange.response.body_len as u64,
                                 status_code: exchange.response.status_code,
                                 headers: exchange.response.headers,
-                                set_cookie_headers: exchange.response.set_cookie_headers,
                                 body: exchange.response.body,
                                 body_file_path: exchange.response.body_file_path,
                                 url: url.to_string(),
+                                remote_ip: Some(remote_ip),
                             }))
                         }
                         H3HopMode::Streaming { client } => {
@@ -2014,6 +2027,7 @@ impl VaneClient {
                                 &mut exchange.response,
                                 url,
                                 Some(VaneHttpVersion::Http3),
+                                Some(remote_ip),
                             );
                             let source = if exchange.response.finished {
                                 // Whole body already read: an intermediate 3xx
@@ -2523,9 +2537,9 @@ impl HopTimeouts {
 /// delivery mode.
 trait RedirectHopResponse {
     fn status_code(&self) -> u16;
-    /// The `location` header value the shared gate acts on. `merge_header`
-    /// keeps `location` first-wins (a repeat never joins), so this is the
-    /// first occurrence's whole value on every implementation.
+    /// The `location` header value the shared gate acts on: the first
+    /// occurrence's whole value on every implementation. Repeats stay in the
+    /// header list as data, but never reach the gate.
     fn location(&self) -> Option<&str>;
     /// Marks a 3xx that Vane refused to follow, so a caller cannot mistake it
     /// for "the server simply sent a redirect" and re-follow the `Location` by
@@ -2539,12 +2553,14 @@ impl RedirectHopResponse for VaneResponse {
     }
 
     fn location(&self) -> Option<&str> {
-        header_value(&self.headers, "location")
+        first_header_value(&self.headers, "location")
     }
 
     fn mark_refused(&mut self, reason: &'static str) {
-        self.headers
-            .insert(REDIRECT_REFUSED_HEADER.to_string(), reason.to_string());
+        self.headers.push(VaneHeader {
+            name: REDIRECT_REFUSED_HEADER.to_string(),
+            value: reason.to_string(),
+        });
     }
 }
 
@@ -2827,6 +2843,15 @@ enum Http3Io {
 }
 
 impl Http3Io {
+    /// The outer socket's peer when this connection rides a MASQUE tunnel —
+    /// the proxy — and `None` for a direct connection.
+    fn outer_peer_addr(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Direct { .. } => None,
+            Self::Masque(tunnel) => Some(tunnel.peer_addr),
+        }
+    }
+
     fn set_write_timeout(&self, timeout: Duration) -> Result<(), VaneError> {
         match self {
             Self::Direct { socket, .. } => socket
@@ -2919,11 +2944,11 @@ struct Http3ResponseParts {
     /// caller's file. The public response cannot be asked once a file was used.
     body_len: u64,
     status_code: u16,
-    headers: HashMap<String, String>,
-    set_cookie_headers: Vec<String>,
+    headers: Vec<VaneHeader>,
     body: Vec<u8>,
     body_file_path: Option<String>,
     url: String,
+    remote_ip: Option<String>,
 }
 
 impl Http3ResponseParts {
@@ -2935,12 +2960,12 @@ impl Http3ResponseParts {
             body_file_path: self.body_file_path,
             is_success: (200..=299).contains(&self.status_code),
             url: self.url,
-            set_cookie: self.set_cookie_headers,
             // `create_quiche_config` offers only `h3::APPLICATION_PROTOCOL`,
             // and the MASQUE path uses the same h3-only config on both hops,
             // so an `Http3ResponseParts` cannot have been served over anything
             // else.
             http_version: Some(VaneHttpVersion::Http3),
+            remote_ip: self.remote_ip,
         }
     }
 }
@@ -3022,12 +3047,21 @@ impl RedirectHopResponse for StreamingHopResult {
     }
 
     fn location(&self) -> Option<&str> {
-        header_value(&self.head.headers, "location")
+        first_header_value(&self.head.headers, "location")
     }
 
     fn mark_refused(&mut self, reason: &'static str) {
         self.head.mark_refused(reason);
     }
+}
+
+/// What [`VaneResponse::remote_ip`] reports: the socket peer of the
+/// connection that produced the response. Direct: the connection's resolved
+/// peer. Via MASQUE: the proxy (`outer.peer_addr`) — through a CONNECT proxy
+/// the TCP path's `remote_addr()` can only ever report the actual socket
+/// peer, and cross-transport consistency beats per-transport cleverness.
+fn response_remote_ip(peer_addr: SocketAddr, outer_peer_addr: Option<SocketAddr>) -> String {
+    outer_peer_addr.unwrap_or(peer_addr).ip().to_string()
 }
 
 /// Builds the caller-visible head off a response whose headers are complete,
@@ -3038,6 +3072,7 @@ fn streaming_head(
     state: &mut ResponseState,
     url: &Url,
     http_version: Option<VaneHttpVersion>,
+    remote_ip: Option<String>,
 ) -> VaneResponse {
     VaneResponse {
         status_code: state.status_code,
@@ -3046,8 +3081,8 @@ fn streaming_head(
         body_file_path: None,
         is_success: (200..=299).contains(&state.status_code),
         url: url.to_string(),
-        set_cookie: std::mem::take(&mut state.set_cookie_headers),
         http_version,
+        remote_ip,
     }
 }
 
@@ -3158,7 +3193,7 @@ impl RedirectHopResponse for VaneResponseStream {
     }
 
     fn location(&self) -> Option<&str> {
-        header_value(&self.head.headers, "location")
+        first_header_value(&self.head.headers, "location")
     }
 
     fn mark_refused(&mut self, reason: &'static str) {
@@ -5247,14 +5282,15 @@ fn origin_port(url: &Url) -> u16 {
     url.port_or_known_default().unwrap_or(443)
 }
 
-/// Case-insensitive lookup over a response header map. HTTP/3 field names are
-/// lowercase by protocol, but the response is peer-controlled and the redirect
-/// gate must not be skippable by spelling `Location` differently.
-fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+/// First occurrence of `name` in an ordered header list. Case-insensitive:
+/// `push_header` lowercases every name, but the list is peer-controlled data
+/// and the redirect gate must not be skippable by spelling `Location`
+/// differently should a producer ever bypass that normalization.
+fn first_header_value<'a>(headers: &'a [VaneHeader], name: &str) -> Option<&'a str> {
     headers
         .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
+        .find(|header| header.name.eq_ignore_ascii_case(name))
+        .map(|header| header.value.as_str())
 }
 
 /// Response header naming why Vane stopped following a redirect chain.
@@ -5503,8 +5539,10 @@ fn flush_quic_packets(
 
 struct ResponseState {
     status_code: u16,
-    headers: HashMap<String, String>,
-    set_cookie_headers: Vec<String>,
+    /// Ordered `(name, value)` pairs, arrival order, duplicates preserved,
+    /// `set-cookie` inline — exactly the shape [`VaneResponse::headers`]
+    /// ships, so the construction sites are moves, not conversions.
+    headers: Vec<VaneHeader>,
     body: Vec<u8>,
     body_file_path: Option<String>,
     body_file: Option<File>,
@@ -5537,8 +5575,7 @@ impl ResponseState {
         };
         Ok(Self {
             status_code: 0,
-            headers: HashMap::new(),
-            set_cookie_headers: Vec::new(),
+            headers: Vec::new(),
             body: Vec::new(),
             body_file_path: body_file_path
                 .filter(|path| !path.is_empty())
@@ -5586,49 +5623,36 @@ impl ResponseState {
         }
     }
 
-    /// Folds one response header into the state, applying the rules both
-    /// transports share, so the same response yields the same map whether UDP
-    /// or the TCP fallback served it:
+    /// Appends one response header, applying the rules both transports share,
+    /// so the same response yields the same list whether UDP or the TCP
+    /// fallback served it: every occurrence is kept, in arrival order,
+    /// duplicates included — `set-cookie` inline in positional order. Names
+    /// are lowercased (reqwest's `HeaderName` already is; on H3 the peer
+    /// controls the spelling, and `Location` plus `location` must not read as
+    /// two different headers to the first-occurrence lookups).
     ///
-    /// - `set-cookie` goes to its own list and never enters the map: a
-    ///   `HashMap` cannot hold its repeats and RFC 6265 forbids joining them
-    ///   (an `Expires` value contains a comma).
-    /// - `location` keeps its first occurrence whole and drops repeats: it is
-    ///   single-valued (RFC 9110 §10.2.2), a joined `"a, b"` is not a URL,
-    ///   and the TCP path's `HeaderMap::get` already hands the redirect gate
-    ///   the first occurrence — so first-wins is what keeps the map, the gate
-    ///   and both transports agreeing on the same value.
-    /// - Any other repeated name is combined into one `", "`-joined field
-    ///   value in wire order (RFC 9110 §5.2), the shape `package:http`-style
-    ///   consumers split back apart.
-    /// - `content-length` feeds the body-size hint from its first occurrence
-    ///   only. A repeat is malformed (RFC 9110 §8.6); the map keeps the
-    ///   joined evidence verbatim, but re-parsing later occurrences would let
-    ///   a hostile repeat — or a trailer — move the reservation hint after
-    ///   the first was already acted on.
-    ///
-    /// Callers pass lowercase names: reqwest's `HeaderName` already is, and
-    /// the HTTP/3 block merge lowercases before calling.
-    fn merge_header(&mut self, name: String, value: String) {
-        if name == "set-cookie" {
-            self.set_cookie_headers.push(value);
-            return;
+    /// `content-length` feeds the body-size hint from its first occurrence
+    /// only. A repeat is malformed (RFC 9110 §8.6); the list keeps the
+    /// evidence verbatim, but re-parsing later occurrences would let a
+    /// hostile repeat — or a trailer — move the reservation hint after the
+    /// first was already acted on.
+    fn push_header(&mut self, mut name: String, value: String) {
+        name.make_ascii_lowercase();
+        if name == "content-length" && first_header_value(&self.headers, "content-length").is_none()
+        {
+            self.on_content_length(&value);
         }
-        match self.headers.get_mut(&name) {
-            Some(combined) => {
-                if name == "location" {
-                    return;
-                }
-                combined.push_str(", ");
-                combined.push_str(&value);
-            }
-            None => {
-                if name == "content-length" {
-                    self.on_content_length(&value);
-                }
-                self.headers.insert(name, value);
-            }
-        }
+        self.headers.push(VaneHeader { name, value });
+    }
+
+    /// The `set-cookie` values in arrival order — the cookie jar's filtered
+    /// view of the ordered header list.
+    fn set_cookie_values(&self) -> Vec<String> {
+        self.headers
+            .iter()
+            .filter(|header| header.name == "set-cookie")
+            .map(|header| header.value.clone())
+            .collect()
     }
 
     fn push_body(&mut self, bytes: &[u8]) -> Result<(), VaneError> {
@@ -5659,12 +5683,12 @@ impl ResponseState {
 ///
 /// quiche's h3 layer emits one `Event::Headers` per HEADERS frame and has no
 /// notion of a final response, so without this an `103 Early Hints` block's
-/// `set-cookie` values would be surfaced on the final response and its other
-/// fields would be comma-joined into the real ones. hyper consumes 1xx
-/// internally on the TCP path, so dropping them here is also what keeps the two
-/// transports agreeing on what the server sent (RFC 9114 §4.1.2). A trailers
-/// block (an `Event::Headers` with no `:status`) folds in as before; a trailer
-/// name that repeats a header name joins like any other repeat.
+/// fields — its `set-cookie` values included — would be surfaced on the final
+/// response. hyper consumes 1xx internally on the TCP path, so dropping them
+/// here is also what keeps the two transports agreeing on what the server
+/// sent (RFC 9114 §4.1.2). A trailers block (an `Event::Headers` with no
+/// `:status`) folds in as before; its fields append to the ordered list like
+/// any other occurrence.
 fn merge_h3_header_block(response: &mut ResponseState, list: Vec<quiche::h3::Header>) {
     // `None` rather than 0: a trailers block is also an `Event::Headers` and
     // carries no `:status`, so treating "absent" as 0 would wipe the real
@@ -5672,12 +5696,8 @@ fn merge_h3_header_block(response: &mut ResponseState, list: Vec<quiche::h3::Hea
     let mut status: Option<u16> = None;
     let mut fields = Vec::with_capacity(list.len());
     for header in list {
-        // Lowercased before it is keyed: HTTP/3 field names are lowercase by
-        // protocol, but the peer controls them, and `Location` plus `location`
-        // as two map entries would make the redirect gate's lookup
-        // nondeterministic. Lowercasing first means such a repeat comma-joins
-        // into a single entry instead, exactly as the TCP path's `HeaderName`
-        // normalization makes it do.
+        // Lowercased here for the `:status` match; `push_header` normalizes
+        // the stored spelling either way.
         let name = String::from_utf8_lossy(header.name()).to_ascii_lowercase();
         let value = String::from_utf8_lossy(header.value()).to_string();
         if name == ":status" {
@@ -5694,7 +5714,7 @@ fn merge_h3_header_block(response: &mut ResponseState, list: Vec<quiche::h3::Hea
         response.headers_complete = true;
     }
     for (name, value) in fields {
-        response.merge_header(name, value);
+        response.push_header(name, value);
     }
 }
 
@@ -6151,10 +6171,10 @@ static FFI_NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 /// library on either side corrupts the call frame); new symbols
 /// `vane_ffi_set_dns_resolver` and `vane_ffi_dns_resolver_reply` (stubs
 /// until the resolver batch wires them). The header-array contract
-/// strengthens from batch 2 of the v5 rollout: entries in arrival order,
-/// duplicates preserved, `set-cookie` in positional order (previously
-/// re-expanded at the tail); consumers must not assume unique keys — already
-/// the documented rule on `vane_ffi_execute`.
+/// strengthened in batch 2 of the v5 rollout and is now in effect: entries
+/// in arrival order, duplicates preserved, `set-cookie` in positional order
+/// (previously re-expanded at the tail); consumers must not assume unique
+/// keys — already the documented rule on `vane_ffi_execute`.
 #[unsafe(no_mangle)]
 pub extern "C" fn vane_ffi_abi_version() -> u32 {
     5
@@ -6550,9 +6570,7 @@ fn ffi_create_client(config: *const VaneFfiClientConfig) -> Result<u64, VaneErro
     let handle = FFI_NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     FFI_CLIENTS
         .lock()
-        .map_err(|_| {
-            VaneError::Generic("Vane FFI client registry lock was poisoned".to_string())
-        })?
+        .map_err(|_| VaneError::Generic("Vane FFI client registry lock was poisoned".to_string()))?
         .insert(handle, client);
     Ok(handle)
 }
@@ -6680,15 +6698,14 @@ fn ffi_response_from_vane(response: VaneResponse) -> VaneFfiResponse {
         is_success: response.is_success,
         http_version: response.http_version.map_or(0, VaneHttpVersion::ffi_code),
         error_kind: 0,
-        headers: ffi_header_array_from(response.headers, response.set_cookie),
+        headers: ffi_header_array_from(response.headers),
         body: ffi_buffer_from_vec(response.body),
         body_file_path: ffi_buffer_from_vec(
             response.body_file_path.unwrap_or_default().into_bytes(),
         ),
         url: ffi_buffer_from_vec(response.url.into_bytes()),
         error: ffi_buffer_from_vec(Vec::new()),
-        // v5 layout only; batch 2 of the rollout fills it from the response.
-        remote_ip: ffi_buffer_from_vec(Vec::new()),
+        remote_ip: ffi_buffer_from_vec(response.remote_ip.unwrap_or_default().into_bytes()),
     }
 }
 
@@ -6955,23 +6972,17 @@ fn ffi_header_array_empty() -> VaneFfiHeaderArray {
     }
 }
 
-/// The array has always been a `(key, value)` list rather than a map, so the
-/// `Set-Cookie` values ride as repeated `("set-cookie", value)` entries instead
-/// of a second `repr(C)` field. Consumers must not assume unique keys.
-fn ffi_header_array_from(
-    headers: HashMap<String, String>,
-    set_cookie: Vec<String>,
-) -> VaneFfiHeaderArray {
+/// The array has always been a `(key, value)` list rather than a map, and
+/// since ABI v5 batch 2 it is the response's ordered list verbatim: arrival
+/// order, duplicates preserved, `set-cookie` in positional order (previously
+/// re-expanded at the tail). Consumers must not assume unique keys.
+fn ffi_header_array_from(headers: Vec<VaneHeader>) -> VaneFfiHeaderArray {
     let mut headers: Vec<VaneFfiHeader> = headers
         .into_iter()
-        .map(|(key, value)| VaneFfiHeader {
-            key: ffi_buffer_from_vec(key.into_bytes()),
-            value: ffi_buffer_from_vec(value.into_bytes()),
+        .map(|header| VaneFfiHeader {
+            key: ffi_buffer_from_vec(header.name.into_bytes()),
+            value: ffi_buffer_from_vec(header.value.into_bytes()),
         })
-        .chain(set_cookie.into_iter().map(|value| VaneFfiHeader {
-            key: ffi_buffer_from_vec(b"set-cookie".to_vec()),
-            value: ffi_buffer_from_vec(value.into_bytes()),
-        }))
         .collect();
     if headers.is_empty() {
         return ffi_header_array_empty();
@@ -7365,17 +7376,16 @@ mod tests {
             .expect("HTTP/3 cookie set should succeed");
         assert_eq!(set_cookie.status_code, 302);
         // The H3 half of what `tcp::tests::response_metadata` proves offline:
-        // the values reach the caller as well as the jar, and never through
-        // the header map.
+        // the values reach the caller as well as the jar, inline in the
+        // ordered header list.
         assert!(
             set_cookie
-                .set_cookie
+                .headers
                 .iter()
-                .any(|value| value.contains("vane_cookie")),
-            "set_cookie was {:?}",
-            set_cookie.set_cookie
+                .any(|header| header.name == "set-cookie" && header.value.contains("vane_cookie")),
+            "set-cookie entries were {:?}",
+            set_cookie.headers
         );
-        assert!(!set_cookie.headers.contains_key("set-cookie"));
         assert_eq!(set_cookie.http_version, Some(VaneHttpVersion::Http3));
 
         let cookies = client
@@ -7532,10 +7542,7 @@ mod tests {
                 protocol_mode: mode,
                 ..VaneClientConfig::default()
             });
-            assert!(
-                err.contains("incompatible with HTTP/3"),
-                "got {err}"
-            );
+            assert!(err.contains("incompatible with HTTP/3"), "got {err}");
         }
         // The same ceiling is fine when no transport would ignore it, and a
         // 1.3 floor is fine everywhere (H3 already is 1.3).
@@ -7825,18 +7832,27 @@ mod tests {
         assert_eq!(VaneHttpVersion::Http3.ffi_code(), 4);
     }
 
-    /// The C ABI has no `set_cookie` field: the values ride as repeated
-    /// `("set-cookie", value)` entries in the header array, which a `HashMap`
-    /// input could never produce.
+    /// The v5 batch-2 header-array contract: the ordered list crosses the C
+    /// ABI verbatim — arrival order, duplicates preserved, `set-cookie` in
+    /// positional order rather than re-expanded at the tail. The C ABI still
+    /// has no `set_cookie` field; the repeats ARE the representation.
     #[test]
-    fn ffi_header_array_carries_repeated_set_cookie() {
-        let mut headers = HashMap::new();
-        headers.insert("content-type".to_string(), "text/plain".to_string());
-        let array = ffi_header_array_from(
-            headers,
-            vec!["a=1; Path=/".to_string(), "b=2; Path=/".to_string()],
-        );
-        assert_eq!(array.len, 3);
+    fn ffi_header_array_preserves_arrival_order() {
+        fn pair(name: &str, value: &str) -> VaneHeader {
+            VaneHeader {
+                name: name.to_string(),
+                value: value.to_string(),
+            }
+        }
+
+        let array = ffi_header_array_from(vec![
+            pair("set-cookie", "a=1; Path=/"),
+            pair("content-type", "text/plain"),
+            pair("set-cookie", "b=2; Path=/"),
+            pair("x-multi", "a"),
+            pair("x-multi", "b"),
+        ]);
+        assert_eq!(array.len, 5);
         let entries: Vec<(String, String)> = (0..array.len)
             .map(|index| unsafe {
                 let header = &*array.data.add(index);
@@ -7854,13 +7870,31 @@ mod tests {
                 )
             })
             .collect();
-        let cookies: Vec<&str> = entries
-            .iter()
-            .filter(|(key, _)| key == "set-cookie")
-            .map(|(_, value)| value.as_str())
-            .collect();
-        assert_eq!(cookies, vec!["a=1; Path=/", "b=2; Path=/"]);
+        let expected: Vec<(String, String)> = [
+            ("set-cookie", "a=1; Path=/"),
+            ("content-type", "text/plain"),
+            ("set-cookie", "b=2; Path=/"),
+            ("x-multi", "a"),
+            ("x-multi", "b"),
+        ]
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        assert_eq!(entries, expected);
         ffi_header_array_free(array);
+    }
+
+    /// The `remote_ip` selection rule: via MASQUE the response reports the
+    /// proxy — the outer socket's peer — matching what reqwest's
+    /// `remote_addr()` reports through a CONNECT proxy on TCP; a direct
+    /// connection reports its own resolved peer. An IPv6 peer stays a bare
+    /// literal: no brackets, no port.
+    #[test]
+    fn masque_remote_ip_is_the_outer_socket_peer() {
+        let origin: SocketAddr = "192.0.2.10:443".parse().unwrap();
+        let proxy: SocketAddr = "[2001:db8::1]:8443".parse().unwrap();
+        assert_eq!(response_remote_ip(origin, Some(proxy)), "2001:db8::1");
+        assert_eq!(response_remote_ip(origin, None), "192.0.2.10");
     }
 
     /// warmup is best-effort: bad input errors internally and is swallowed
@@ -8229,7 +8263,15 @@ mod tests {
         // The config default cap; the parameterized-cap cases are the
         // h3_offline chain test and its `tcp::tests` twin.
         let max_redirects = VaneClientConfig::default().max_redirects;
-        next_redirect_url(status, Some(location), from, &request, hops, max_redirects, pins)
+        next_redirect_url(
+            status,
+            Some(location),
+            from,
+            &request,
+            hops,
+            max_redirects,
+            pins,
+        )
     }
 
     fn followed(decision: RedirectDecision) -> Option<String> {
@@ -8297,10 +8339,10 @@ mod tests {
             "https://attacker%2etest/y",
             "https://evil@other.example/",
             "gopher://api.example.com/home",
-            // A single value shaped like a comma-join (`merge_header` never
-            // produces one for `location`): the `", "` lands in the
-            // authority, which cannot parse. Whole-value on both transports,
-            // so both stop here identically.
+            // A single value shaped like a comma-join (the ordered list
+            // never joins values): the `", "` lands in the authority, which
+            // cannot parse. Whole-value on both transports, so both stop
+            // here identically.
             "https://a.example, https://b.example",
         ] {
             assert_eq!(
@@ -8357,11 +8399,11 @@ mod tests {
         );
     }
 
-    /// Covers the whole H3 population path for both new response fields: an
-    /// interim block must be discarded, and `into_public_response` is the only
-    /// place the H3 transport fills `set_cookie`/`http_version` in. Neither had
-    /// offline coverage — the redirect tests assert on the `h3_response` helper
-    /// below, which writes the values itself, and the live test is env-gated.
+    /// Covers the whole H3 population path for the response fields: an
+    /// interim block must be discarded, and `into_public_response` is the
+    /// only place the H3 transport fills `http_version`/`remote_ip` in. The
+    /// redirect tests assert on the `h3_response` helper below, which writes
+    /// the values itself, and the live test is env-gated.
     #[test]
     fn an_interim_h3_header_block_never_reaches_the_response() {
         fn header(name: &str, value: &str) -> quiche::h3::Header {
@@ -8396,37 +8438,44 @@ mod tests {
             body_len: state.body_len as u64,
             status_code: state.status_code,
             headers: state.headers,
-            set_cookie_headers: state.set_cookie_headers,
             body: state.body,
             body_file_path: state.body_file_path,
             url: "https://example.com/".to_string(),
+            remote_ip: Some("127.0.0.1".to_string()),
         }
         .into_public_response();
 
         assert_eq!(response.status_code, 200);
         assert_eq!(
-            response.headers.get("grpc-status").map(String::as_str),
+            first_header_value(&response.headers, "grpc-status"),
             Some("0")
         );
-        assert_eq!(response.set_cookie, vec!["sid=B".to_string()]);
+        // Only the final block's cookie survives, inline in the list.
+        let cookies: Vec<&str> = response
+            .headers
+            .iter()
+            .filter(|header| header.name == "set-cookie")
+            .map(|header| header.value.as_str())
+            .collect();
+        assert_eq!(cookies, vec!["sid=B"]);
         assert_eq!(
-            response.headers.get("server").map(String::as_str),
+            first_header_value(&response.headers, "server"),
             Some("real")
         );
-        // The map must never carry the cookie: it cannot hold repeats.
-        assert!(!response.headers.contains_key("set-cookie"));
         assert_eq!(response.http_version, Some(VaneHttpVersion::Http3));
+        assert_eq!(response.remote_ip.as_deref(), Some("127.0.0.1"));
     }
 
-    /// Pins the join rule the two transports share: a repeated non-cookie
-    /// header combines into one `", "`-joined value in wire order (RFC 9110
-    /// §5.2), except `location`, which keeps its first occurrence whole.
-    /// `repeated_headers_comma_join_identically_on_both_transports` in
-    /// `tcp::tests` asserts the same shapes for the same wire on the
-    /// TCP fallback — the whole point is that the map cannot depend on
-    /// whether UDP happened to work.
+    /// Pins the list rule the two transports share: every occurrence is kept
+    /// in arrival order, duplicates included — `set-cookie` inline — while
+    /// the first-occurrence lookups (`location`, the `content-length` hint)
+    /// act on the first value only.
+    /// `repeated_headers_are_preserved_identically_on_both_transports` in
+    /// `tcp::tests` asserts the same shapes for the same wire on the TCP
+    /// fallback — the whole point is that the list cannot depend on whether
+    /// UDP happened to work.
     #[test]
-    fn repeated_h3_headers_comma_join_across_header_blocks() {
+    fn repeated_h3_headers_are_preserved_in_order_across_header_blocks() {
         fn header(name: &str, value: &str) -> quiche::h3::Header {
             quiche::h3::Header::new(name.as_bytes(), value.as_bytes())
         }
@@ -8454,44 +8503,53 @@ mod tests {
                 header("location", "https://second.example/"),
             ],
         );
-        // A trailers block carries no `:status`; a repeat there joins too.
+        // A trailers block carries no `:status`; its fields append too.
         merge_h3_header_block(&mut state, vec![header("x-trailer", "t")]);
 
+        // Everything from the final block onward, in arrival order,
+        // duplicates preserved, the mixed-case spelling lowercased, and the
+        // interim block's fields gone.
+        let got: Vec<(&str, &str)> = state
+            .headers
+            .iter()
+            .map(|header| (header.name.as_str(), header.value.as_str()))
+            .collect();
         assert_eq!(
-            state.headers.get("x-multi").map(String::as_str),
-            Some("a, b")
+            got,
+            vec![
+                ("x-multi", "a"),
+                ("x-multi", "b"),
+                ("x-trailer", "h"),
+                ("set-cookie", "sid=1"),
+                ("set-cookie", "sid=2"),
+                ("content-length", "7"),
+                ("content-length", "999"),
+                ("location", "https://first.example/"),
+                ("location", "https://second.example/"),
+                ("x-trailer", "t"),
+            ]
         );
-        assert_eq!(
-            state.headers.get("x-trailer").map(String::as_str),
-            Some("h, t")
-        );
-        // The map carries the malformed repeat verbatim, but the parsed size
+        // The list carries the malformed repeat verbatim, but the parsed size
         // hint keeps first-value semantics: a later occurrence must not move
         // a reservation the first already sized.
-        assert_eq!(
-            state.headers.get("content-length").map(String::as_str),
-            Some("7, 999")
-        );
         assert_eq!(state.download_total, 7);
-        // `location` never joins: first occurrence whole, repeats dropped —
-        // the value the redirect gate acts on, on both transports. A joined
-        // `"a, b"` here would not be a URL at all.
+        // The redirect gate acts on the first `location` occurrence; the
+        // repeat stays in the list as data only.
         assert_eq!(
-            state.headers.get("location").map(String::as_str),
+            first_header_value(&state.headers, "location"),
             Some("https://first.example/")
         );
-        assert_eq!(
-            state.set_cookie_headers,
-            vec!["sid=1".to_string(), "sid=2".to_string()]
-        );
-        assert!(!state.headers.contains_key("set-cookie"));
     }
 
     fn h3_response(status: u16, location: Option<&str>, body: &str) -> VaneResponse {
-        let mut headers = HashMap::new();
-        if let Some(location) = location {
-            headers.insert("location".to_string(), location.to_string());
-        }
+        let headers = location
+            .map(|location| {
+                vec![VaneHeader {
+                    name: "location".to_string(),
+                    value: location.to_string(),
+                }]
+            })
+            .unwrap_or_default();
         VaneResponse {
             status_code: status,
             headers,
@@ -8499,8 +8557,8 @@ mod tests {
             body_file_path: None,
             is_success: (200..=299).contains(&status),
             url: String::new(),
-            set_cookie: Vec::new(),
             http_version: Some(VaneHttpVersion::Http3),
+            remote_ip: None,
         }
     }
 
@@ -8586,7 +8644,7 @@ mod tests {
         let response = result.unwrap();
         assert_eq!(response.status_code, 302);
         assert_eq!(
-            response.headers.get(REDIRECT_REFUSED_HEADER).map(|s| &**s),
+            first_header_value(&response.headers, REDIRECT_REFUSED_HEADER),
             Some(REDIRECT_REFUSED_HOP_CAP)
         );
 
@@ -8635,7 +8693,7 @@ mod tests {
         let response = result.unwrap();
         assert_eq!(response.status_code, 307);
         assert_eq!(
-            response.headers.get(REDIRECT_REFUSED_HEADER).map(|s| &**s),
+            first_header_value(&response.headers, REDIRECT_REFUSED_HEADER),
             Some(REDIRECT_REFUSED_CROSS_ORIGIN_BODY)
         );
         // The refused response reaches the caller in full, and its bytes are
@@ -8661,11 +8719,7 @@ mod tests {
         });
         assert_eq!(seen.len(), 1);
         assert_eq!(
-            result
-                .unwrap()
-                .headers
-                .get(REDIRECT_REFUSED_HEADER)
-                .map(|s| &**s),
+            first_header_value(&result.unwrap().headers, REDIRECT_REFUSED_HEADER),
             Some(REDIRECT_REFUSED_PINNED_HOST)
         );
     }

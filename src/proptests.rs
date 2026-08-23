@@ -323,7 +323,9 @@ const CROSS_ORIGIN_NAME_POOL: &[&str] = &[
 fn header_name() -> impl Strategy<Value = String> {
     prop_oneof![
         5 => prop::sample::select(HEADER_NAMES).prop_map(str::to_string),
-        1 => "[a-z][a-z0-9-]{0,12}",
+        // Mixed case on purpose: the peer controls the spelling and the
+        // stored list must still come out lowercased.
+        1 => "[a-zA-Z][a-zA-Z0-9-]{0,12}",
     ]
 }
 
@@ -550,57 +552,42 @@ fn check_persisted_round_trip(cookie: &StoredCookie) {
     assert_eq!(&reparsed, cookie, "cookie changed across persist/load");
 }
 
-/// The header-fold rules both transports share, restated as a model:
-/// `set-cookie` never enters the map, `location` keeps its first occurrence
-/// exactly, everything else joins `", "` in wire order, and only the first
-/// `content-length` feeds the (capped) reservation hint.
+/// The header rules both transports share, restated as a model: every
+/// occurrence is kept, in arrival order, duplicates included — `set-cookie`
+/// inline in positional order — names lowercased; the redirect gate reads
+/// the FIRST `location`; and only the first `content-length` feeds the
+/// (capped) reservation hint.
 fn check_merge_headers(entries: &[(String, String)]) {
     let mut state = ResponseState::new(DEFAULT_MAX_RESPONSE_BODY_BYTES, None)
         .expect("no body file, cannot fail");
     for (name, value) in entries {
-        state.merge_header(name.clone(), value.clone());
+        state.push_header(name.clone(), value.clone());
     }
 
-    assert!(
-        !state.headers.contains_key("set-cookie"),
-        "set-cookie leaked into the header map"
-    );
-    let expected_cookies: Vec<&String> = entries
+    let expected: Vec<(String, String)> = entries
         .iter()
-        .filter(|(name, _)| name == "set-cookie")
-        .map(|(_, value)| value)
+        .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+        .collect();
+    let got: Vec<(String, String)> = state
+        .headers
+        .iter()
+        .map(|header| (header.name.clone(), header.value.clone()))
         .collect();
     assert_eq!(
-        state.set_cookie_headers.iter().collect::<Vec<_>>(),
-        expected_cookies,
-        "set-cookie values must be kept verbatim, in wire order"
+        got, expected,
+        "every occurrence must be kept verbatim, in arrival order"
     );
 
-    let mut expected: Vec<(String, String)> = Vec::new();
-    for (name, value) in entries {
-        if name == "set-cookie" {
-            continue;
-        }
-        match expected.iter_mut().find(|(existing, _)| existing == name) {
-            Some((existing, joined)) => {
-                if existing != "location" {
-                    joined.push_str(", ");
-                    joined.push_str(value);
-                }
-            }
-            None => expected.push((name.clone(), value.clone())),
-        }
-    }
-    assert_eq!(state.headers.len(), expected.len(), "ghost header key");
-    for (name, joined) in &expected {
-        assert_eq!(
-            state.headers.get(name),
-            Some(joined),
-            "fold rule broke for {name:?}"
-        );
-    }
+    assert_eq!(
+        first_header_value(&state.headers, "location"),
+        expected
+            .iter()
+            .find(|(name, _)| name == "location")
+            .map(|(_, value)| value.as_str()),
+        "the redirect gate must see the first location occurrence"
+    );
 
-    let expected_total = entries
+    let expected_total = expected
         .iter()
         .find(|(name, _)| name == "content-length")
         .map(|(_, value)| value.parse::<u64>().unwrap_or(0))
@@ -665,10 +652,7 @@ fn check_redirect_gate(
             (300..400).contains(&status),
             "followed a non-3xx status {status}"
         );
-        assert!(
-            hops < max_redirects as usize,
-            "followed past the hop cap"
-        );
+        assert!(hops < max_redirects as usize, "followed past the hop cap");
         assert_eq!(next.scheme(), "https", "followed a cleartext downgrade");
         if pin_current_host {
             assert_eq!(
@@ -818,7 +802,7 @@ proptest! {
     }
 
     #[test]
-    fn merged_headers_follow_the_fold_rules(
+    fn merged_headers_preserve_order_and_duplicates(
         entries in prop::collection::vec((header_name(), header_value()), 0..12),
     ) {
         check_merge_headers(&entries);
