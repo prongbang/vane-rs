@@ -75,9 +75,6 @@ const MAX_INTERMEDIATE_BODY_BYTES: u64 = 64 * 1024;
 /// well under the flow window, so an oversized block is rejected cleanly
 /// instead of being buffered.
 const MAX_RESPONSE_HEADER_SECTION_BYTES: u64 = 64 * 1024;
-/// Redirect hops allowed when `follow_redirects` is on. Shared by both
-/// transports: the hop cap is a security bound, not a transport detail.
-const MAX_REDIRECTS: usize = 10;
 /// Caller-supplied headers allowed to survive a redirect to a different origin.
 ///
 /// Everything else — API keys, bearer tokens, tenant ids — is dropped: reqwest
@@ -805,6 +802,46 @@ pub enum VaneProtocolMode {
     Http1Only,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum VaneTlsVersion {
+    Tls12,
+    Tls13,
+}
+
+// NO derive(Debug) — `VaneClientConfig` derives Debug, and a derived Debug
+// here would print the private key on any `{:?}` of a config. Manual impl.
+#[derive(Clone, uniffi::Record)]
+pub struct VaneClientCertificate {
+    /// PEM, leaf first, optionally followed by intermediates (full chain).
+    pub certificate_pem: String,
+    /// PEM PKCS#8, SEC1, or PKCS#1 private key. Never logged, never echoed in
+    /// errors, never printed by Debug.
+    pub private_key_pem: String,
+}
+
+impl VaneClientCertificate {
+    /// SHA-256 over the certificate PEM bytes, hex-encoded. Public data: the
+    /// redacting `Debug` may show it, and `PoolKey` keys on it so a pooled
+    /// connection authenticated as one identity never serves another.
+    fn certificate_fingerprint(&self) -> String {
+        sha256_hex_fingerprint(self.certificate_pem.as_bytes())
+    }
+}
+
+/// Redacting Debug: never prints PEM material. The cert side may show a
+/// SHA-256 fingerprint (public data); the key side is always "<redacted>".
+impl std::fmt::Debug for VaneClientCertificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaneClientCertificate")
+            .field(
+                "certificate_pem",
+                &format_args!("<sha256:{}>", self.certificate_fingerprint()),
+            )
+            .field("private_key_pem", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct VaneClientConfig {
     pub base_url: Option<String>,
@@ -826,8 +863,38 @@ pub struct VaneClientConfig {
     pub follow_redirects: bool,
     pub user_agent: Option<String>,
     pub protocol_mode: VaneProtocolMode,
+    /// With `proxy_authorization`, the ENTIRE proxy surface — deliberately.
+    /// A per-scheme proxy union (rhttp's shape) is meaningless in an
+    /// https-only client: with one possible request scheme, first-scheme-match
+    /// is always the first entry, i.e. a single proxy URL. SOCKS stays out
+    /// too — it would be TCP-only and silently dead on H3 (MASQUE has no
+    /// SOCKS analogue). Revisit only if Vane ever accepts http:// URLs (the
+    /// https-only rejections in `execute`/`tcp.rs` are the tripwire).
     pub proxy_url: Option<String>,
     pub proxy_authorization: Option<String>,
+    /// Redirect hop cap when `follow_redirects` is on. Shared by both
+    /// transports: the hop cap is a security bound, not a transport detail.
+    /// At most 64; 0 makes the first 3xx a hop-cap refusal.
+    #[uniffi(default = 10)]
+    pub max_redirects: u32,
+    /// Minimum TLS version on the TCP path; `None` = rustls default (1.2).
+    /// HTTP/3 is TLS 1.3-always (RFC 9001), so on that path this only
+    /// validates compatibility at construction.
+    #[uniffi(default = None)]
+    pub tls_min_version: Option<VaneTlsVersion>,
+    /// Maximum TLS version on the TCP path; `None` = rustls default (1.3).
+    /// `Tls12` is rejected at construction with an HTTP/3-capable
+    /// `protocol_mode`: QUIC mandates TLS 1.3.
+    #[uniffi(default = None)]
+    pub tls_max_version: Option<VaneTlsVersion>,
+    /// PEM certificates ADDED to platform trust on both stacks (extend-only;
+    /// there is no replace mode and no verification-off switch). Each entry
+    /// may hold one certificate or a whole bundle.
+    #[uniffi(default = [])]
+    pub custom_root_certificates: Vec<String>,
+    /// Client certificate (mTLS) presented to the origin on both stacks.
+    #[uniffi(default = None)]
+    pub client_certificate: Option<VaneClientCertificate>,
 }
 
 impl Default for VaneClientConfig {
@@ -858,6 +925,11 @@ impl Default for VaneClientConfig {
             protocol_mode: VaneProtocolMode::Http3Only,
             proxy_url: None,
             proxy_authorization: None,
+            max_redirects: 10,
+            tls_min_version: None,
+            tls_max_version: None,
+            custom_root_certificates: vec![],
+            client_certificate: None,
         }
     }
 }
@@ -1071,6 +1143,48 @@ impl VaneClient {
                         .to_string(),
                 ));
             }
+        }
+        if config.max_redirects > 64 {
+            return Err(VaneError::InvalidRequest(
+                "maxRedirects must be at most 64: the redirect hop cap is a security bound"
+                    .to_string(),
+            ));
+        }
+        if matches!(
+            (config.tls_min_version, config.tls_max_version),
+            (Some(VaneTlsVersion::Tls13), Some(VaneTlsVersion::Tls12))
+        ) {
+            return Err(VaneError::InvalidRequest(
+                "tlsMinVersion must not exceed tlsMaxVersion".to_string(),
+            ));
+        }
+        // Loud at construction, never a silent per-transport divergence:
+        // quiche pins TLS 1.3 per connection (RFC 9001 mandates it), so a 1.2
+        // ceiling can only ever be honored by the TCP path.
+        if config.tls_max_version == Some(VaneTlsVersion::Tls12)
+            && matches!(
+                config.protocol_mode,
+                VaneProtocolMode::Http3ThenHttp2ThenHttp1 | VaneProtocolMode::Http3Only
+            )
+        {
+            return Err(VaneError::InvalidRequest(
+                "tlsMaxVersion tls12 is incompatible with HTTP/3: QUIC mandates TLS 1.3 \
+                 (RFC 9001); use an HTTP/2/1 protocolMode or raise tlsMaxVersion"
+                    .to_string(),
+            ));
+        }
+        // Parsed then rejected loudly until the trust batch wires them: a
+        // config that names a trust posture the client would silently not
+        // apply must never construct.
+        if !config.custom_root_certificates.is_empty() {
+            return Err(VaneError::InvalidRequest(
+                "customRootCertificates is not implemented yet".to_string(),
+            ));
+        }
+        if config.client_certificate.is_some() {
+            return Err(VaneError::InvalidRequest(
+                "clientCertificate is not implemented yet".to_string(),
+            ));
         }
         let cookie_jar = if config.cookies_enabled {
             load_cookie_jar(config.cookie_persistence_path.as_deref())?
@@ -1386,6 +1500,7 @@ impl VaneClient {
                 deadline: Instant::now() + timeout,
                 idle: timeout,
             },
+            max_redirects: self.config.max_redirects,
         }
         .run(url, request_body, |hop| {
             self.execute_http3_once(
@@ -1448,6 +1563,7 @@ impl VaneClient {
                 deadline: Instant::now() + timeout,
                 idle: timeout,
             },
+            max_redirects: this.config.max_redirects,
         }
         .run(url, request_body, |hop| {
             this.execute_http3_hop(
@@ -2450,6 +2566,9 @@ struct RedirectChain<'a> {
     cancel_token: Option<&'a AtomicBool>,
     progress: Option<&'a VaneProgressState>,
     timeouts: HopTimeouts,
+    /// The config's hop cap; both entry points copy it from the client so
+    /// the chain and the shared gate can never disagree about it.
+    max_redirects: u32,
 }
 
 impl RedirectChain<'_> {
@@ -2488,7 +2607,8 @@ impl RedirectChain<'_> {
                 // Reporting a replayed body's bytes from zero again would walk
                 // the upload counter backwards.
                 report_upload: hops == 0,
-                redirect_possible: self.request.follow_redirects && hops < MAX_REDIRECTS,
+                redirect_possible: self.request.follow_redirects
+                    && hops < self.max_redirects as usize,
             })
             .map_err(|err| withdraw_replay_safety(err, hops))?;
 
@@ -2502,6 +2622,7 @@ impl RedirectChain<'_> {
                 &current,
                 self.request,
                 hops,
+                self.max_redirects,
                 self.certificate_pins,
             ) {
                 RedirectDecision::Stop => return Ok(self.finish(response, downloaded)),
@@ -2608,6 +2729,16 @@ struct PoolKey {
     proxy_url: Option<String>,
     proxy_authorization: Option<String>,
     certificate_pins: Vec<String>,
+    // Connection-identity config is keyed, same as `proxy_url`. Config is
+    // immutable per client today, so these are convention/defensive, not
+    // load-bearing — until someone adds a runtime setter.
+    tls_min_version: Option<VaneTlsVersion>,
+    tls_max_version: Option<VaneTlsVersion>,
+    /// SHA-256 of the concatenated custom-roots PEM; `None` when unset.
+    custom_roots_fingerprint: Option<String>,
+    /// SHA-256 of the client certificate PEM: a pooled connection
+    /// authenticated as identity A must never serve a config with identity B.
+    client_certificate_fingerprint: Option<String>,
 }
 
 impl PoolKey {
@@ -2629,6 +2760,15 @@ impl PoolKey {
             proxy_url: config.proxy_url.clone(),
             proxy_authorization: config.proxy_authorization.clone(),
             certificate_pins,
+            tls_min_version: config.tls_min_version,
+            tls_max_version: config.tls_max_version,
+            custom_roots_fingerprint: (!config.custom_root_certificates.is_empty()).then(|| {
+                sha256_hex_fingerprint(config.custom_root_certificates.concat().as_bytes())
+            }),
+            client_certificate_fingerprint: config
+                .client_certificate
+                .as_ref()
+                .map(VaneClientCertificate::certificate_fingerprint),
         }
     }
 }
@@ -4342,6 +4482,10 @@ fn send_request_body(
     Ok(())
 }
 
+/// There is no TLS-version knob to apply here: quiche pins TLS min=max=1.3
+/// per connection inside `Handshake::init` (RFC 9001 mandates it), so
+/// `tls_min_version`/`tls_max_version` are validated for H3 compatibility at
+/// `VaneClient::new` and enforced only on the TCP path.
 fn create_quiche_config(
     max_idle_timeout_millis: u64,
     max_send_udp_payload: usize,
@@ -4603,6 +4747,19 @@ fn spki_sha256_pin(cert_der: &[u8]) -> Result<String, VaneError> {
 fn sha256_pin(prefix: &str, bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("{prefix}/{}", BASE64.encode(digest))
+}
+
+/// Hex SHA-256 fingerprint of public material (certificate PEM). Serves the
+/// redacting `Debug` on [`VaneClientCertificate`] and the `PoolKey` identity
+/// fields; never applied to key material.
+fn sha256_hex_fingerprint(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 fn default_cookie_path(url: &Url) -> String {
@@ -5130,12 +5287,16 @@ fn next_redirect_url(
     current: &Url,
     request: &VaneRequest,
     hops: usize,
+    max_redirects: u32,
     certificate_pins: &HashMap<String, Vec<String>>,
 ) -> RedirectDecision {
     if !request.follow_redirects || !(300..400).contains(&status_code) {
         return RedirectDecision::Stop;
     }
-    if hops >= MAX_REDIRECTS {
+    // The cap comes from `max_redirects` in the client config (default 10,
+    // validated to at most 64 at construction); with a cap of 0 the first
+    // 3xx is already a hop-cap refusal.
+    if hops >= max_redirects as usize {
         return RedirectDecision::Refused(REDIRECT_REFUSED_HOP_CAP);
     }
     // An empty Location means "no redirect" rather than the site root.
@@ -5829,6 +5990,21 @@ pub struct VaneFfiClientConfig {
     pub protocol_mode: u8,
     pub proxy_url: VaneFfiString,
     pub proxy_authorization: VaneFfiString,
+    // -------- appended in ABI v5; order is offset --------
+    /// Redirect hop cap; callers pass 10 for the default. Values > 64 are
+    /// rejected at client creation.
+    pub max_redirects: u32,
+    /// 0 = unset, 12 = TLS 1.2, 13 = TLS 1.3. Anything else is an error.
+    pub tls_min_version: u8,
+    pub tls_max_version: u8,
+    // 2 bytes tail padding here before the next 8-aligned pointer — deliberate;
+    // do NOT fill them later without a bump (the VaneFfiResponse padding lesson).
+    /// Concatenated PEM bundle; empty = none. Becomes a one-element
+    /// custom_root_certificates vec in the core (PEM is concatenation-safe).
+    pub custom_root_ca_pem: VaneFfiString,
+    /// PEM leaf-first chain; empty = none. Must be set together with the key.
+    pub client_certificate_pem: VaneFfiString,
+    pub client_private_key_pem: VaneFfiString,
 }
 
 #[repr(C)]
@@ -5892,6 +6068,11 @@ pub struct VaneFfiResponse {
     pub body_file_path: VaneFfiBuffer,
     pub url: VaneFfiBuffer,
     pub error: VaneFfiBuffer,
+    /// IP literal of the socket peer ("203.0.113.7"); empty = unknown.
+    /// Appended in ABI v5 — the padding after is_success was spent in v3
+    /// (http_version, error_kind), so this GROWS the struct. Always empty
+    /// until batch 2 of the v5 rollout fills it.
+    pub remote_ip: VaneFfiBuffer,
 }
 
 #[repr(C)]
@@ -5960,31 +6141,85 @@ static FFI_NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 /// u64 cannot ride padding). A v3 plugin handed this library would read a
 /// field past its own struct; this bump is exactly the skew the check exists
 /// to refuse.
+///
+/// v5: config knobs — `VaneFfiClientConfig` GREW: `max_redirects`,
+/// `tls_min_version`, `tls_max_version`, `custom_root_ca_pem`,
+/// `client_certificate_pem`, `client_private_key_pem` appended in that
+/// order; `VaneFfiResponse` GREW: `remote_ip` appended after `error`;
+/// `vane_ffi_client_create` CHANGED SIGNATURE (gained the `out_error_kind`
+/// out-param — the lockstep version check is load-bearing here, a stale
+/// library on either side corrupts the call frame); new symbols
+/// `vane_ffi_set_dns_resolver` and `vane_ffi_dns_resolver_reply` (stubs
+/// until the resolver batch wires them). The header-array contract
+/// strengthens from batch 2 of the v5 rollout: entries in arrival order,
+/// duplicates preserved, `set-cookie` in positional order (previously
+/// re-expanded at the tail); consumers must not assume unique keys — already
+/// the documented rule on `vane_ffi_execute`.
 #[unsafe(no_mangle)]
 pub extern "C" fn vane_ffi_abi_version() -> u32 {
-    4
+    5
 }
 
+/// v5: `out_error_kind` (nullable; ignored when null) receives the
+/// `VaneError::ffi_kind` code on failure — the SAME code table the response
+/// path already uses and Dart's `_errorKind` already decodes
+/// (InvalidRequest = 1). Written only when creation fails.
 #[unsafe(no_mangle)]
 pub extern "C" fn vane_ffi_client_create(
     config: *const VaneFfiClientConfig,
     out_error: *mut VaneFfiBuffer,
+    out_error_kind: *mut u32,
 ) -> u64 {
     ffi_clear_error(out_error);
+    let fail = |error: VaneError| {
+        if !out_error_kind.is_null() {
+            unsafe { *out_error_kind = error.ffi_kind() };
+        }
+        ffi_set_error(out_error, error.to_string());
+        0
+    };
     match std::panic::catch_unwind(|| ffi_create_client(config)) {
         Ok(Ok(handle)) => handle,
-        Ok(Err(error)) => {
-            ffi_set_error(out_error, error);
-            0
-        }
-        Err(_) => {
-            ffi_set_error(
-                out_error,
-                "Rust panic while creating Vane client".to_string(),
-            );
-            0
-        }
+        Ok(Err(error)) => fail(error),
+        Err(_) => fail(VaneError::Generic(
+            "Rust panic while creating Vane client".to_string(),
+        )),
     }
+}
+
+/// Callback type: invoked on a Vane worker thread. `host` points into memory
+/// owned by the pending-request registry and stays valid until the request id
+/// is retired (reply received, or client destroyed) — safe for Dart's
+/// NativeCallable.listener asynchronous delivery.
+pub type VaneFfiDnsResolveCallback =
+    extern "C" fn(request_id: u64, host: VaneFfiString, user_data: *mut std::ffi::c_void);
+
+/// Install/replace/clear (callback = None) the resolver for a client.
+///
+/// Part of the v5 symbol inventory; a stub until the resolver batch wires the
+/// rendezvous — it always reports failure so a caller cannot believe a
+/// resolver is installed that no request will ever consult.
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_set_dns_resolver(
+    _client: u64,
+    _callback: Option<VaneFfiDnsResolveCallback>,
+    _user_data: *mut std::ffi::c_void,
+) -> bool {
+    false
+}
+
+/// Complete a resolution. `ips`: newline-separated IP literals, UTF-8;
+/// `is_error` true (or an empty list) fails the resolution loudly.
+/// Unknown/expired request ids are a safe no-op.
+///
+/// Part of the v5 symbol inventory; a no-op until the resolver batch wires
+/// the rendezvous (no resolver can be installed yet, so every id is unknown).
+#[unsafe(no_mangle)]
+pub extern "C" fn vane_ffi_dns_resolver_reply(
+    _request_id: u64,
+    _ips: VaneFfiString,
+    _is_error: bool,
+) {
 }
 
 #[unsafe(no_mangle)]
@@ -6215,6 +6450,7 @@ pub unsafe extern "C" fn vane_ffi_response_free(response: *mut VaneFfiResponse) 
         ffi_buffer_free(response.body_file_path);
         ffi_buffer_free(response.url);
         ffi_buffer_free(response.error);
+        ffi_buffer_free(response.remote_ip);
     }
 }
 
@@ -6305,13 +6541,18 @@ pub extern "C" fn vane_ffi_stream_close(stream: u64) {
     });
 }
 
-fn ffi_create_client(config: *const VaneFfiClientConfig) -> Result<u64, String> {
-    let config = ffi_config(config)?;
-    let client = Arc::new(VaneClient::new(config).map_err(|error| error.to_string())?);
+fn ffi_create_client(config: *const VaneFfiClientConfig) -> Result<u64, VaneError> {
+    // Typed end to end so `vane_ffi_client_create` can report the error kind:
+    // a config that fails to parse is an invalid request, same as one
+    // `VaneClient::new` refuses.
+    let config = ffi_config(config).map_err(VaneError::InvalidRequest)?;
+    let client = Arc::new(VaneClient::new(config)?);
     let handle = FFI_NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     FFI_CLIENTS
         .lock()
-        .map_err(|_| "Vane FFI client registry lock was poisoned".to_string())?
+        .map_err(|_| {
+            VaneError::Generic("Vane FFI client registry lock was poisoned".to_string())
+        })?
         .insert(handle, client);
     Ok(handle)
 }
@@ -6446,6 +6687,8 @@ fn ffi_response_from_vane(response: VaneResponse) -> VaneFfiResponse {
         ),
         url: ffi_buffer_from_vec(response.url.into_bytes()),
         error: ffi_buffer_from_vec(Vec::new()),
+        // v5 layout only; batch 2 of the rollout fills it from the response.
+        remote_ip: ffi_buffer_from_vec(Vec::new()),
     }
 }
 
@@ -6460,6 +6703,7 @@ fn ffi_error_response(error: VaneError) -> VaneFfiResponse {
         body_file_path: ffi_buffer_from_vec(Vec::new()),
         url: ffi_buffer_from_vec(Vec::new()),
         error: ffi_buffer_from_vec(error.to_string().into_bytes()),
+        remote_ip: ffi_buffer_from_vec(Vec::new()),
     }
 }
 
@@ -6535,6 +6779,35 @@ fn ffi_config(config: *const VaneFfiClientConfig) -> Result<VaneClientConfig, St
             config.proxy_authorization,
             "proxy_authorization",
         )?,
+        max_redirects: config.max_redirects,
+        tls_min_version: ffi_tls_version(config.tls_min_version)?,
+        tls_max_version: ffi_tls_version(config.tls_max_version)?,
+        // One concatenated bundle over the C ABI; PEM is concatenation-safe,
+        // so it lands as a one-element list.
+        custom_root_certificates: ffi_optional_string(
+            config.custom_root_ca_pem,
+            "custom_root_ca_pem",
+        )?
+        .map_or_else(Vec::new, |pem| vec![pem]),
+        client_certificate: {
+            let certificate_pem =
+                ffi_optional_string(config.client_certificate_pem, "client_certificate_pem")?;
+            let private_key_pem =
+                ffi_optional_string(config.client_private_key_pem, "client_private_key_pem")?;
+            match (certificate_pem, private_key_pem) {
+                (Some(certificate_pem), Some(private_key_pem)) => Some(VaneClientCertificate {
+                    certificate_pem,
+                    private_key_pem,
+                }),
+                (None, None) => None,
+                _ => {
+                    return Err(
+                        "clientCertificate requires both certificatePem and privateKeyPem"
+                            .to_string(),
+                    );
+                }
+            }
+        },
     })
 }
 
@@ -6561,6 +6834,17 @@ fn ffi_request(request: *const VaneFfiRequest) -> Result<VaneRequest, String> {
         timeout_seconds: ffi_optional_u64(request.timeout_seconds, "timeout_seconds")?,
         follow_redirects: request.follow_redirects,
     })
+}
+
+/// Decoder twin of [`ffi_protocol_mode`] for the v5 TLS-version bytes:
+/// 0 = unset, 12 = TLS 1.2, 13 = TLS 1.3.
+fn ffi_tls_version(value: u8) -> Result<Option<VaneTlsVersion>, String> {
+    match value {
+        0 => Ok(None),
+        12 => Ok(Some(VaneTlsVersion::Tls12)),
+        13 => Ok(Some(VaneTlsVersion::Tls13)),
+        _ => Err(format!("Invalid Vane TLS version: {value}")),
+    }
 }
 
 fn ffi_protocol_mode(value: u8) -> Result<VaneProtocolMode, String> {
@@ -6961,6 +7245,11 @@ mod tests {
             config.max_response_body_bytes,
             DEFAULT_MAX_RESPONSE_BODY_BYTES
         );
+        assert_eq!(config.max_redirects, 10);
+        assert_eq!(config.tls_min_version, None);
+        assert_eq!(config.tls_max_version, None);
+        assert!(config.custom_root_certificates.is_empty());
+        assert!(config.client_certificate.is_none());
     }
 
     #[test]
@@ -7186,6 +7475,106 @@ mod tests {
                 ..VaneClientConfig::default()
             })
             .is_ok()
+        );
+    }
+
+    /// The batch-1 knob validation set, all refused at construction like the
+    /// plaintext-proxy precedent above: the posture can never depend on which
+    /// transport ends up carrying a request.
+    #[test]
+    fn config_knobs_are_validated_at_construction() {
+        fn client_error(config: VaneClientConfig) -> String {
+            match VaneClient::new(config) {
+                Ok(_) => panic!("client construction should have failed"),
+                Err(err) => {
+                    assert!(
+                        matches!(err, VaneError::InvalidRequest(_)),
+                        "expected InvalidRequest, got {err:?}"
+                    );
+                    err.to_string()
+                }
+            }
+        }
+
+        // The redirect hop cap is a security bound and stays one.
+        let err = client_error(VaneClientConfig {
+            max_redirects: 65,
+            ..VaneClientConfig::default()
+        });
+        assert!(err.contains("maxRedirects must be at most 64"), "got {err}");
+        assert!(
+            VaneClient::new(VaneClientConfig {
+                max_redirects: 64,
+                ..VaneClientConfig::default()
+            })
+            .is_ok()
+        );
+
+        // An inverted version range can never be satisfied by any transport.
+        let err = client_error(VaneClientConfig {
+            tls_min_version: Some(VaneTlsVersion::Tls13),
+            tls_max_version: Some(VaneTlsVersion::Tls12),
+            ..VaneClientConfig::default()
+        });
+        assert!(
+            err.contains("tlsMinVersion must not exceed tlsMaxVersion"),
+            "got {err}"
+        );
+
+        // The classic trap, refused loudly: a 1.2 ceiling with an H3-capable
+        // mode would be silently ignored by QUIC (TLS 1.3-always, RFC 9001).
+        for mode in [
+            VaneProtocolMode::Http3Only,
+            VaneProtocolMode::Http3ThenHttp2ThenHttp1,
+        ] {
+            let err = client_error(VaneClientConfig {
+                tls_max_version: Some(VaneTlsVersion::Tls12),
+                protocol_mode: mode,
+                ..VaneClientConfig::default()
+            });
+            assert!(
+                err.contains("incompatible with HTTP/3"),
+                "got {err}"
+            );
+        }
+        // The same ceiling is fine when no transport would ignore it, and a
+        // 1.3 floor is fine everywhere (H3 already is 1.3).
+        assert!(
+            VaneClient::new(VaneClientConfig {
+                tls_max_version: Some(VaneTlsVersion::Tls12),
+                protocol_mode: VaneProtocolMode::Http2ThenHttp1,
+                ..VaneClientConfig::default()
+            })
+            .is_ok()
+        );
+        assert!(
+            VaneClient::new(VaneClientConfig {
+                tls_min_version: Some(VaneTlsVersion::Tls13),
+                ..VaneClientConfig::default()
+            })
+            .is_ok()
+        );
+
+        // Parsed-then-rejected guards: a trust posture the client would not
+        // yet apply must never construct silently.
+        let err = client_error(VaneClientConfig {
+            custom_root_certificates: vec!["-----BEGIN CERTIFICATE-----".to_string()],
+            ..VaneClientConfig::default()
+        });
+        assert!(
+            err.contains("customRootCertificates is not implemented yet"),
+            "got {err}"
+        );
+        let err = client_error(VaneClientConfig {
+            client_certificate: Some(VaneClientCertificate {
+                certificate_pem: "cert".to_string(),
+                private_key_pem: "key".to_string(),
+            }),
+            ..VaneClientConfig::default()
+        });
+        assert!(
+            err.contains("clientCertificate is not implemented yet"),
+            "got {err}"
         );
     }
 
@@ -7837,7 +8226,10 @@ mod tests {
         pins: &HashMap<String, Vec<String>>,
     ) -> RedirectDecision {
         let request = request(&from.to_string());
-        next_redirect_url(status, Some(location), from, &request, hops, pins)
+        // The config default cap; the parameterized-cap cases are the
+        // h3_offline chain test and its `tcp::tests` twin.
+        let max_redirects = VaneClientConfig::default().max_redirects;
+        next_redirect_url(status, Some(location), from, &request, hops, max_redirects, pins)
     }
 
     fn followed(decision: RedirectDecision) -> Option<String> {
@@ -7932,12 +8324,13 @@ mod tests {
             Some("https://a.example/x, https://b.example/".to_string())
         );
         // Hop cap, enforced on the last allowed hop and the one after it.
+        let cap = VaneClientConfig::default().max_redirects as usize;
         assert!(matches!(
-            redirect(302, "/home", &from, MAX_REDIRECTS - 1, &unpinned),
+            redirect(302, "/home", &from, cap - 1, &unpinned),
             RedirectDecision::Follow(_)
         ));
         assert_eq!(
-            redirect(302, "/home", &from, MAX_REDIRECTS, &unpinned),
+            redirect(302, "/home", &from, cap, &unpinned),
             Refused(REDIRECT_REFUSED_HOP_CAP)
         );
         // Not a redirect status, empty Location, no Location, opted out: all
@@ -7951,6 +8344,7 @@ mod tests {
                 &from,
                 &request("https://api.example.com/login"),
                 0,
+                10,
                 &unpinned
             ),
             Stop
@@ -7958,7 +8352,7 @@ mod tests {
         let mut no_follow = request("https://api.example.com/login");
         no_follow.follow_redirects = false;
         assert_eq!(
-            next_redirect_url(302, Some("/home"), &from, &no_follow, 0, &unpinned),
+            next_redirect_url(302, Some("/home"), &from, &no_follow, 0, 10, &unpinned),
             Stop
         );
     }
@@ -8143,6 +8537,7 @@ mod tests {
                 deadline,
                 idle: Duration::from_secs(30),
             },
+            max_redirects: VaneClientConfig::default().max_redirects,
         }
         .run(&url, request_body, |hop| {
             seen.push(SeenHop {
@@ -8183,8 +8578,11 @@ mod tests {
             },
         );
 
-        // The cap allows MAX_REDIRECTS hops, so MAX_REDIRECTS + 1 requests.
-        assert_eq!(seen.len(), MAX_REDIRECTS + 1);
+        // The cap allows `max_redirects` hops, so cap + 1 requests.
+        assert_eq!(
+            seen.len(),
+            VaneClientConfig::default().max_redirects as usize + 1
+        );
         let response = result.unwrap();
         assert_eq!(response.status_code, 302);
         assert_eq!(
@@ -8866,7 +9264,11 @@ mod tests {
     /// cannot land without the author reading that contract.
     #[test]
     fn c_abi_version_is_the_one_the_dart_bindings_expect() {
-        assert_eq!(vane_ffi_abi_version(), 4);
+        // v5: the config-knobs layout + `vane_ffi_client_create` signature
+        // change. `_expectedAbiVersion` in `vane_flutter_ffi.dart` moves to 5
+        // in the same change-set — lockstep is load-bearing this time, not
+        // just convention (a stale side corrupts the create call frame).
+        assert_eq!(vane_ffi_abi_version(), 5);
     }
 
     /// `VaneFfiRequest` layout, pinned since v4 grew it. `body_stream_id` is
@@ -8911,6 +9313,222 @@ mod tests {
     /// contract (the buffer is the success discriminator, the return value
     /// the kind) and free's idempotence are what the Dart writer isolate
     /// builds on.
+    fn test_ffi_client_config() -> VaneFfiClientConfig {
+        // FFI twin of the documented defaults: every pointer null, every
+        // scalar its default, so a test mutates only the field it means.
+        let null_string = || VaneFfiString {
+            data: ptr::null(),
+            len: 0,
+        };
+        VaneFfiClientConfig {
+            base_url: null_string(),
+            default_headers: ptr::null(),
+            default_headers_len: 0,
+            dns_overrides: ptr::null(),
+            dns_overrides_len: 0,
+            certificate_pins: ptr::null(),
+            certificate_pins_len: 0,
+            cookies_enabled: false,
+            cookie_persistence_path: null_string(),
+            connection_pool_enabled: true,
+            max_idle_connections: 4,
+            connection_idle_timeout_seconds: 25,
+            retry_max_attempts: 1,
+            retry_initial_delay_millis: 100,
+            retry_max_delay_millis: 1_000,
+            retry_unsafe_methods: false,
+            max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
+            max_response_body_bytes: DEFAULT_MAX_RESPONSE_BODY_BYTES,
+            timeout_seconds: 30,
+            follow_redirects: true,
+            user_agent: null_string(),
+            protocol_mode: 1,
+            proxy_url: null_string(),
+            proxy_authorization: null_string(),
+            max_redirects: 10,
+            tls_min_version: 0,
+            tls_max_version: 0,
+            custom_root_ca_pem: null_string(),
+            client_certificate_pem: null_string(),
+            client_private_key_pem: null_string(),
+        }
+    }
+
+    /// Every `VaneFfiClientConfig` member reaches the parsed
+    /// `VaneClientConfig` — the C parse layer had no test at all before v5.
+    #[test]
+    fn ffi_config_round_trips_every_field() {
+        let s = |value: &'static str| VaneFfiString {
+            data: value.as_ptr(),
+            len: value.len(),
+        };
+
+        let default_headers = [VaneFfiStringPair {
+            key: s("x-app"),
+            value: s("vane"),
+        }];
+        let dns_overrides = [VaneFfiStringPair {
+            key: s("api.example.com"),
+            value: s("203.0.113.7"),
+        }];
+        let pin_values = [s("sha256/AAAA"), s("sha256/BBBB")];
+        let certificate_pins = [VaneFfiStringListPair {
+            key: s("pinned.example.com"),
+            values: VaneFfiStringList {
+                values: pin_values.as_ptr(),
+                len: pin_values.len(),
+            },
+        }];
+        let root_pem = "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n";
+
+        let config = VaneFfiClientConfig {
+            base_url: s("https://api.example.com"),
+            default_headers: default_headers.as_ptr(),
+            default_headers_len: default_headers.len(),
+            dns_overrides: dns_overrides.as_ptr(),
+            dns_overrides_len: dns_overrides.len(),
+            certificate_pins: certificate_pins.as_ptr(),
+            certificate_pins_len: certificate_pins.len(),
+            cookies_enabled: true,
+            cookie_persistence_path: s("/tmp/vane-cookies.json"),
+            connection_pool_enabled: true,
+            max_idle_connections: 7,
+            connection_idle_timeout_seconds: 21,
+            retry_max_attempts: 3,
+            retry_initial_delay_millis: 50,
+            retry_max_delay_millis: 900,
+            retry_unsafe_methods: true,
+            max_request_body_bytes: 1_024,
+            max_response_body_bytes: 2_048,
+            timeout_seconds: 42,
+            follow_redirects: false,
+            user_agent: s("vane-test/1"),
+            protocol_mode: 2,
+            proxy_url: s("https://proxy.example.com:8443"),
+            proxy_authorization: s("Basic dXNlcjpwYXNz"),
+            max_redirects: 5,
+            tls_min_version: 12,
+            tls_max_version: 13,
+            custom_root_ca_pem: s(root_pem),
+            client_certificate_pem: s("client-cert-pem"),
+            client_private_key_pem: s("client-key-pem"),
+        };
+
+        let parsed = ffi_config(&config).unwrap();
+
+        assert_eq!(parsed.base_url.as_deref(), Some("https://api.example.com"));
+        assert_eq!(
+            parsed.default_headers,
+            HashMap::from([("x-app".to_string(), "vane".to_string())])
+        );
+        assert_eq!(
+            parsed.dns_overrides,
+            HashMap::from([("api.example.com".to_string(), "203.0.113.7".to_string())])
+        );
+        assert_eq!(
+            parsed.certificate_pins,
+            HashMap::from([(
+                "pinned.example.com".to_string(),
+                vec!["sha256/AAAA".to_string(), "sha256/BBBB".to_string()],
+            )])
+        );
+        assert!(parsed.cookies_enabled);
+        assert_eq!(
+            parsed.cookie_persistence_path.as_deref(),
+            Some("/tmp/vane-cookies.json")
+        );
+        assert!(parsed.connection_pool_enabled);
+        assert_eq!(parsed.max_idle_connections, 7);
+        assert_eq!(parsed.connection_idle_timeout_seconds, 21);
+        assert_eq!(parsed.retry_max_attempts, 3);
+        assert_eq!(parsed.retry_initial_delay_millis, 50);
+        assert_eq!(parsed.retry_max_delay_millis, 900);
+        assert!(parsed.retry_unsafe_methods);
+        assert_eq!(parsed.max_request_body_bytes, 1_024);
+        assert_eq!(parsed.max_response_body_bytes, 2_048);
+        assert_eq!(parsed.timeout_seconds, Some(42));
+        assert!(!parsed.follow_redirects);
+        assert_eq!(parsed.user_agent.as_deref(), Some("vane-test/1"));
+        assert_eq!(parsed.protocol_mode, VaneProtocolMode::Http2ThenHttp1);
+        assert_eq!(
+            parsed.proxy_url.as_deref(),
+            Some("https://proxy.example.com:8443")
+        );
+        assert_eq!(
+            parsed.proxy_authorization.as_deref(),
+            Some("Basic dXNlcjpwYXNz")
+        );
+        assert_eq!(parsed.max_redirects, 5);
+        assert_eq!(parsed.tls_min_version, Some(VaneTlsVersion::Tls12));
+        assert_eq!(parsed.tls_max_version, Some(VaneTlsVersion::Tls13));
+        assert_eq!(parsed.custom_root_certificates, vec![root_pem.to_string()]);
+        let cert = parsed.client_certificate.expect("client certificate");
+        assert_eq!(cert.certificate_pem, "client-cert-pem");
+        assert_eq!(cert.private_key_pem, "client-key-pem");
+
+        // The unset shape decodes to the defaults the null pointer would give.
+        let parsed = ffi_config(&test_ffi_client_config()).unwrap();
+        assert_eq!(parsed.max_redirects, 10);
+        assert_eq!(parsed.tls_min_version, None);
+        assert_eq!(parsed.tls_max_version, None);
+        assert!(parsed.custom_root_certificates.is_empty());
+        assert!(parsed.client_certificate.is_none());
+
+        // Cert and key only travel as a pair.
+        let mut xor = test_ffi_client_config();
+        xor.client_certificate_pem = s("client-cert-pem");
+        let err = ffi_config(&xor).unwrap_err();
+        assert!(
+            err.contains("clientCertificate requires both certificatePem and privateKeyPem"),
+            "{err}"
+        );
+
+        // The version byte is a closed set: 0, 12, 13.
+        let mut bad_version = test_ffi_client_config();
+        bad_version.tls_min_version = 11;
+        let err = ffi_config(&bad_version).unwrap_err();
+        assert!(err.contains("Invalid Vane TLS version"), "{err}");
+    }
+
+    /// The v5 `out_error_kind` contract on `vane_ffi_client_create`: a
+    /// validation failure reports InvalidRequest (kind 1) instead of the
+    /// kind-less string Dart used to flatten to `unknown`, a null out-param
+    /// stays safe, and success leaves the out-param untouched.
+    #[test]
+    fn ffi_client_create_reports_error_kind() {
+        let empty_buffer = || VaneFfiBuffer {
+            data: ptr::null_mut(),
+            len: 0,
+            cap: 0,
+        };
+
+        let mut config = test_ffi_client_config();
+        config.max_redirects = 65;
+        let mut error = empty_buffer();
+        let mut kind: u32 = 0;
+        let handle = vane_ffi_client_create(&config, &mut error, &mut kind);
+        assert_eq!(handle, 0);
+        assert!(error.len > 0, "expected a non-empty error buffer");
+        assert_eq!(kind, VaneError::InvalidRequest(String::new()).ffi_kind());
+        vane_ffi_buffer_free(error);
+
+        // A null `out_error_kind` is explicitly allowed ("ignored when null").
+        let mut error = empty_buffer();
+        let handle = vane_ffi_client_create(&config, &mut error, ptr::null_mut());
+        assert_eq!(handle, 0);
+        assert!(error.len > 0);
+        vane_ffi_buffer_free(error);
+
+        // Written only when creation fails: success keeps the sentinel.
+        let mut error = empty_buffer();
+        let mut kind: u32 = 77;
+        let handle = vane_ffi_client_create(&test_ffi_client_config(), &mut error, &mut kind);
+        assert_ne!(handle, 0);
+        assert_eq!(error.len, 0);
+        assert_eq!(kind, 77, "out_error_kind must only be written on failure");
+        vane_ffi_client_close(handle);
+    }
+
     #[test]
     fn ffi_body_stream_symbols_round_trip_with_kinds() {
         let empty_buffer = || VaneFfiBuffer {
@@ -8990,7 +9608,7 @@ mod tests {
             len: 0,
             cap: 0,
         };
-        let client = vane_ffi_client_create(ptr::null(), &mut create_error);
+        let client = vane_ffi_client_create(ptr::null(), &mut create_error, ptr::null_mut());
         assert_ne!(client, 0);
         assert_eq!(create_error.len, 0);
 

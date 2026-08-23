@@ -658,7 +658,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{TEST_HOST, TestH3Server, test_pki};
-    use crate::{VaneClient, VaneClientConfig, sha256_pin, test_request};
+    use crate::{
+        REDIRECT_REFUSED_HEADER, REDIRECT_REFUSED_HOP_CAP, VaneClient, VaneClientConfig,
+        sha256_pin, test_request,
+    };
 
     fn offline_client(config: VaneClientConfig) -> VaneClient {
         VaneClient::new(VaneClientConfig {
@@ -822,6 +825,40 @@ mod tests {
             response.url.ends_with("/get"),
             "redirect chain should end on /get, got {}",
             response.url
+        );
+    }
+
+    /// The `max_redirects` knob on the wire: the same 3-hop chain is a
+    /// hop-cap refusal one hop short of the cap it needs and a success at
+    /// exactly that cap. The TCP twin is
+    /// `tcp::tests::redirect_chain_honours_the_configured_hop_cap`.
+    #[test]
+    fn redirect_chain_honours_the_configured_hop_cap() {
+        let server = TestH3Server::start();
+
+        let refused = offline_client(VaneClientConfig {
+            max_redirects: 2,
+            ..VaneClientConfig::default()
+        })
+        .execute(test_request(&server.url("/redirect/3")))
+        .unwrap();
+        assert_eq!(refused.status_code, 302);
+        assert_eq!(
+            refused.headers.get(REDIRECT_REFUSED_HEADER).map(|s| &**s),
+            Some(REDIRECT_REFUSED_HOP_CAP)
+        );
+
+        let followed = offline_client(VaneClientConfig {
+            max_redirects: 3,
+            ..VaneClientConfig::default()
+        })
+        .execute(test_request(&server.url("/redirect/3")))
+        .unwrap();
+        assert!(followed.is_success);
+        assert!(
+            followed.url.ends_with("/get"),
+            "redirect chain should end on /get, got {}",
+            followed.url
         );
     }
 

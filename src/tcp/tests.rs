@@ -373,6 +373,19 @@ fn local_tls_server<F>(
 where
     F: Fn(TlsStream) + Send + Sync + 'static,
 {
+    local_tls_server_with_versions(rustls::DEFAULT_VERSIONS, alpn, handle)
+}
+
+/// [`local_tls_server`] with the server's TLS versions pinned, so a test can
+/// stand up e.g. a TLS 1.2-only peer for the `tls_min_version` knob.
+fn local_tls_server_with_versions<F>(
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    alpn: &[u8],
+    handle: F,
+) -> (u16, CertificateDer<'static>, CertificateDer<'static>)
+where
+    F: Fn(TlsStream) + Send + Sync + 'static,
+{
     use rustls::pki_types::PrivateKeyDer;
     use rustls::{ServerConfig, ServerConnection};
 
@@ -392,7 +405,7 @@ where
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut server_config = ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(versions)
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(vec![leaf_der], leaf_pkcs8)
@@ -425,7 +438,16 @@ where
 fn raw_http_server(
     routes: &'static [(&'static str, &'static str)],
 ) -> (u16, CertificateDer<'static>) {
-    let (port, ca, _leaf) = local_tls_server(b"http/1.1", move |mut tls| {
+    let (port, ca, _leaf) = local_tls_server(b"http/1.1", raw_http_handler(routes));
+    (port, ca)
+}
+
+/// The scripted-response handler [`raw_http_server`] runs, split out so a
+/// test can pair it with [`local_tls_server_with_versions`].
+fn raw_http_handler(
+    routes: &'static [(&'static str, &'static str)],
+) -> impl Fn(TlsStream) + Send + Sync + 'static {
+    move |mut tls| {
         let mut buf = [0u8; 8192];
         let mut pending = Vec::new();
         loop {
@@ -452,8 +474,7 @@ fn raw_http_server(
                 std::io::Write::flush(&mut tls).ok();
             }
         }
-    });
-    (port, ca)
+    }
 }
 
 /// Installs `ca` as the process-wide trust anchor for the duration of the
@@ -633,7 +654,7 @@ fn tls_config_offers_alpn_per_protocol_mode() {
     // reqwest leaves a preconfigured config's ALPN alone, so without these
     // HTTP/2 is never negotiated at all.
     let alpn = |mode| {
-        tls_config(&mode, HashMap::new())
+        tls_config(&mode, HashMap::new(), None, None)
             .unwrap()
             .alpn_protocols
             .clone()
@@ -752,12 +773,104 @@ fn target(
     let response = reqwest::blocking::Response::from(raw.body(Vec::new()).unwrap());
     let mut request = crate::test_request(&current.to_string());
     request.follow_redirects = true;
-    match redirect_target(&response, current, &request, 0, pins) {
+    match redirect_target(&response, current, &request, 0, 10, pins) {
         RedirectDecision::Follow(url) => Some(url),
         // The reasons are asserted in the shared gate's own tests; here only
         // "did the TCP adapter hand back a hop" matters.
         RedirectDecision::Stop | RedirectDecision::Refused(_) => None,
     }
+}
+
+/// TCP twin of `h3_offline::tests::redirect_chain_honours_the_configured_hop_cap`:
+/// the same 3-hop chain, refused at `max_redirects = 2`, followed at 3 —
+/// pinning that both transports share one cap decision.
+#[test]
+fn redirect_chain_honours_the_configured_hop_cap() {
+    let (port, ca) = raw_http_server(&[
+        (
+            "/a",
+            "HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\n\r\n",
+        ),
+        (
+            "/b",
+            "HTTP/1.1 302 Found\r\nLocation: /c\r\nContent-Length: 0\r\n\r\n",
+        ),
+        (
+            "/c",
+            "HTTP/1.1 302 Found\r\nLocation: /d\r\nContent-Length: 0\r\n\r\n",
+        ),
+        (
+            "/d",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        ),
+    ]);
+    let _guard = with_test_root(ca);
+    let client = |max_redirects: u32| {
+        client_with(VaneClientConfig {
+            base_url: Some(format!("https://localhost:{port}")),
+            protocol_mode: VaneProtocolMode::Http1Only,
+            timeout_seconds: Some(10),
+            max_redirects,
+            ..VaneClientConfig::default()
+        })
+    };
+
+    let refused = client(2).execute(crate::test_request("/a")).unwrap();
+    assert_eq!(refused.status_code, 302);
+    assert_eq!(
+        refused.headers.get(REDIRECT_REFUSED_HEADER).map(|s| &**s),
+        Some(crate::REDIRECT_REFUSED_HOP_CAP)
+    );
+
+    let followed = client(3).execute(crate::test_request("/a")).unwrap();
+    assert!(followed.is_success);
+    assert!(
+        followed.url.ends_with("/d"),
+        "redirect chain should end on /d, got {}",
+        followed.url
+    );
+}
+
+/// The one real TLS-version enforcement site: `tls_min_version = tls13` on
+/// the TCP path refuses a TLS 1.2-only server that the default posture
+/// accepts. (HTTP/3 has no enforcement to test — QUIC is TLS 1.3-always, and
+/// the incompatible combination is refused at construction.)
+#[test]
+fn tls_min_13_refuses_a_tls12_only_server() {
+    static ROUTES: &[(&str, &str)] = &[(
+        "/",
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    )];
+    let (port, ca, _leaf) = local_tls_server_with_versions(
+        &[&rustls::version::TLS12],
+        b"http/1.1",
+        raw_http_handler(ROUTES),
+    );
+    let _guard = with_test_root(ca);
+    let client = |tls_min_version: Option<VaneTlsVersion>| {
+        client_with(VaneClientConfig {
+            base_url: Some(format!("https://localhost:{port}")),
+            protocol_mode: VaneProtocolMode::Http1Only,
+            timeout_seconds: Some(10),
+            tls_min_version,
+            ..VaneClientConfig::default()
+        })
+    };
+
+    // Control half: the server itself is reachable under the default
+    // posture (TLS 1.2 + 1.3), so the refusal below is the knob's doing.
+    let response = client(None).execute(crate::test_request("/")).unwrap();
+    assert!(response.is_success);
+
+    // With the floor raised to 1.3 the handshake has no common version and
+    // the request fails before any HTTP happens.
+    let err = client(Some(VaneTlsVersion::Tls13))
+        .execute(crate::test_request("/"))
+        .unwrap_err();
+    assert!(
+        !matches!(err, VaneError::InvalidRequest(_)),
+        "expected a handshake failure, not a config rejection: {err}"
+    );
 }
 
 #[test]

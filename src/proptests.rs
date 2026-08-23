@@ -639,6 +639,7 @@ fn check_redirect_gate(
     current: &Url,
     follow: bool,
     hops: usize,
+    max_redirects: u32,
     pin_current_host: bool,
 ) {
     let mut request = test_request(&current.to_string());
@@ -650,15 +651,24 @@ fn check_redirect_gate(
             vec!["sha256/AAAA".to_string()],
         );
     }
-    if let RedirectDecision::Follow(next) =
-        next_redirect_url(status, Some(location), current, &request, hops, &pins)
-    {
+    if let RedirectDecision::Follow(next) = next_redirect_url(
+        status,
+        Some(location),
+        current,
+        &request,
+        hops,
+        max_redirects,
+        &pins,
+    ) {
         assert!(follow, "followed a redirect the caller opted out of");
         assert!(
             (300..400).contains(&status),
             "followed a non-3xx status {status}"
         );
-        assert!(hops < MAX_REDIRECTS, "followed past the hop cap");
+        assert!(
+            hops < max_redirects as usize,
+            "followed past the hop cap"
+        );
         assert_eq!(next.scheme(), "https", "followed a cleartext downgrade");
         if pin_current_host {
             assert_eq!(
@@ -840,10 +850,13 @@ proptest! {
             "http://example.com/",
         ]),
         follow in any::<bool>(),
-        hops in 0..(MAX_REDIRECTS + 3),
+        // Past both sides of any cap the config validator admits (<= 64),
+        // including the cap-0 "first 3xx already refused" edge.
+        hops in 0usize..70,
+        max_redirects in 0u32..67,
         pin_current_host in any::<bool>(),
     ) {
-        check_redirect_gate(status, &location, &current, follow, hops, pin_current_host);
+        check_redirect_gate(status, &location, &current, follow, hops, max_redirects, pin_current_host);
     }
 
     #[test]

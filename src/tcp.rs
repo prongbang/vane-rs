@@ -30,7 +30,7 @@ use super::{
     BodyStep, H3_BODY_BUFFER_BYTES, REDIRECT_REFUSED_HEADER, RedirectDecision, RedirectRewrite,
     RequestBodyStream, ResponseState, StreamingBodySource, StreamingHopResult, Url, VaneClient,
     VaneError, VaneHttpVersion, VaneProgressState, VaneProtocolMode, VaneRequest, VaneResponse,
-    VaneResponseStream, cancel_token, check_cancelled, for_each_regular_header,
+    VaneResponseStream, VaneTlsVersion, cancel_token, check_cancelled, for_each_regular_header,
     header_survives_origin_change, may_resume_tls_session, next_redirect_url, origin_port,
     progress_download, progress_handle, progress_init, progress_upload, redact_url_userinfo,
     redirect_rewrite, resolve_peer_addr, streaming_head, upload_total, verify_certificate_pins,
@@ -352,6 +352,8 @@ fn check_android_trust_ready() -> Result<(), VaneError> {
 fn tls_config(
     mode: &VaneProtocolMode,
     certificate_pins: HashMap<String, Vec<String>>,
+    tls_min_version: Option<VaneTlsVersion>,
+    tls_max_version: Option<VaneTlsVersion>,
 ) -> Result<ClientConfig, VaneError> {
     // Before `Verifier::new`, not after: this is the only place a platform
     // verifier is constructed, so every TCP request is covered by this one
@@ -370,9 +372,19 @@ fn tls_config(
         .map(|(host, _)| host.to_ascii_lowercase())
         .collect();
 
-    // `with_safe_default_protocol_versions` is TLS 1.2 + 1.3.
+    // Unset bounds mean rustls's defaults: TLS 1.2 + 1.3. `min > max` was
+    // rejected at construction, so the filtered list is never empty. This is
+    // the only enforcement site — HTTP/3 is TLS 1.3-always (quiche pins it
+    // per connection; RFC 9001), which construction validation accounts for.
+    let mut versions: Vec<&'static rustls::SupportedProtocolVersion> = Vec::new();
+    if tls_min_version.unwrap_or(VaneTlsVersion::Tls12) == VaneTlsVersion::Tls12 {
+        versions.push(&rustls::version::TLS12);
+    }
+    if tls_max_version.unwrap_or(VaneTlsVersion::Tls13) == VaneTlsVersion::Tls13 {
+        versions.push(&rustls::version::TLS13);
+    }
     let mut config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(&versions)
         .map_err(|e| VaneError::Tls(format!("Failed to configure TLS versions: {e}")))?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedServerCertVerifier {
@@ -473,7 +485,12 @@ fn build_client(
     certificate_pins: HashMap<String, Vec<String>>,
 ) -> Result<SharedTcpClient, VaneError> {
     let config = &client.config;
-    let tls = tls_config(&config.protocol_mode, certificate_pins)?;
+    let tls = tls_config(
+        &config.protocol_mode,
+        certificate_pins,
+        config.tls_min_version,
+        config.tls_max_version,
+    )?;
     let mut builder = Client::builder()
         // A clone shares the verifier and session cache by `Arc`, so the
         // retained copy IS the client's TLS identity, not a twin.
@@ -1059,7 +1076,14 @@ fn follow(
             }
         }
 
-        let next = match redirect_target(&response, &current, request, hops, certificate_pins) {
+        let next = match redirect_target(
+            &response,
+            &current,
+            request,
+            hops,
+            client.config.max_redirects,
+            certificate_pins,
+        ) {
             RedirectDecision::Stop => break response,
             RedirectDecision::Refused(reason) => {
                 refused = Some(reason);
@@ -1408,6 +1432,7 @@ fn redirect_target(
     current: &Url,
     request: &VaneRequest,
     hops: usize,
+    max_redirects: u32,
     certificate_pins: &HashMap<String, Vec<String>>,
 ) -> RedirectDecision {
     // `get` takes the first Location if a server sent several; a response with
@@ -1423,6 +1448,7 @@ fn redirect_target(
         current,
         request,
         hops,
+        max_redirects,
         certificate_pins,
     )
 }
