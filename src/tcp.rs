@@ -21,20 +21,21 @@ use reqwest::redirect;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{
     ClientSessionMemoryCache, ClientSessionStore, Resumption, Tls12ClientSessionValue,
-    Tls13ClientSessionValue,
+    Tls13ClientSessionValue, WebPkiServerVerifier,
 };
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, NamedGroup, SignatureScheme};
 
 use super::{
-    BodyStep, H3_BODY_BUFFER_BYTES, REDIRECT_REFUSED_HEADER, RedirectDecision, RedirectRewrite,
-    RequestBodyStream, ResponseState, StreamingBodySource, StreamingHopResult, Url, VaneClient,
-    VaneError, VaneHeader, VaneHttpVersion, VaneProgressState, VaneProtocolMode, VaneRequest,
-    VaneResponse, VaneResponseStream, VaneTlsVersion, cancel_token, check_cancelled,
-    for_each_regular_header, header_survives_origin_change, may_resume_tls_session,
-    next_redirect_url, origin_port, progress_download, progress_handle, progress_init,
-    progress_upload, redact_url_userinfo, redirect_rewrite, resolve_peer_addr, streaming_head,
-    upload_total, verify_certificate_pins,
+    BodyStep, ClientIdentity, H3_BODY_BUFFER_BYTES, REDIRECT_REFUSED_HEADER, RedirectDecision,
+    RedirectRewrite, RequestBodyStream, ResponseState, StreamingBodySource, StreamingHopResult,
+    Url, VaneClient, VaneClientConfig, VaneError, VaneHeader, VaneHttpVersion, VaneProgressState,
+    VaneProtocolMode, VaneRequest, VaneResponse, VaneResponseStream, VaneTlsVersion, cancel_token,
+    check_cancelled, for_each_regular_header, header_survives_origin_change,
+    may_resume_tls_session, next_redirect_url, origin_port, progress_download, progress_handle,
+    progress_init, progress_upload, redact_url_userinfo, redirect_rewrite, resolve_peer_addr,
+    streaming_head, upload_total, verify_certificate_pins,
 };
 
 /// Wraps the platform's own certificate verifier and adds Vane's host-scoped
@@ -123,6 +124,130 @@ fn pin_lookup_host(server_name: &ServerName<'_>) -> Option<String> {
         }),
         _ => None,
     }
+}
+
+/// OR-composes the platform verifier with a webpki verifier over the
+/// caller's `custom_root_certificates`: a chain is accepted iff EITHER full
+/// verifier accepts it. Each arm performs complete chain, name and validity
+/// verification over its own root set, so the composition is exactly
+/// extend-only semantics — it cannot accept anything outside the union of
+/// the two trust sets.
+///
+/// One uniform mechanism on every platform, deliberately: Android's platform
+/// verifier has no extra-roots API at all, so a per-OS `new_with_extra_roots`
+/// would be a build break or a silent no-op there. Built only when the list
+/// is non-empty; [`PinnedServerCertVerifier`] wraps THIS, so pins are
+/// enforced above whichever arm accepted.
+///
+/// Revocation asymmetry, by design: the custom arm is pure webpki with no
+/// revocation checking (no CRLs are configured), while the platform arm
+/// inherits the OS verifier's revocation behavior (Apple/Windows check;
+/// rustls-platform-verifier's Android and Linux arms do not). So on
+/// platforms that check, a chain the platform arm rejects as REVOKED is
+/// still accepted here whenever the custom roots also anchor it — custom
+/// roots are for private CAs whose revocation the deployer owns.
+#[derive(Debug)]
+struct ExtendedTrustVerifier {
+    platform: Arc<dyn ServerCertVerifier>,
+    custom: Arc<WebPkiServerVerifier>,
+}
+
+impl ServerCertVerifier for ExtendedTrustVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        match self.platform.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Ok(verified) => Ok(verified),
+            Err(platform_err) => self
+                .custom
+                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+                // Both arms refused: report the platform's error — platform
+                // trust is the rule callers reason about, custom roots the
+                // exception.
+                .map_err(|_| platform_err),
+        }
+    }
+
+    // Signature checks are chain-independent; the platform arm's schemes are
+    // what the handshake offered, so it stays the authority for them.
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.platform.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.platform.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.platform.supported_verify_schemes()
+    }
+}
+
+/// Parses every `custom_root_certificates` entry into one root store. Shared
+/// by `VaneClient::new` (so a bad entry fails construction) and [`tls_config`]
+/// (which builds the webpki arm over it); the error names the entry index
+/// only — never certificate content.
+pub(crate) fn parse_custom_roots(entries: &[String]) -> Result<rustls::RootCertStore, VaneError> {
+    let mut roots = rustls::RootCertStore::empty();
+    for (index, pem) in entries.iter().enumerate() {
+        let invalid = || {
+            VaneError::InvalidRequest(format!(
+                "customRootCertificates[{index}] is not valid PEM certificate data"
+            ))
+        };
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem.as_bytes())
+            .collect::<Result<_, _>>()
+            .map_err(|_| invalid())?;
+        if certs.is_empty() {
+            return Err(invalid());
+        }
+        for cert in certs {
+            roots.add(cert).map_err(|_| invalid())?;
+        }
+    }
+    Ok(roots)
+}
+
+/// Parses the client certificate's PEM chain + key into rustls types. Shared
+/// by `VaneClient::new` (construction-time validation) and [`tls_config`];
+/// error messages are fixed strings — no PEM or key material, ever.
+pub(crate) fn parse_client_identity(
+    identity: &ClientIdentity,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), VaneError> {
+    let invalid_chain =
+        || VaneError::InvalidRequest("clientCertificate PEM did not parse".to_string());
+    let chain: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(identity.chain_pem.as_bytes())
+            .collect::<Result<_, _>>()
+            .map_err(|_| invalid_chain())?;
+    if chain.is_empty() {
+        return Err(invalid_chain());
+    }
+    let key = PrivateKeyDer::from_pem_slice(identity.key_pem.as_bytes()).map_err(|_| {
+        VaneError::InvalidRequest("clientCertificate privateKey did not parse".to_string())
+    })?;
+    Ok((chain, key))
 }
 
 /// The TCP spelling of the HTTP/3 rule in [`super::may_resume_tls_session`]:
@@ -351,10 +476,9 @@ fn check_android_trust_ready() -> Result<(), VaneError> {
 }
 
 fn tls_config(
-    mode: &VaneProtocolMode,
+    config: &VaneClientConfig,
+    client_identity: Option<&ClientIdentity>,
     certificate_pins: HashMap<String, Vec<String>>,
-    tls_min_version: Option<VaneTlsVersion>,
-    tls_max_version: Option<VaneTlsVersion>,
 ) -> Result<ClientConfig, VaneError> {
     // Before `Verifier::new`, not after: this is the only place a platform
     // verifier is constructed, so every TCP request is covered by this one
@@ -363,7 +487,21 @@ fn tls_config(
     check_android_trust_ready()?;
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let inner = inner_verifier(&provider)?;
+    let platform = inner_verifier(&provider)?;
+    // Custom roots EXTEND platform trust through the OR-composite
+    // [`ExtendedTrustVerifier`]; the empty list keeps the bare platform
+    // verifier — today's path exactly.
+    let inner: Arc<dyn ServerCertVerifier> = if config.custom_root_certificates.is_empty() {
+        platform
+    } else {
+        let roots = parse_custom_roots(&config.custom_root_certificates)?;
+        let custom = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+            .build()
+            .map_err(|e| {
+                VaneError::Tls(format!("Failed to build the custom-roots verifier: {e}"))
+            })?;
+        Arc::new(ExtendedTrustVerifier { platform, custom })
+    };
 
     // Lowercased like every pin lookup; an entry that only differs by case
     // still marks the host pinned here, which errs toward a full handshake.
@@ -378,28 +516,42 @@ fn tls_config(
     // the only enforcement site — HTTP/3 is TLS 1.3-always (quiche pins it
     // per connection; RFC 9001), which construction validation accounts for.
     let mut versions: Vec<&'static rustls::SupportedProtocolVersion> = Vec::new();
-    if tls_min_version.unwrap_or(VaneTlsVersion::Tls12) == VaneTlsVersion::Tls12 {
+    if config.tls_min_version.unwrap_or(VaneTlsVersion::Tls12) == VaneTlsVersion::Tls12 {
         versions.push(&rustls::version::TLS12);
     }
-    if tls_max_version.unwrap_or(VaneTlsVersion::Tls13) == VaneTlsVersion::Tls13 {
+    if config.tls_max_version.unwrap_or(VaneTlsVersion::Tls13) == VaneTlsVersion::Tls13 {
         versions.push(&rustls::version::TLS13);
     }
-    let mut config = ClientConfig::builder_with_provider(provider)
+    let builder = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&versions)
         .map_err(|e| VaneError::Tls(format!("Failed to configure TLS versions: {e}")))?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedServerCertVerifier {
             inner,
             certificate_pins,
-        }))
-        .with_no_client_auth();
+        }));
+    let mut tls = match client_identity {
+        // mTLS toward the origin: the ONE shared [`ClientIdentity`] the
+        // HTTP/3 builder path also consumes (taken out of the config at
+        // construction — see `VaneClient::client_identity`), parsed by
+        // rustls here. Construction already ran this parse, so a failure at
+        // this point is a rustls-level rejection of the material itself —
+        // surfaced without echoing any of it.
+        Some(identity) => {
+            let (chain, key) = parse_client_identity(identity)?;
+            builder.with_client_auth_cert(chain, key).map_err(|e| {
+                VaneError::Tls(format!("Failed to configure client certificate: {e}"))
+            })?
+        }
+        None => builder.with_no_client_auth(),
+    };
 
     // rustls's default resumption would happily resume a pinned host, and a
     // resumed handshake never reaches the verifier installed above. The
     // 256-entry cache matches the default this replaces; 0-RTT stays off
     // (rustls clients never send early data unless `enable_early_data` is
     // set, and it is not).
-    config.resumption = Resumption::store(Arc::new(PinAwareSessionStore {
+    tls.resumption = Resumption::store(Arc::new(PinAwareSessionStore {
         inner: ClientSessionMemoryCache::new(256),
         pinned_hosts,
     }));
@@ -407,13 +559,13 @@ fn tls_config(
     // reqwest only fills these in on its own TLS path; a preconfigured config
     // is passed through untouched, so without this nothing offers ALPN, HTTP/2
     // is never negotiated, and prior-knowledge h2 violates RFC 9113 3.4.
-    config.alpn_protocols = match mode {
+    tls.alpn_protocols = match config.protocol_mode {
         VaneProtocolMode::Http1Only => vec![b"http/1.1".to_vec()],
         VaneProtocolMode::Http2Only => vec![b"h2".to_vec()],
         _ => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
     };
 
-    Ok(config)
+    Ok(tls)
 }
 
 /// The platform's own verifier, which is what "trusted" has to mean on
@@ -486,12 +638,7 @@ fn build_client(
     certificate_pins: HashMap<String, Vec<String>>,
 ) -> Result<SharedTcpClient, VaneError> {
     let config = &client.config;
-    let tls = tls_config(
-        &config.protocol_mode,
-        certificate_pins,
-        config.tls_min_version,
-        config.tls_max_version,
-    )?;
+    let tls = tls_config(config, client.client_identity.as_deref(), certificate_pins)?;
     let mut builder = Client::builder()
         // A clone shares the verifier and session cache by `Arc`, so the
         // retained copy IS the client's TLS identity, not a twin.
@@ -870,7 +1017,13 @@ fn follow_and_read(
     read_body(hop.response, &mut state, cancel_token, progress)?;
 
     if let Some(reason) = hop.refused {
-        state.push_header(REDIRECT_REFUSED_HEADER.to_string(), reason.to_string());
+        // Direct push, NOT `push_header`: the reserved refusal marker is
+        // dropped there when it arrives from the peer, and this is the one
+        // place the TCP buffered path appends Vane's own.
+        state.headers.push(VaneHeader {
+            name: REDIRECT_REFUSED_HEADER.to_string(),
+            value: reason.to_string(),
+        });
     }
 
     let status_code = state.status_code;

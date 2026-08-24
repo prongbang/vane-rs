@@ -6,7 +6,7 @@ use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::CertificateDer;
 
 use super::*;
-use crate::{VaneClientConfig, certificate_pin_values, sha256_pin};
+use crate::{VaneClientCertificate, VaneClientConfig, certificate_pin_values, sha256_pin};
 
 fn client_with(config: VaneClientConfig) -> VaneClient {
     VaneClient::new(config).unwrap()
@@ -386,6 +386,52 @@ fn local_tls_server_with_versions<F>(
 where
     F: Fn(TlsStream) + Send + Sync + 'static,
 {
+    local_tls_server_inner(versions, None, alpn, handle)
+}
+
+/// [`local_tls_server`] that REQUIRES a client certificate signed by a
+/// per-run client CA — the server half of the mTLS tests. Returns the usual
+/// port + server CA plus the one client identity (leaf PEM, key PEM) the
+/// server will accept.
+fn local_mtls_server<F>(alpn: &[u8], handle: F) -> (u16, CertificateDer<'static>, String, String)
+where
+    F: Fn(TlsStream) + Send + Sync + 'static,
+{
+    use rcgen::DnType;
+
+    let mut client_ca_params = CertificateParams::new(Vec::new()).unwrap();
+    client_ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "vane tcp mtls client CA");
+    client_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let client_ca_key = KeyPair::generate().unwrap();
+    let client_ca = client_ca_params.self_signed(&client_ca_key).unwrap();
+    let mut client_roots = RootCertStore::empty();
+    client_roots.add(client_ca.der().clone()).unwrap();
+    let issuer = Issuer::new(client_ca_params, client_ca_key);
+
+    let mut leaf_params = CertificateParams::new(Vec::new()).unwrap();
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, "vane tcp mtls client");
+    leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+
+    let (port, ca, _leaf) =
+        local_tls_server_inner(rustls::DEFAULT_VERSIONS, Some(client_roots), alpn, handle);
+    (port, ca, leaf.pem(), leaf_key.serialize_pem())
+}
+
+fn local_tls_server_inner<F>(
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    client_roots: Option<RootCertStore>,
+    alpn: &[u8],
+    handle: F,
+) -> (u16, CertificateDer<'static>, CertificateDer<'static>)
+where
+    F: Fn(TlsStream) + Send + Sync + 'static,
+{
     use rustls::pki_types::PrivateKeyDer;
     use rustls::{ServerConfig, ServerConnection};
 
@@ -404,10 +450,20 @@ where
     let leaf_pkcs8 = PrivateKeyDer::try_from(leaf_key.serialize_der()).unwrap();
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut server_config = ServerConfig::builder_with_provider(provider)
+    let builder = ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(versions)
-        .unwrap()
-        .with_no_client_auth()
+        .unwrap();
+    let builder = match client_roots {
+        // The mTLS servers: a client certificate chaining to these roots is
+        // REQUIRED, so a client that presents none fails the handshake.
+        Some(roots) => builder.with_client_cert_verifier(
+            rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .unwrap(),
+        ),
+        None => builder.with_no_client_auth(),
+    };
+    let mut server_config = builder
         .with_single_cert(vec![leaf_der], leaf_pkcs8)
         .unwrap();
     server_config.alpn_protocols = vec![alpn.to_vec()];
@@ -654,10 +710,17 @@ fn tls_config_offers_alpn_per_protocol_mode() {
     // reqwest leaves a preconfigured config's ALPN alone, so without these
     // HTTP/2 is never negotiated at all.
     let alpn = |mode| {
-        tls_config(&mode, HashMap::new(), None, None)
-            .unwrap()
-            .alpn_protocols
-            .clone()
+        tls_config(
+            &VaneClientConfig {
+                protocol_mode: mode,
+                ..VaneClientConfig::default()
+            },
+            None,
+            HashMap::new(),
+        )
+        .unwrap()
+        .alpn_protocols
+        .clone()
     };
     assert_eq!(
         alpn(VaneProtocolMode::Http1Only),
@@ -795,9 +858,12 @@ fn redirect_chain_honours_the_configured_hop_cap() {
             "/b",
             "HTTP/1.1 302 Found\r\nLocation: /c\r\nContent-Length: 0\r\n\r\n",
         ),
+        // `/c` is the hop the cap refuses below; it spoofs Vane's own
+        // refusal marker, which `push_header` must drop or the peer's value
+        // would win first-wins over the real reason.
         (
             "/c",
-            "HTTP/1.1 302 Found\r\nLocation: /d\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 302 Found\r\nLocation: /d\r\nvane-redirect-refused: peer-spoofed\r\nContent-Length: 0\r\n\r\n",
         ),
         (
             "/d",
@@ -820,6 +886,16 @@ fn redirect_chain_honours_the_configured_hop_cap() {
     assert_eq!(
         crate::first_header_value(&refused.headers, REDIRECT_REFUSED_HEADER),
         Some(crate::REDIRECT_REFUSED_HOP_CAP)
+    );
+    // `/c` spoofed the marker; only Vane's own may land.
+    assert_eq!(
+        refused
+            .headers
+            .iter()
+            .filter(|h| h.name == REDIRECT_REFUSED_HEADER)
+            .count(),
+        1,
+        "the peer-spoofed marker must be dropped"
     );
 
     let followed = client(3).execute(crate::test_request("/a")).unwrap();
@@ -871,6 +947,157 @@ fn tls_min_13_refuses_a_tls12_only_server() {
         !matches!(err, VaneError::InvalidRequest(_)),
         "expected a handshake failure, not a config rejection: {err}"
     );
+}
+
+/// DER → PEM, so a per-run CA can ride `custom_root_certificates` (the knob
+/// is PEM-only, like every real deployment's bundle).
+fn pem_from_der(der: &[u8]) -> String {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in encoded.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).unwrap());
+        pem.push('\n');
+    }
+    pem.push_str("-----END CERTIFICATE-----\n");
+    pem
+}
+
+static OK_ROUTES: &[(&str, &str)] = &[(
+    "/",
+    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+)];
+
+/// The batch-3 flagship on TCP: the per-run CA is in no platform store and
+/// deliberately NOT in `TEST_ROOT`, so only `custom_root_certificates` — the
+/// `ExtendedTrustVerifier`'s custom arm — can make the chain validate.
+#[test]
+fn custom_root_extends_platform_trust() {
+    let (port, ca, _leaf) = local_tls_server(b"http/1.1", raw_http_handler(OK_ROUTES));
+    // Serialized with every other TCP-client test, but TEST_ROOT stays
+    // unset: the platform arm must genuinely not know this CA.
+    let _guard = crate::tcp_test_lock();
+    let client = |roots: Vec<String>| {
+        client_with(VaneClientConfig {
+            base_url: Some(format!("https://localhost:{port}")),
+            protocol_mode: VaneProtocolMode::Http1Only,
+            timeout_seconds: Some(10),
+            custom_root_certificates: roots,
+            ..VaneClientConfig::default()
+        })
+    };
+
+    // Control: without the knob nothing trusts this CA and the handshake
+    // fails through the bare platform verifier.
+    assert!(
+        client(vec![]).execute(crate::test_request("/")).is_err(),
+        "a per-run CA must not validate without the knob"
+    );
+
+    let response = client(vec![pem_from_der(&ca)])
+        .execute(crate::test_request("/"))
+        .unwrap();
+    assert!(response.is_success);
+}
+
+/// The OR-composite is a union, not "anything goes": with a custom root
+/// configured, a chain anchored in a third, unknown CA must still fail —
+/// neither arm may half-verify.
+#[test]
+fn custom_roots_do_not_widen_trust() {
+    let (port, _ca, _leaf) = local_tls_server(b"http/1.1", raw_http_handler(OK_ROUTES));
+    let _guard = crate::tcp_test_lock();
+
+    let mut stranger_params = CertificateParams::new(Vec::new()).unwrap();
+    stranger_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let stranger = stranger_params
+        .self_signed(&KeyPair::generate().unwrap())
+        .unwrap();
+
+    let client = client_with(VaneClientConfig {
+        base_url: Some(format!("https://localhost:{port}")),
+        protocol_mode: VaneProtocolMode::Http1Only,
+        timeout_seconds: Some(10),
+        custom_root_certificates: vec![stranger.pem()],
+        ..VaneClientConfig::default()
+    });
+    assert!(
+        client.execute(crate::test_request("/")).is_err(),
+        "a stranger CA in the knob must not admit an unrelated chain"
+    );
+}
+
+/// `PinnedServerCertVerifier` wraps the composite, so pins are enforced
+/// above whichever arm accepted: a custom root that makes the chain validate
+/// must not make a wrong pin pass.
+#[test]
+fn custom_roots_do_not_bypass_pins() {
+    let (port, ca, _leaf) = local_tls_server(b"http/1.1", raw_http_handler(OK_ROUTES));
+    let _guard = crate::tcp_test_lock();
+    let ca_pem = pem_from_der(&ca);
+    let client = |pins: HashMap<String, Vec<String>>| {
+        client_with(VaneClientConfig {
+            base_url: Some(format!("https://localhost:{port}")),
+            protocol_mode: VaneProtocolMode::Http1Only,
+            timeout_seconds: Some(10),
+            custom_root_certificates: vec![ca_pem.clone()],
+            certificate_pins: pins,
+            ..VaneClientConfig::default()
+        })
+    };
+
+    // Control: with the custom root and no pin the request succeeds, so the
+    // failure below can only be the pin's doing.
+    assert!(
+        client(HashMap::new())
+            .execute(crate::test_request("/"))
+            .unwrap()
+            .is_success
+    );
+
+    let wrong_pin = sha256_pin("sha256-cert", b"not the certificate the server presents");
+    let err = client(HashMap::from([("localhost".to_string(), vec![wrong_pin])]))
+        .execute(crate::test_request("/"))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("pin"),
+        "expected the pin failure, got {err}"
+    );
+}
+
+/// The mTLS pair on the TCP path: a server that REQUIRES a client
+/// certificate refuses the plain client and accepts one configured through
+/// the knob. (A key that does not match the certificate never gets this far
+/// — it is rejected at construction, covered by
+/// `config_knobs_are_validated_at_construction`.)
+#[test]
+fn client_certificate_satisfies_an_mtls_server() {
+    let (port, ca, cert_pem, key_pem) = local_mtls_server(b"http/1.1", raw_http_handler(OK_ROUTES));
+    let _guard = with_test_root(ca);
+    let client = |identity: Option<VaneClientCertificate>| {
+        client_with(VaneClientConfig {
+            base_url: Some(format!("https://localhost:{port}")),
+            protocol_mode: VaneProtocolMode::Http1Only,
+            timeout_seconds: Some(10),
+            client_certificate: identity,
+            ..VaneClientConfig::default()
+        })
+    };
+
+    // Without the knob the server's CertificateRequest goes unanswered and
+    // the handshake fails.
+    assert!(
+        client(None).execute(crate::test_request("/")).is_err(),
+        "the mTLS server must refuse a client without a certificate"
+    );
+
+    let response = client(Some(VaneClientCertificate {
+        certificate_pem: cert_pem,
+        private_key_pem: key_pem,
+    }))
+    .execute(crate::test_request("/"))
+    .unwrap();
+    assert!(response.is_success);
 }
 
 #[test]

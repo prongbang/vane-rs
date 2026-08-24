@@ -9,7 +9,11 @@ libc = "0.2"
 
 [dependencies]
 base64 = "0.22"
-boring = { version = "4.22", optional = true }
+# Non-optional since the trust knobs: the H3 ctx-builder path (custom roots,
+# mTLS) needs `boring::` types in every feature set, and quiche's default
+# `boringssl-boring-crate` feature already links the crate unconditionally —
+# this costs the no-default-features build nothing it wasn't paying.
+boring = "4.22"
 getrandom = "0.3"
 psl = { version = "2", optional = true }
 quiche = "0.29.1"
@@ -25,10 +29,16 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 # tried first and is dead on both: openssl-probe never looks in
 # /system/etc/security/cacerts, and iOS ships no PEM bundle at all.
 rustls-platform-verifier = { version = "0.7", optional = true }
+# Wipes the retained client-certificate key PEM on drop (1.d key hygiene).
+# Already in the tree via rustls-pki-types; direct so the HTTP/3-only build
+# keeps the same hygiene.
+zeroize = "1"
 
 [features]
 default = ["spki-pinning", "tcp-fallback", "psl"]
-spki-pinning = ["dep:boring"]
+# The pin-verification code path; `boring` itself is now unconditional (see
+# the dependency note), so this gates only vane's own code.
+spki-pinning = []
 # Public suffix list, so a `Set-Cookie: Domain=co.uk` is refused as well as
 # `Domain=com`. Dropped by the small profile: it costs ~533 KB of embedded list
 # for a feature that is off by default. The dot-and-IP-literal guard in

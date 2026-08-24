@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -49,7 +49,65 @@ pub(crate) struct TestPki {
     pub(crate) leaf_key_der: Vec<u8>,
 }
 
+impl TestPki {
+    /// The CA as PEM text, for tests that feed it through
+    /// `custom_root_certificates` instead of relying on the seam.
+    pub(crate) fn ca_pem(&self) -> String {
+        std::fs::read_to_string(&self.ca_pem_path).unwrap()
+    }
+}
+
 static TEST_PKI: OnceLock<TestPki> = OnceLock::new();
+
+/// Counter so each [`fresh_pki`] call writes distinct server files.
+static FRESH_PKI_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A second, independent PKI for `TEST_HOST`, trusted by NOTHING — not the
+/// platform store and not the `#[cfg(test)]` seam (which only ever loads
+/// `TEST_PKI`'s CA). Handing `ca_pem` to `custom_root_certificates` is
+/// therefore the only way a client can trust a server presenting this PKI —
+/// exactly what the custom-roots tests must prove. The files exist for the
+/// test *server's* quiche config, which loads from paths; the client under
+/// test consumes the PEM from memory.
+pub(crate) struct FreshPki {
+    pub(crate) ca_pem: String,
+    cert_pem_path: PathBuf,
+    key_pem_path: PathBuf,
+}
+
+pub(crate) fn fresh_pki() -> FreshPki {
+    let seq = FRESH_PKI_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+    // Distinct CNs for the same BoringSSL reason as `test_pki`.
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, format!("vane fresh test CA {seq}"));
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_key = KeyPair::generate().unwrap();
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let ca_pem = ca.pem();
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let mut leaf_params = CertificateParams::new(vec![TEST_HOST.to_string()]).unwrap();
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, TEST_HOST);
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let write = |name: &str, contents: &str| -> PathBuf {
+        let path = dir.join(format!("vane-h3-fresh-{pid}-{seq}-{name}"));
+        std::fs::write(&path, contents).unwrap();
+        path
+    };
+    FreshPki {
+        ca_pem,
+        cert_pem_path: write("cert.pem", &leaf.pem()),
+        key_pem_path: write("key.pem", &leaf_key.serialize_pem()),
+    }
+}
 
 /// The extra trust anchor `create_quiche_config`'s test-only seam loads.
 /// `None` until a test starts a server, so suites that never touch the
@@ -129,6 +187,9 @@ pub(crate) struct ServerTuning {
     /// so received stream data is never consumed, no window credit is ever
     /// granted, and an uploading client stalls against `flow_window`.
     pub(crate) hold_h3: Option<Arc<AtomicBool>>,
+    /// Serve from this PKI instead of the process-wide [`test_pki`], so the
+    /// client can only trust the server through `custom_root_certificates`.
+    pub(crate) pki: Option<FreshPki>,
 }
 
 /// A localhost HTTP/3 origin on an ephemeral port, served from one background
@@ -148,7 +209,13 @@ impl TestH3Server {
     }
 
     pub(crate) fn start_tuned(tuning: ServerTuning) -> Self {
-        let pki = test_pki();
+        let (cert_pem_path, key_pem_path) = match &tuning.pki {
+            Some(pki) => (pki.cert_pem_path.clone(), pki.key_pem_path.clone()),
+            None => {
+                let pki = test_pki();
+                (pki.cert_pem_path.clone(), pki.key_pem_path.clone())
+            }
+        };
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         // The tick that bounds every loop below: recv wakes at least this
         // often to fire QUIC timers and check the stop flag.
@@ -159,10 +226,10 @@ impl TestH3Server {
 
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
         config
-            .load_cert_chain_from_pem_file(pki.cert_pem_path.to_str().unwrap())
+            .load_cert_chain_from_pem_file(cert_pem_path.to_str().unwrap())
             .unwrap();
         config
-            .load_priv_key_from_pem_file(pki.key_pem_path.to_str().unwrap())
+            .load_priv_key_from_pem_file(key_pem_path.to_str().unwrap())
             .unwrap();
         config
             .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
@@ -602,7 +669,16 @@ fn route(request: &PendingRequest) -> (String, Vec<(String, String)>, Vec<u8>) {
         };
         return (
             "302".to_string(),
-            vec![("location".to_string(), target)],
+            vec![
+                ("location".to_string(), target),
+                // A hostile peer spoofing Vane's own refusal marker; the
+                // client must drop it (`ResponseState::push_header`) or it
+                // would win every first-wins lookup over the real one.
+                (
+                    crate::REDIRECT_REFUSED_HEADER.to_string(),
+                    "peer-spoofed".to_string(),
+                ),
+            ],
             Vec::new(),
         );
     }
@@ -614,7 +690,14 @@ fn route(request: &PendingRequest) -> (String, Vec<(String, String)>, Vec<u8>) {
     if path == "/redirect-http" {
         return (
             "302".to_string(),
-            vec![("location".to_string(), format!("http://{TEST_HOST}/get"))],
+            vec![
+                ("location".to_string(), format!("http://{TEST_HOST}/get")),
+                // Spoof attempt, as on `/redirect/` above.
+                (
+                    crate::REDIRECT_REFUSED_HEADER.to_string(),
+                    "peer-spoofed".to_string(),
+                ),
+            ],
             Vec::new(),
         );
     }
@@ -657,7 +740,7 @@ fn echo_body(request: &PendingRequest, query: &str) -> Vec<u8> {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{TEST_HOST, TestH3Server, test_pki};
+    use super::{ServerTuning, TEST_HOST, TestH3Server, fresh_pki, test_pki};
     use crate::{
         REDIRECT_REFUSED_HEADER, REDIRECT_REFUSED_HOP_CAP, VaneClient, VaneClientConfig,
         first_header_value, sha256_pin, test_request,
@@ -778,6 +861,136 @@ mod tests {
         );
     }
 
+    /// The batch-3 flagship, HTTP/3 twin: the fresh CA reaches the client
+    /// only through `custom_root_certificates` — the production ctx-builder
+    /// path — never the `#[cfg(test)]` seam, which has never seen this CA.
+    /// Extend-only semantics, both directions: unknown CA fails without the
+    /// knob, validates with it.
+    #[test]
+    fn custom_root_extends_platform_trust() {
+        let pki = fresh_pki();
+        let ca_pem = pki.ca_pem.clone();
+        let server = TestH3Server::start_tuned(ServerTuning {
+            pki: Some(pki),
+            ..ServerTuning::default()
+        });
+
+        // Control: nothing trusts this CA, so the handshake must fail.
+        let untrusting = offline_client(VaneClientConfig::default());
+        assert!(
+            untrusting
+                .execute(test_request(&server.url("/get")))
+                .is_err(),
+            "a fresh CA must not validate without the knob"
+        );
+
+        let trusting = offline_client(VaneClientConfig {
+            custom_root_certificates: vec![ca_pem],
+            ..VaneClientConfig::default()
+        });
+        let response = trusting.execute(test_request(&server.url("/get"))).unwrap();
+        assert!(response.is_success);
+    }
+
+    /// The OR is a union, not "anything goes": with a custom root configured,
+    /// a chain anchored in a third, unknown CA must still fail.
+    #[test]
+    fn custom_roots_do_not_widen_trust() {
+        let server_pki = fresh_pki();
+        let stranger = fresh_pki();
+        let server = TestH3Server::start_tuned(ServerTuning {
+            pki: Some(server_pki),
+            ..ServerTuning::default()
+        });
+
+        let client = offline_client(VaneClientConfig {
+            custom_root_certificates: vec![stranger.ca_pem.clone()],
+            ..VaneClientConfig::default()
+        });
+        assert!(
+            client.execute(test_request(&server.url("/get"))).is_err(),
+            "a stranger CA in the knob must not admit an unrelated chain"
+        );
+    }
+
+    /// Extend, never replace: with a (stranger) custom root active — so the
+    /// ctx-builder path is in force — roots loaded through the
+    /// post-construction quiche call (`load_platform_roots` and the test
+    /// seam share it) must still be honored. Trust for this server comes
+    /// only from the seam; the knob may add trust, never subtract it.
+    #[test]
+    fn custom_roots_do_not_replace_existing_trust() {
+        let server = TestH3Server::start();
+        let stranger = fresh_pki();
+        let client = offline_client(VaneClientConfig {
+            custom_root_certificates: vec![stranger.ca_pem.clone()],
+            ..VaneClientConfig::default()
+        });
+
+        let response = client.execute(test_request(&server.url("/get"))).unwrap();
+        assert!(response.is_success);
+    }
+
+    /// Pins run post-handshake regardless of which root anchored the chain:
+    /// a custom root that makes the chain validate must not make a wrong pin
+    /// pass.
+    #[test]
+    fn custom_roots_do_not_bypass_pins() {
+        let pki = fresh_pki();
+        let ca_pem = pki.ca_pem.clone();
+        let server = TestH3Server::start_tuned(ServerTuning {
+            pki: Some(pki),
+            ..ServerTuning::default()
+        });
+
+        let wrong_pin = sha256_pin("sha256-cert", b"not the certificate the server presents");
+        let client = offline_client(VaneClientConfig {
+            custom_root_certificates: vec![ca_pem],
+            certificate_pins: HashMap::from([(TEST_HOST.to_string(), vec![wrong_pin])]),
+            ..VaneClientConfig::default()
+        });
+        let err = client
+            .execute(test_request(&server.url("/get")))
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::VaneError::Tls(_)),
+            "expected the pin failure, got {err}"
+        );
+    }
+
+    /// The builder-path twin of `second_connection_resumes_tls_session`:
+    /// custom roots switch config construction to
+    /// `with_boring_ssl_ctx_builder`, and quiche's `from_boring` must keep
+    /// the session callback installed. Security-critical seam: a resumed
+    /// handshake skips certificate verification, so resumption behavior must
+    /// be identical on both construction paths (the pinned-host gate is
+    /// covered by `pinned_host_never_resumes`, which is path-independent).
+    #[test]
+    fn custom_roots_preserve_tls_session_resumption() {
+        let server = TestH3Server::start();
+        let client = offline_client(VaneClientConfig {
+            connection_pool_enabled: false,
+            custom_root_certificates: vec![test_pki().ca_pem()],
+            ..VaneClientConfig::default()
+        });
+
+        let first = client.execute(test_request(&server.url("/get"))).unwrap();
+        assert!(first.is_success);
+        assert_eq!(
+            client.tls_sessions.lock().unwrap().len(),
+            1,
+            "the ctx-builder path should still capture NewSessionTickets"
+        );
+
+        let second = client.execute(test_request(&server.url("/get"))).unwrap();
+        assert!(second.is_success);
+        assert_eq!(
+            server.handshakes(),
+            vec![false, true],
+            "the ctx-builder path should still resume the TLS session"
+        );
+    }
+
     /// Offline twin of the live `/get`+`/post` echo test.
     #[test]
     fn get_and_post_echo() {
@@ -869,6 +1082,17 @@ mod tests {
         assert_eq!(
             first_header_value(&refused.headers, REDIRECT_REFUSED_HEADER),
             Some(REDIRECT_REFUSED_HOP_CAP)
+        );
+        // The server spoofs the marker on every 302 (see `route`); only
+        // Vane's own may survive, or the peer's would win first-wins.
+        assert_eq!(
+            refused
+                .headers
+                .iter()
+                .filter(|h| h.name == REDIRECT_REFUSED_HEADER)
+                .count(),
+            1,
+            "the peer-spoofed marker must be dropped"
         );
 
         let followed = offline_client(VaneClientConfig {
@@ -1043,6 +1267,16 @@ mod tests {
             crate::first_header_value(&head.headers, crate::REDIRECT_REFUSED_HEADER),
             Some(crate::REDIRECT_REFUSED_DOWNGRADE)
         );
+        // `/redirect-http` spoofs the marker too; the streaming path must
+        // drop the peer's copy just like the buffered one.
+        assert_eq!(
+            head.headers
+                .iter()
+                .filter(|h| h.name == crate::REDIRECT_REFUSED_HEADER)
+                .count(),
+            1,
+            "the peer-spoofed marker must be dropped"
+        );
         assert!(stream.read_chunk().unwrap().is_none());
     }
 
@@ -1148,7 +1382,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
-    use super::{ServerTuning, sha256_hex};
+    use super::sha256_hex;
     use crate::{
         VaneRequest, create_body_stream, finish_body_stream, free_body_stream,
         write_body_stream_chunk,
@@ -1373,6 +1607,7 @@ mod tests {
         let server = TestH3Server::start_tuned(ServerTuning {
             flow_window: Some(WINDOW),
             hold_h3: Some(Arc::clone(&hold)),
+            ..ServerTuning::default()
         });
         let client = Arc::new(offline_client(VaneClientConfig::default()));
         let body = body_pattern(UPLOAD_BODY_LEN);

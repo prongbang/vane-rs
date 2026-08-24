@@ -24,11 +24,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-#[cfg(feature = "spki-pinning")]
 use boring::x509::X509;
 use quiche::h3::NameValue;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 const DEFAULT_MAX_REQUEST_BODY_BYTES: u64 = 64 * 1024 * 1024;
@@ -1074,12 +1074,71 @@ fn unsupported_tcp_backend_error() -> VaneError {
     )
 }
 
+/// The client-certificate (mTLS) identity, moved OUT of the stored
+/// [`VaneClientConfig`] at construction so exactly one copy of the key
+/// exists, and that copy is [`Zeroizing`] — left in the config it would ride
+/// along as a second, plain `String` for the client's lifetime and defeat
+/// wipe-on-drop. Shared (`Arc`) by [`H3TlsMaterial`] and the TCP
+/// `tls_config` path, which re-reads it on every client rebuild.
+///
+/// No `Debug` on purpose: unprintable beats redacted.
+struct ClientIdentity {
+    /// PEM, leaf first, optionally followed by intermediates (full chain).
+    chain_pem: String,
+    /// Private key PEM. Never logged, never in an error, never written
+    /// anywhere; zeroed when the last holder drops.
+    key_pem: Zeroizing<String>,
+}
+
+impl ClientIdentity {
+    /// SHA-256 over the chain PEM bytes, hex-encoded — public data, the same
+    /// bytes [`VaneClientCertificate::certificate_fingerprint`] hashes.
+    fn certificate_fingerprint(&self) -> String {
+        sha256_hex_fingerprint(self.chain_pem.as_bytes())
+    }
+}
+
+/// TLS inputs for the HTTP/3 context, retained for the client's lifetime
+/// because `create_quiche_config` re-runs on every [`QuicConfigCache`] miss.
+/// Everything is consumed from memory by the boring ctx builder — no PEM ever
+/// touches the filesystem — and the private key is wiped on drop.
+struct H3TlsMaterial {
+    /// Concatenated `custom_root_certificates` PEM; `None` = platform trust
+    /// only (PEM is concatenation-safe, and boring's `stack_from_pem` splits
+    /// a bundle back into certificates).
+    custom_roots_pem: Option<String>,
+    /// The one shared client identity (mTLS), if configured.
+    client_identity: Option<Arc<ClientIdentity>>,
+}
+
+impl H3TlsMaterial {
+    fn from_config(
+        config: &VaneClientConfig,
+        client_identity: Option<Arc<ClientIdentity>>,
+    ) -> Self {
+        Self {
+            custom_roots_pem: (!config.custom_root_certificates.is_empty())
+                .then(|| config.custom_root_certificates.concat()),
+            client_identity,
+        }
+    }
+
+    /// `true` keeps today's `quiche::Config::new` path byte-for-byte.
+    fn is_empty(&self) -> bool {
+        self.custom_roots_pem.is_none() && self.client_identity.is_none()
+    }
+}
+
 /// Cached `quiche::Config`s keyed by `(max-idle-timeout millis, max send UDP
 /// payload)` — the only per-connection settings on them. Building one re-reads
 /// the platform CA bundle, which is a whole directory scan on Android. Bounded
 /// in practice by the handful of distinct timeouts an application uses, times
-/// the two payload sizes (direct/outer vs MASQUE inner).
-type QuicConfigCache = Mutex<HashMap<(u64, usize), quiche::Config>>;
+/// the two payload sizes (direct/outer vs MASQUE inner). Carries the client's
+/// [`H3TlsMaterial`] so every cache-miss rebuild has the same TLS inputs.
+struct QuicConfigCache {
+    configs: Mutex<HashMap<(u64, usize), quiche::Config>>,
+    tls: H3TlsMaterial,
+}
 
 /// Serialized TLS session tickets for TLS 1.3 resumption. Ticket reuse only —
 /// 0-RTT/early data is never enabled (replay risk).
@@ -1121,6 +1180,10 @@ impl TlsSessionKey {
 #[derive(uniffi::Object)]
 pub struct VaneClient {
     config: VaneClientConfig,
+    /// The client-certificate identity, taken OUT of `config` at
+    /// construction (see [`ClientIdentity`]); `config.client_certificate`
+    /// is always `None` past `new`.
+    client_identity: Option<Arc<ClientIdentity>>,
     pool: Mutex<Vec<PooledHttp3Connection>>,
     cookie_jar: Mutex<Vec<StoredCookie>>,
     certificate_pins: Mutex<HashMap<String, Vec<String>>>,
@@ -1133,7 +1196,7 @@ pub struct VaneClient {
 }
 
 impl VaneClient {
-    pub fn new(config: VaneClientConfig) -> Result<Self, VaneError> {
+    pub fn new(mut config: VaneClientConfig) -> Result<Self, VaneError> {
         // One rule for both transports, checked once at construction: which
         // transport ends up carrying a request depends on network conditions,
         // so the proxy posture must not.
@@ -1181,18 +1244,43 @@ impl VaneClient {
                     .to_string(),
             ));
         }
-        // Parsed then rejected loudly until the trust batch wires them: a
-        // config that names a trust posture the client would silently not
-        // apply must never construct.
-        if !config.custom_root_certificates.is_empty() {
-            return Err(VaneError::InvalidRequest(
-                "customRootCertificates is not implemented yet".to_string(),
-            ));
+        // Trust knobs are validated here, once, for both transports: each
+        // custom-roots entry must be real PEM certificate data, and a client
+        // certificate must parse with a key that matches it. The messages
+        // carry an index at most — never PEM or key material (the
+        // `redact_url_userinfo` discipline).
+        for (index, pem) in config.custom_root_certificates.iter().enumerate() {
+            if !X509::stack_from_pem(pem.as_bytes()).is_ok_and(|certs| !certs.is_empty()) {
+                return Err(VaneError::InvalidRequest(format!(
+                    "customRootCertificates[{index}] is not valid PEM certificate data"
+                )));
+            }
         }
-        if config.client_certificate.is_some() {
-            return Err(VaneError::InvalidRequest(
-                "clientCertificate is not implemented yet".to_string(),
-            ));
+        // The identity moves OUT of the stored config: the key must exist
+        // exactly once, as `Zeroizing` (see [`ClientIdentity`]) — kept in
+        // `self.config` it would survive as a plain `String` for the
+        // client's lifetime.
+        let client_identity = config.client_certificate.take().map(|identity| {
+            Arc::new(ClientIdentity {
+                chain_pem: identity.certificate_pem,
+                key_pem: Zeroizing::new(identity.private_key_pem),
+            })
+        });
+        let h3_tls = H3TlsMaterial::from_config(&config, client_identity.clone());
+        // A dry run of the exact assembly `create_quiche_config` performs on
+        // every cache miss, so a malformed chain, an unparsable key, or a key
+        // that does not match the certificate fails construction instead of
+        // the first request.
+        h3_ssl_ctx_builder(&h3_tls)?;
+        // The TCP stack parses the same PEM with its own parser at client
+        // build; running that parse here keeps its failures at construction
+        // too, so neither stack can accept material the other rejects late.
+        #[cfg(feature = "tcp-fallback")]
+        {
+            tcp::parse_custom_roots(&config.custom_root_certificates)?;
+            if let Some(identity) = &client_identity {
+                tcp::parse_client_identity(identity)?;
+            }
         }
         let cookie_jar = if config.cookies_enabled {
             load_cookie_jar(config.cookie_persistence_path.as_deref())?
@@ -1202,10 +1290,14 @@ impl VaneClient {
         let certificate_pins = config.certificate_pins.clone();
         Ok(Self {
             config,
+            client_identity,
             pool: Mutex::new(Vec::new()),
             cookie_jar: Mutex::new(cookie_jar),
             certificate_pins: Mutex::new(certificate_pins),
-            quic_config: Mutex::new(HashMap::new()),
+            quic_config: QuicConfigCache {
+                configs: Mutex::new(HashMap::new()),
+                tls: h3_tls,
+            },
             tls_sessions: Mutex::new(HashMap::new()),
             #[cfg(feature = "tcp-fallback")]
             tcp_client: Mutex::new(None),
@@ -1726,7 +1818,12 @@ impl VaneClient {
             .host_str()
             .ok_or_else(|| VaneError::InvalidRequest("URL is missing host".to_string()))?;
         let certificate_pins = self.certificate_pins_snapshot()?;
-        let key = PoolKey::new(url, &self.config, &certificate_pins);
+        let key = PoolKey::new(
+            url,
+            &self.config,
+            &certificate_pins,
+            self.client_identity.as_deref(),
+        );
         {
             let pool = self
                 .pool
@@ -1914,7 +2011,12 @@ impl VaneClient {
             // this change leaves that as it was.)
             hop.body_stream.and_then(|stream| stream.content_length),
         )?;
-        let pool_key = PoolKey::new(url, &self.config, certificate_pins);
+        let pool_key = PoolKey::new(
+            url,
+            &self.config,
+            certificate_pins,
+            self.client_identity.as_deref(),
+        );
         let mut allow_pooled = self.config.connection_pool_enabled;
 
         loop {
@@ -2762,6 +2864,7 @@ impl PoolKey {
         url: &Url,
         config: &VaneClientConfig,
         certificate_pin_map: &HashMap<String, Vec<String>>,
+        client_identity: Option<&ClientIdentity>,
     ) -> Self {
         let host = url.host_str().unwrap_or_default().to_string();
         let mut certificate_pins = certificate_pin_map.get(&host).cloned().unwrap_or_default();
@@ -2781,10 +2884,8 @@ impl PoolKey {
             custom_roots_fingerprint: (!config.custom_root_certificates.is_empty()).then(|| {
                 sha256_hex_fingerprint(config.custom_root_certificates.concat().as_bytes())
             }),
-            client_certificate_fingerprint: config
-                .client_certificate
-                .as_ref()
-                .map(VaneClientCertificate::certificate_fingerprint),
+            client_certificate_fingerprint: client_identity
+                .map(ClientIdentity::certificate_fingerprint),
         }
     }
 }
@@ -3642,7 +3743,7 @@ fn quic_connect(
     let idle_timeout_millis = timeout.as_millis().try_into().unwrap_or(u64::MAX);
     // The cache holds no invariant a panicking thread could have broken, so a
     // poisoned lock must not brick every later request on this client.
-    let mut cached = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut cached = cache.configs.lock().unwrap_or_else(PoisonError::into_inner);
     let key = (idle_timeout_millis, max_send_udp_payload);
     if cached.len() >= MAX_QUIC_CONFIGS && !cached.contains_key(&key) {
         cached.clear();
@@ -3652,6 +3753,7 @@ fn quic_connect(
         Entry::Vacant(entry) => entry.insert(create_quiche_config(
             idle_timeout_millis,
             max_send_udp_payload,
+            &cache.tls,
         )?),
     };
 
@@ -4524,8 +4626,22 @@ fn send_request_body(
 fn create_quiche_config(
     max_idle_timeout_millis: u64,
     max_send_udp_payload: usize,
+    tls: &H3TlsMaterial,
 ) -> Result<quiche::Config, VaneError> {
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+    // Custom roots or a client certificate switch to the boring ctx-builder
+    // constructor, which consumes PEM from memory — no temp files, no disk,
+    // ever. Everything below pokes the same underlying SSL_CTX on either
+    // constructor (including `load_platform_roots` and the test seam), and
+    // quiche's `from_boring` installs the session callback exactly like
+    // `Context::new`, so TLS session resumption is unaffected. The only
+    // `Context::new` step the builder path skips is `load_ca_certs`, which
+    // `load_platform_roots` below supersedes on both paths.
+    let mut config = match h3_ssl_ctx_builder(tls)? {
+        Some(builder) => {
+            quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)?
+        }
+        None => quiche::Config::new(quiche::PROTOCOL_VERSION)?,
+    };
     config
         .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
         .map_err(|e| VaneError::Generic(format!("Failed to configure HTTP/3 ALPN: {e:?}")))?;
@@ -4553,6 +4669,74 @@ fn create_quiche_config(
     config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
     Ok(config)
+}
+
+/// The in-memory boring context builder for the HTTP/3 trust knobs: custom
+/// roots are added to the builder's certificate store (strictly additive —
+/// `load_platform_roots` still fills the same store afterwards), and a client
+/// certificate lands via `set_certificate`/`set_private_key`. All PEM is
+/// parsed from memory; nothing is ever written to the filesystem. Returns
+/// `None` when neither knob is set, keeping the default `Config::new` path
+/// byte-for-byte.
+///
+/// Also `VaneClient::new`'s dry run: every failure here is reachable at
+/// construction, and no error message carries PEM or key material.
+fn h3_ssl_ctx_builder(
+    tls: &H3TlsMaterial,
+) -> Result<Option<boring::ssl::SslContextBuilder>, VaneError> {
+    if tls.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls())
+        .map_err(|e| VaneError::Tls(format!("Failed to create the HTTP/3 TLS context: {e}")))?;
+    if let Some(pem) = &tls.custom_roots_pem {
+        let certs = X509::stack_from_pem(pem.as_bytes()).map_err(|_| {
+            VaneError::InvalidRequest(
+                "customRootCertificates is not valid PEM certificate data".to_string(),
+            )
+        })?;
+        for cert in certs {
+            builder.cert_store_mut().add_cert(cert).map_err(|_| {
+                VaneError::InvalidRequest(
+                    "customRootCertificates is not valid PEM certificate data".to_string(),
+                )
+            })?;
+        }
+    }
+    if let Some(identity) = &tls.client_identity {
+        let mut chain = X509::stack_from_pem(identity.chain_pem.as_bytes())
+            .map_err(|_| VaneError::InvalidRequest("clientCertificate PEM did not parse".into()))?;
+        if chain.is_empty() {
+            return Err(VaneError::InvalidRequest(
+                "clientCertificate PEM did not parse".to_string(),
+            ));
+        }
+        let leaf = chain.remove(0);
+        builder
+            .set_certificate(&leaf)
+            .map_err(|e| VaneError::Tls(format!("Failed to configure client certificate: {e}")))?;
+        for intermediate in chain {
+            builder.add_extra_chain_cert(intermediate).map_err(|e| {
+                VaneError::Tls(format!("Failed to configure client certificate chain: {e}"))
+            })?;
+        }
+        // Chain and key live in one `ClientIdentity`, so a chain always
+        // comes with its key.
+        let key_pem = &identity.key_pem;
+        let key = boring::pkey::PKey::private_key_from_pem(key_pem.as_bytes()).map_err(|_| {
+            VaneError::InvalidRequest("clientCertificate privateKey did not parse".to_string())
+        })?;
+        // BoringSSL checks the key against the certificate set above, so a
+        // mismatched pair fails right here — at construction, thanks to the
+        // dry run. Fixed message: boring's own would not leak material, but a
+        // fixed one provably cannot.
+        builder.set_private_key(&key).map_err(|_| {
+            VaneError::InvalidRequest(
+                "clientCertificate privateKey does not match the certificate".to_string(),
+            )
+        })?;
+    }
+    Ok(Some(builder))
 }
 
 /// Builds the per-connection HTTP/3 config. Shared by the direct and the
@@ -5636,8 +5820,18 @@ impl ResponseState {
     /// evidence verbatim, but re-parsing later occurrences would let a
     /// hostile repeat — or a trailer — move the reservation hint after the
     /// first was already acted on.
+    ///
+    /// `vane-redirect-refused` is dropped outright: it is Vane's OWN refusal
+    /// marker (`mark_refused`), not a header a peer may send, and since the
+    /// marker is appended after the peer's headers, a peer-sent occurrence
+    /// would win `first_header_value` and every binding's first-wins
+    /// headerMap. Every peer header on both transports funnels through here;
+    /// Vane's own sites push onto `headers` directly, bypassing the guard.
     fn push_header(&mut self, mut name: String, value: String) {
         name.make_ascii_lowercase();
+        if name == REDIRECT_REFUSED_HEADER {
+            return;
+        }
         if name == "content-length" && first_header_value(&self.headers, "content-length").is_none()
         {
             self.on_content_length(&value);
@@ -7562,16 +7756,34 @@ mod tests {
             .is_ok()
         );
 
-        // Parsed-then-rejected guards: a trust posture the client would not
-        // yet apply must never construct silently.
+        // Trust-knob validation. Every rejection names at most an index —
+        // no error may ever echo PEM or key material.
+        let assert_material_free = |err: &str| {
+            assert!(
+                !err.contains("-----BEGIN") && !err.contains("PRIVATE KEY"),
+                "material leaked into an error: {err}"
+            );
+        };
+
         let err = client_error(VaneClientConfig {
             custom_root_certificates: vec!["-----BEGIN CERTIFICATE-----".to_string()],
             ..VaneClientConfig::default()
         });
         assert!(
-            err.contains("customRootCertificates is not implemented yet"),
+            err.contains("customRootCertificates[0] is not valid PEM certificate data"),
             "got {err}"
         );
+        assert_material_free(&err);
+
+        // A malformed entry is named by index even behind valid ones.
+        let (ca_pem, cert_pem, key_pem, wrong_key_pem) = test_client_identity();
+        let err = client_error(VaneClientConfig {
+            custom_root_certificates: vec![ca_pem.clone(), "not a certificate".to_string()],
+            ..VaneClientConfig::default()
+        });
+        assert!(err.contains("customRootCertificates[1]"), "got {err}");
+        assert_material_free(&err);
+
         let err = client_error(VaneClientConfig {
             client_certificate: Some(VaneClientCertificate {
                 certificate_pem: "cert".to_string(),
@@ -7580,9 +7792,166 @@ mod tests {
             ..VaneClientConfig::default()
         });
         assert!(
-            err.contains("clientCertificate is not implemented yet"),
+            err.contains("clientCertificate PEM did not parse"),
             "got {err}"
         );
+        assert_material_free(&err);
+
+        let err = client_error(VaneClientConfig {
+            client_certificate: Some(VaneClientCertificate {
+                certificate_pem: cert_pem.clone(),
+                private_key_pem: "not a key".to_string(),
+            }),
+            ..VaneClientConfig::default()
+        });
+        assert!(
+            err.contains("clientCertificate privateKey did not parse"),
+            "got {err}"
+        );
+        assert_material_free(&err);
+
+        // A key that parses but belongs to a different certificate fails at
+        // construction too — the H3 builder dry run checks the pair.
+        let err = client_error(VaneClientConfig {
+            client_certificate: Some(VaneClientCertificate {
+                certificate_pem: cert_pem.clone(),
+                private_key_pem: wrong_key_pem,
+            }),
+            ..VaneClientConfig::default()
+        });
+        assert!(
+            err.contains("clientCertificate privateKey does not match the certificate"),
+            "got {err}"
+        );
+        assert_material_free(&err);
+
+        // The happy path constructs: valid roots plus a matching pair.
+        assert!(
+            VaneClient::new(VaneClientConfig {
+                custom_root_certificates: vec![ca_pem],
+                client_certificate: Some(VaneClientCertificate {
+                    certificate_pem: cert_pem,
+                    private_key_pem: key_pem,
+                }),
+                ..VaneClientConfig::default()
+            })
+            .is_ok()
+        );
+    }
+
+    /// PEM fixtures for the trust-knob tests: `(ca, cert, key, wrong_key)` —
+    /// a CA, a leaf it signed with the leaf's matching key, and a key that
+    /// matches nothing.
+    fn test_client_identity() -> (String, String, String, String) {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+
+        let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "vane knob test CA");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let ca_pem = ca.pem();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let leaf_params = CertificateParams::new(vec!["client.test".to_string()]).unwrap();
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+
+        let wrong_key = KeyPair::generate().unwrap();
+        (
+            ca_pem,
+            leaf.pem(),
+            leaf_key.serialize_pem(),
+            wrong_key.serialize_pem(),
+        )
+    }
+
+    /// The manual `Debug` on `VaneClientCertificate`: a `{:?}` of a whole
+    /// config (the thing that ends up in logs) must never print PEM material.
+    /// The certificate fingerprint is public data and may appear.
+    #[test]
+    fn client_certificate_debug_is_redacted() {
+        let (_, cert_pem, key_pem, _) = test_client_identity();
+        let config = VaneClientConfig {
+            client_certificate: Some(VaneClientCertificate {
+                certificate_pem: cert_pem.clone(),
+                private_key_pem: key_pem,
+            }),
+            ..VaneClientConfig::default()
+        };
+
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("-----BEGIN"), "PEM leaked: {debug}");
+        assert!(
+            !debug.contains("PRIVATE KEY"),
+            "key material leaked: {debug}"
+        );
+        assert!(debug.contains("<redacted>"), "got {debug}");
+        assert!(
+            debug.contains(&sha256_hex_fingerprint(cert_pem.as_bytes())),
+            "the public fingerprint should be shown: {debug}"
+        );
+    }
+
+    /// The H3 mTLS assembly, end to end in memory: a chain + key as PEM
+    /// strings builds a real `quiche::Config` through the production
+    /// ctx-builder path with no temp file anywhere. (No hermetic H3 server
+    /// demands a client certificate, so this unit is the named stand-in for
+    /// the handshake itself; the live check stays advisory.)
+    #[test]
+    fn client_certificate_builds_a_quiche_config_from_memory() {
+        let (ca_pem, cert_pem, key_pem, _) = test_client_identity();
+        let tls = H3TlsMaterial::from_config(
+            &VaneClientConfig {
+                custom_root_certificates: vec![ca_pem],
+                ..VaneClientConfig::default()
+            },
+            Some(Arc::new(ClientIdentity {
+                chain_pem: cert_pem,
+                key_pem: Zeroizing::new(key_pem),
+            })),
+        );
+
+        create_quiche_config(30_000, MAX_DATAGRAM_SIZE, &tls)
+            .expect("the ctx-builder path should assemble from PEM in memory");
+    }
+
+    /// The §1.d key-lifetime rule: `VaneClient::new` moves the identity OUT
+    /// of the stored config, so the only living copy of the private key is
+    /// the shared `Zeroizing` one — a key left in `self.config` would sit in
+    /// memory unwiped for the client's lifetime.
+    #[test]
+    fn client_certificate_is_taken_out_of_the_stored_config() {
+        let (_, cert_pem, key_pem, _) = test_client_identity();
+        let client = VaneClient::new(VaneClientConfig {
+            client_certificate: Some(VaneClientCertificate {
+                certificate_pem: cert_pem.clone(),
+                private_key_pem: key_pem,
+            }),
+            ..VaneClientConfig::default()
+        })
+        .unwrap();
+
+        assert!(
+            client.config.client_certificate.is_none(),
+            "the stored config must carry no client-certificate material"
+        );
+        // Belt to the direct probe's braces: the config's debug output shows
+        // not even the redacted placeholder or the public fingerprint —
+        // there is nothing there to redact.
+        let debug = format!("{:?}", client.config);
+        assert!(!debug.contains("<redacted>"), "got {debug}");
+        assert!(
+            !debug.contains(&sha256_hex_fingerprint(cert_pem.as_bytes())),
+            "got {debug}"
+        );
+        let identity = client
+            .client_identity
+            .as_ref()
+            .expect("the shared identity holds the material instead");
+        assert_eq!(identity.chain_pem, cert_pem);
     }
 
     #[test]
@@ -9754,7 +10123,10 @@ mod tests {
 
     #[test]
     fn quiche_config_is_cached_per_idle_timeout_and_udp_payload() {
-        let cache = QuicConfigCache::new(HashMap::new());
+        let cache = QuicConfigCache {
+            configs: Mutex::new(HashMap::new()),
+            tls: H3TlsMaterial::from_config(&VaneClientConfig::default(), None),
+        };
         let scid = quiche::ConnectionId::from_ref(&[7; quiche::MAX_CONN_ID_LEN]);
         let local = SocketAddr::from(([127, 0, 0, 1], 4433));
         let peer = SocketAddr::from(([127, 0, 0, 1], 443));
@@ -9770,7 +10142,13 @@ mod tests {
             )
         };
         let cached_keys = || {
-            let mut keys = cache.lock().unwrap().keys().copied().collect::<Vec<_>>();
+            let mut keys = cache
+                .configs
+                .lock()
+                .unwrap()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
             keys.sort_unstable();
             keys
         };
@@ -9807,7 +10185,7 @@ mod tests {
         for seconds in 0..(MAX_QUIC_CONFIGS as u64 + 2) {
             connect(seconds + 1, MAX_DATAGRAM_SIZE).unwrap();
         }
-        assert!(cache.lock().unwrap().len() <= MAX_QUIC_CONFIGS);
+        assert!(cache.configs.lock().unwrap().len() <= MAX_QUIC_CONFIGS);
     }
 
     #[test]
@@ -9987,8 +10365,8 @@ mod tests {
             .dns_overrides
             .insert("api.example.com".to_string(), "203.0.113.10".to_string());
 
-        let base_key = PoolKey::new(&url, &base, &base.certificate_pins);
-        let dns_key = PoolKey::new(&url, &dns_config, &dns_config.certificate_pins);
+        let base_key = PoolKey::new(&url, &base, &base.certificate_pins, None);
+        let dns_key = PoolKey::new(&url, &dns_config, &dns_config.certificate_pins, None);
 
         assert_ne!(base_key, dns_key);
         assert_eq!(

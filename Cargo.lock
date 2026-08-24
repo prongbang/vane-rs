@@ -2180,6 +2180,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "uniffi",
+ "zeroize",
 ]
 
 [[package]]
