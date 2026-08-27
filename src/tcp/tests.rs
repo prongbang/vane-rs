@@ -2111,3 +2111,108 @@ mod streaming {
         );
     }
 }
+
+/// The caller-supplied DNS resolver on the TCP transport: the reqwest
+/// adapter is consulted (risk f2 TCP half), the URL port wins over the
+/// adapter's port-0 addresses, the setter clears the cached client, and a
+/// parked resolve never runs on the shared runtime (risk f3).
+mod dns_resolver {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{client_with, local_tls_server, raw_http_server, shared_client, with_test_root};
+    use crate::tests::RecordingResolver;
+    use crate::{VaneClientConfig, VaneDnsResolver, VaneProtocolMode};
+
+    const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+    #[test]
+    fn set_dns_resolver_clears_the_cached_tcp_client() {
+        let client = client_with(VaneClientConfig::default());
+        shared_client(&client).unwrap();
+        assert!(client.tcp_client.lock().unwrap().is_some());
+
+        // Same lifecycle as a pin change: the cached client captured the
+        // previous resolver at build.
+        client.set_dns_resolver(Some(
+            RecordingResolver::answering(&["127.0.0.1"]) as Arc<dyn VaneDnsResolver>
+        ));
+        assert!(client.tcp_client.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn the_resolver_steers_the_tcp_transport_and_the_url_port_wins() {
+        let (port, ca) = raw_http_server(&[("/", OK)]);
+        let _guard = with_test_root(ca);
+        let client = client_with(VaneClientConfig {
+            protocol_mode: VaneProtocolMode::Http1Only,
+            timeout_seconds: Some(10),
+            ..VaneClientConfig::default()
+        });
+        let recording = RecordingResolver::answering(&["127.0.0.1"]);
+        client.set_dns_resolver(Some(recording.clone() as Arc<dyn VaneDnsResolver>));
+
+        let response = client
+            .execute(crate::test_request(&format!("https://localhost:{port}/")))
+            .unwrap();
+
+        assert!(response.is_success);
+        // The adapter was the source (a recorded call), and its port-0
+        // addresses let the URL port through — the request reached `port`.
+        assert_eq!(recording.calls(), vec!["localhost".to_string()]);
+    }
+
+    #[test]
+    fn a_parked_resolve_stalls_neither_a_concurrent_request_nor_its_timeout() {
+        // A server that reads the request and never answers, so the
+        // concurrent request can only end by its own timeout firing.
+        let (port, ca, _leaf) = local_tls_server(b"http/1.1", |mut tls| {
+            let mut buf = [0u8; 8192];
+            let _ = std::io::Read::read(&mut tls, &mut buf);
+            std::thread::sleep(Duration::from_secs(20));
+        });
+        let _guard = with_test_root(ca);
+
+        struct SleepyResolver;
+        impl VaneDnsResolver for SleepyResolver {
+            fn resolve(&self, _host: String) -> Vec<String> {
+                std::thread::sleep(Duration::from_secs(6));
+                vec!["127.0.0.1".to_string()]
+            }
+        }
+
+        let client = Arc::new(client_with(VaneClientConfig {
+            protocol_mode: VaneProtocolMode::Http1Only,
+            timeout_seconds: Some(1),
+            // The override short-circuits ahead of the adapter, so this is
+            // the "already-resolved host" of the refutation.
+            dns_overrides: HashMap::from([("localhost".to_string(), "127.0.0.1".to_string())]),
+            ..VaneClientConfig::default()
+        }));
+        client.set_dns_resolver(Some(Arc::new(SleepyResolver) as Arc<dyn VaneDnsResolver>));
+
+        // Parks in the resolver for 6 s — inside spawn_blocking, if the
+        // bridge holds.
+        let parked = {
+            let client = Arc::clone(&client);
+            std::thread::spawn(move || client.execute(crate::test_request("https://slow.test:1/")))
+        };
+        // Give the parked request time to reach the resolver first.
+        std::thread::sleep(Duration::from_millis(300));
+
+        let started = Instant::now();
+        let err = client
+            .execute(crate::test_request(&format!("https://localhost:{port}/")))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        // Inline on the shared runtime, this request could neither run nor
+        // time out until the 6 s resolve returned.
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the concurrent request waited {elapsed:?} behind the parked resolve: {err}"
+        );
+        parked.join().unwrap().unwrap_err();
+    }
+}

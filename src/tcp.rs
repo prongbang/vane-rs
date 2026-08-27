@@ -28,14 +28,14 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, NamedGroup, SignatureScheme};
 
 use super::{
-    BodyStep, ClientIdentity, H3_BODY_BUFFER_BYTES, REDIRECT_REFUSED_HEADER, RedirectDecision,
-    RedirectRewrite, RequestBodyStream, ResponseState, StreamingBodySource, StreamingHopResult,
-    Url, VaneClient, VaneClientConfig, VaneError, VaneHeader, VaneHttpVersion, VaneProgressState,
-    VaneProtocolMode, VaneRequest, VaneResponse, VaneResponseStream, VaneTlsVersion, cancel_token,
-    check_cancelled, for_each_regular_header, header_survives_origin_change,
-    may_resume_tls_session, next_redirect_url, origin_port, progress_download, progress_handle,
-    progress_init, progress_upload, redact_url_userinfo, redirect_rewrite, resolve_peer_addr,
-    streaming_head, upload_total, verify_certificate_pins,
+    BodyStep, ClientDnsResolver, ClientIdentity, H3_BODY_BUFFER_BYTES, REDIRECT_REFUSED_HEADER,
+    RedirectDecision, RedirectRewrite, RequestBodyStream, ResponseState, StreamingBodySource,
+    StreamingHopResult, Url, VaneClient, VaneClientConfig, VaneError, VaneHeader, VaneHttpVersion,
+    VaneProgressState, VaneProtocolMode, VaneRequest, VaneResponse, VaneResponseStream,
+    VaneTlsVersion, cancel_token, check_cancelled, for_each_regular_header,
+    header_survives_origin_change, may_resume_tls_session, next_redirect_url, origin_port,
+    progress_download, progress_handle, progress_init, progress_upload, redact_url_userinfo,
+    redirect_rewrite, resolve_peer_addr, streaming_head, upload_total, verify_certificate_pins,
 };
 
 /// Wraps the platform's own certificate verifier and adds Vane's host-scoped
@@ -633,6 +633,46 @@ pub(crate) struct SharedTcpClient {
     tls: ClientConfig,
 }
 
+/// Bridges the client's installed [`ClientDnsResolver`] into reqwest.
+///
+/// The resolve — including the Dart rendezvous, which can park for up to its
+/// 10 s timeout — must NOT run inline in the returned future: reqwest's
+/// blocking client polls every in-flight request on one shared
+/// current-thread runtime, so an inline blocking resolve would
+/// head-of-line-block every concurrent TCP request AND park the tokio timer
+/// so their timeouts could not fire. `spawn_blocking` restores exactly the
+/// threading of hyper's default `GaiResolver`, which runs `getaddrinfo` on
+/// the same blocking pool.
+///
+/// Goes through [`resolve_peer_addr`], so both transports share one decision
+/// chain: the overrides win in here too (reqwest's own `builder.resolve`
+/// entries also short-circuit ahead of this adapter, saying the same thing).
+/// The resolved address only ever steers the socket — reqwest takes the TLS
+/// server name from the URL host, and the pin lookup
+/// ([`PinnedServerCertVerifier`]) keys off that same name.
+struct ResolverAdapter {
+    resolver: Arc<ClientDnsResolver>,
+    dns_overrides: HashMap<String, String>,
+}
+
+impl reqwest::dns::Resolve for ResolverAdapter {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let resolver = Arc::clone(&self.resolver);
+        let overrides = self.dns_overrides.clone();
+        Box::pin(async move {
+            let addr = tokio::task::spawn_blocking(move || {
+                // Port 0 tells reqwest to take the port from the URL — the
+                // same trick as the `builder.resolve` overrides.
+                resolve_peer_addr(name.as_str(), 0, &overrides, Some(&resolver))
+            })
+            .await
+            .map_err(|e| format!("dns resolver task failed: {e}"))?
+            .map_err(|e| e.to_string())?;
+            Ok(Box::new(std::iter::once(addr)) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 fn build_client(
     client: &VaneClient,
     certificate_pins: HashMap<String, Vec<String>>,
@@ -675,6 +715,16 @@ fn build_client(
         // Port 0 tells reqwest to take the port from the URL, matching how the
         // HTTP/3 path applies overrides.
         builder = builder.resolve(host, SocketAddr::new(ip, 0));
+    }
+
+    // With no resolver installed this branch is never taken and the path
+    // above is byte-for-byte today's. The setter clears the cached client, so
+    // a rebuild always captures the currently-installed resolver.
+    if let Some(resolver) = client.dns_resolver_snapshot() {
+        builder = builder.dns_resolver(Arc::new(ResolverAdapter {
+            resolver,
+            dns_overrides: config.dns_overrides.clone(),
+        }));
     }
 
     if let Some(proxy_url) = config.proxy_url.as_deref() {
@@ -784,6 +834,7 @@ pub(crate) fn warmup(client: &VaneClient, url: Option<&Url>) -> Result<(), VaneE
         host,
         url.port_or_known_default().unwrap_or(443),
         &client.config.dns_overrides,
+        client.dns_resolver_snapshot().as_deref(),
     )?;
     let timeout = Duration::from_secs(client.config.timeout_seconds.unwrap_or(30));
     let deadline = Instant::now() + timeout;

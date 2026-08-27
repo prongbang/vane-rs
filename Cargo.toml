@@ -24,6 +24,10 @@ thiserror = "2.0.12"
 # transparent decompression and the two transports must behave identically.
 # No `cookies`: vane's own jar drives both transports.
 reqwest = { version = "0.13", optional = true, default-features = false, features = ["blocking", "http2", "rustls-no-provider"] }
+# Already in the tree via reqwest; direct only so the DNS resolver adapter can
+# name `spawn_blocking` — the bridge that keeps a blocking resolve off
+# reqwest's shared runtime thread. "rt" alone: no macros, no extra runtime.
+tokio = { version = "1", optional = true, default-features = false, features = ["rt"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12", "logging"] }
 # Platform trust (SecTrust on Apple, JNI on Android). rustls-native-certs was
 # tried first and is dead on both: openssl-probe never looks in
@@ -44,7 +48,7 @@ spki-pinning = []
 # for a feature that is off by default. The dot-and-IP-literal guard in
 # `domain_is_assignable` ships in both profiles either way.
 psl = ["dep:psl"]
-tcp-fallback = ["dep:reqwest", "dep:rustls", "dep:rustls-platform-verifier", "dep:jni", "dep:log"]
+tcp-fallback = ["dep:reqwest", "dep:tokio", "dep:rustls", "dep:rustls-platform-verifier", "dep:jni", "dep:log"]
 
 # Android's trust store is only reachable over JNI, so the TCP path needs one
 # `Context` handshake before its first handshake. Pinned to the same 0.22 the

@@ -1904,4 +1904,76 @@ mod tests {
 
         crate::vane_ffi_client_close(handle);
     }
+
+    /// The caller-supplied DNS resolver on the H3 transport: the chain is
+    /// consulted (risk f2's H3 half) and drain-on-set holds (risk f4).
+    mod dns_resolver {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use super::super::{TEST_HOST, TestH3Server};
+        use crate::tests::RecordingResolver;
+        use crate::{VaneClient, VaneClientConfig, VaneDnsResolver, test_request};
+
+        #[test]
+        fn the_dns_resolver_steers_the_h3_transport() {
+            let server = TestH3Server::start();
+            // No dns_overrides: TEST_HOST resolves nowhere on the system, so
+            // success is itself proof the resolver was the source.
+            let client = VaneClient::new(VaneClientConfig {
+                timeout_seconds: Some(10),
+                ..VaneClientConfig::default()
+            })
+            .unwrap();
+            let recording = RecordingResolver::answering(&["127.0.0.1"]);
+            client.set_dns_resolver(Some(recording.clone() as Arc<dyn VaneDnsResolver>));
+
+            let response = client.execute(test_request(&server.url("/get"))).unwrap();
+
+            assert!(response.is_success);
+            assert_eq!(recording.calls(), vec![TEST_HOST.to_string()]);
+        }
+
+        #[test]
+        fn set_dns_resolver_drains_the_h3_pool() {
+            let server = TestH3Server::start();
+            // Pooling ON (the default): without the drain, the second request
+            // would ride the pooled connection and resolver B never runs.
+            let client = VaneClient::new(VaneClientConfig {
+                dns_overrides: HashMap::new(),
+                timeout_seconds: Some(10),
+                ..VaneClientConfig::default()
+            })
+            .unwrap();
+            let first = RecordingResolver::answering(&["127.0.0.1"]);
+            client.set_dns_resolver(Some(first.clone() as Arc<dyn VaneDnsResolver>));
+            assert!(
+                client
+                    .execute(test_request(&server.url("/get")))
+                    .unwrap()
+                    .is_success
+            );
+            assert_eq!(first.calls().len(), 1);
+
+            let second = RecordingResolver::answering(&["127.0.0.1"]);
+            client.set_dns_resolver(Some(second.clone() as Arc<dyn VaneDnsResolver>));
+            assert!(
+                client
+                    .execute(test_request(&server.url("/get")))
+                    .unwrap()
+                    .is_success
+            );
+
+            assert_eq!(
+                second.calls(),
+                vec![TEST_HOST.to_string()],
+                "the new resolver must be consulted — a pooled connection was not reused"
+            );
+            assert_eq!(
+                server.handshakes().len(),
+                2,
+                "the drain forces a fresh connection"
+            );
+        }
+    }
 }

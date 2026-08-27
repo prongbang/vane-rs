@@ -1176,6 +1176,55 @@ impl TlsSessionKey {
     }
 }
 
+/// A caller-supplied DNS resolver, consulted for every host between the
+/// `dns_overrides` map and the system resolver. Install one with
+/// [`VaneClient::set_dns_resolver`]; precedence is always
+/// `dns_overrides` (exact host match) → this resolver → system.
+#[uniffi::export(with_foreign)]
+pub trait VaneDnsResolver: Send + Sync {
+    /// Return IP address literals for `host` ("203.0.113.7", "2001:db8::1").
+    /// No ports, no hostnames.
+    ///
+    /// Threading, per binding — know your thread before you block:
+    /// - Dart: a native worker thread paired with a worker isolate; the main
+    ///   isolate is never blocked by requests.
+    /// - Swift/Kotlin, H3 path: the CALLER's thread of the sync
+    ///   `execute_request` — possibly the platform main thread on iOS.
+    /// - Swift/Kotlin, TCP path: tokio's blocking pool, via `spawn_blocking`
+    ///   (the reqwest resolver adapter) — never the caller's thread.
+    ///
+    /// Rules: must not invoke Vane requests (deadlock — it runs on the thread
+    /// that owns the in-flight request); must not block on work scheduled on
+    /// the platform main thread, because on iOS the callback may itself be
+    /// running there (the sync-execute case above).
+    ///
+    /// Failure is loud, never a silent fallback: an empty list or any entry
+    /// that is not an IP literal fails the resolution with a Transport error.
+    /// The system resolver is never consulted once a resolver is installed.
+    fn resolve(&self, host: String) -> Vec<String>;
+}
+
+/// The client's installed resolver: either a [`VaneDnsResolver`] trait
+/// object (Rust/Swift/Kotlin) or the Dart C-ABI rendezvous resolver. One
+/// internal seam, so [`resolve_peer_addr`] holds the whole decision chain
+/// and the two shapes cannot diverge on error semantics.
+enum ClientDnsResolver {
+    Foreign(Arc<dyn VaneDnsResolver>),
+    Ffi(FfiDnsResolver),
+}
+
+impl ClientDnsResolver {
+    /// The trait arm cannot fail by construction (bad output is caught by
+    /// the shared parse in [`resolve_peer_addr`]); the FFI arm can — its
+    /// rendezvous times out and its reply may carry an error flag.
+    fn resolve(&self, host: &str) -> Result<Vec<String>, VaneError> {
+        match self {
+            Self::Foreign(resolver) => Ok(resolver.resolve(host.to_string())),
+            Self::Ffi(resolver) => resolver.resolve(host),
+        }
+    }
+}
+
 // ---------- Client ----------
 #[derive(uniffi::Object)]
 pub struct VaneClient {
@@ -1189,6 +1238,9 @@ pub struct VaneClient {
     certificate_pins: Mutex<HashMap<String, Vec<String>>>,
     quic_config: QuicConfigCache,
     tls_sessions: TlsSessionStore,
+    /// Caller-supplied DNS resolver; see [`VaneClient::set_dns_resolver`].
+    /// `Arc` so a request snapshots it once and resolves without the lock.
+    dns_resolver: Mutex<Option<Arc<ClientDnsResolver>>>,
     /// Built on first TCP use so HTTP/3-only applications never spin up a tokio
     /// runtime, and cleared whenever the pins it was built with change.
     #[cfg(feature = "tcp-fallback")]
@@ -1299,6 +1351,7 @@ impl VaneClient {
                 tls: h3_tls,
             },
             tls_sessions: Mutex::new(HashMap::new()),
+            dns_resolver: Mutex::new(None),
             #[cfg(feature = "tcp-fallback")]
             tcp_client: Mutex::new(None),
         })
@@ -1843,6 +1896,7 @@ impl VaneClient {
             host,
             url.port_or_known_default().unwrap_or(443),
             &self.config.dns_overrides,
+            self.dns_resolver_snapshot().as_deref(),
         )?;
         let timeout = Duration::from_secs(self.config.timeout_seconds.unwrap_or(30));
         let timeouts = HopTimeouts {
@@ -1989,6 +2043,7 @@ impl VaneClient {
             host,
             url.port_or_known_default().unwrap_or(443),
             &self.config.dns_overrides,
+            self.dns_resolver_snapshot().as_deref(),
         )?;
         let cookie_header = if self.config.cookies_enabled {
             // Re-derived per hop: cookies are scoped by host and path, so the
@@ -2282,7 +2337,14 @@ impl VaneClient {
         certificate_pins: &HashMap<String, Vec<String>>,
     ) -> Result<PooledHttp3Connection, VaneError> {
         let proxy = MasqueProxyConfig::parse(proxy_url)?;
-        let proxy_addr = resolve_peer_addr(&proxy.host, proxy.port, &self.config.dns_overrides)?;
+        // The proxy resolves through the same chain as every origin —
+        // consistent with `dns_overrides` applying to the proxy today.
+        let proxy_addr = resolve_peer_addr(
+            &proxy.host,
+            proxy.port,
+            &self.config.dns_overrides,
+            self.dns_resolver_snapshot().as_deref(),
+        )?;
         let mut outer = connect_quic_h3(
             &proxy.host,
             proxy_addr,
@@ -2514,6 +2576,42 @@ impl VaneClient {
             }
         }
         self.clear_connection_pool()
+    }
+
+    fn dns_resolver_snapshot(&self) -> Option<Arc<ClientDnsResolver>> {
+        self.dns_resolver
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The one store-and-drain path behind both resolver setters (the UniFFI
+    /// [`Self::set_dns_resolver`] and the C-ABI rendezvous installer).
+    ///
+    /// Same lifecycle as a pin change: every pooled connection was resolved
+    /// under the previous resolver (or none) and [`PoolKey`] carries no
+    /// resolver identity, so drain-on-set is the only thing that keeps "set
+    /// after the first request" honest. The cached TCP client is dropped
+    /// (its reqwest resolver was captured at build), the H3 pool is closed
+    /// out, and the banked TLS sessions — warmup's other product — go with
+    /// them; the next handshake re-earns its ticket through the new resolver.
+    fn set_dns_resolver_internal(&self, resolver: Option<Arc<ClientDnsResolver>>) {
+        *self
+            .dns_resolver
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = resolver;
+        #[cfg(feature = "tcp-fallback")]
+        self.tcp_client
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        self.tls_sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        // Only fails on a poisoned pool lock, where there is nothing left to
+        // drain anyway.
+        self.clear_connection_pool().ok();
     }
 
     fn add_certificate_pin_internal(&self, host: String, pin: String) -> Result<(), VaneError> {
@@ -4826,10 +4924,18 @@ fn append_query_params(url: &mut Url, query_params: &HashMap<String, String>) {
     }
 }
 
+/// The one name-to-address decision chain, on every path of both transports:
+/// `dns_overrides` (exact host match) → `resolver` → system. An override hit
+/// never consults the resolver; a resolver failure never falls back to the
+/// system — a misconfigured resolver fails loudly, it does not silently
+/// degrade. The result only ever steers the socket: the TLS server name and
+/// the pin lookup host stay the URL's host on both transports, whatever this
+/// returns.
 fn resolve_peer_addr(
     host: &str,
     port: u16,
     dns_overrides: &HashMap<String, String>,
+    resolver: Option<&ClientDnsResolver>,
 ) -> Result<SocketAddr, VaneError> {
     if let Some(override_addr) = dns_overrides.get(host) {
         let ip = override_addr.parse::<IpAddr>().map_err(|e| {
@@ -4838,6 +4944,28 @@ fn resolve_peer_addr(
             ))
         })?;
         return Ok(SocketAddr::new(ip, port));
+    }
+
+    if let Some(resolver) = resolver {
+        let addresses = resolver.resolve(host)?;
+        if addresses.is_empty() {
+            return Err(VaneError::Transport(format!(
+                "dns resolver returned no addresses for {host}"
+            )));
+        }
+        // Every entry must parse, not just the winner: a garbage address is a
+        // resolver bug, and dropping it silently is how rhttp lost hosts. The
+        // message never echoes the value. First address wins, matching the
+        // system path's `.next()`.
+        let mut parsed = Vec::with_capacity(addresses.len());
+        for address in &addresses {
+            parsed.push(address.parse::<IpAddr>().map_err(|_| {
+                VaneError::Transport(format!(
+                    "dns resolver returned an invalid address for {host}"
+                ))
+            })?);
+        }
+        return Ok(SocketAddr::new(parsed[0], port));
     }
 
     (host, port)
@@ -6140,6 +6268,22 @@ impl VaneClient {
     pub fn warmup(&self, url: Option<String>) {
         let _ = self.warmup_inner(url.as_deref());
     }
+
+    /// Set or clear the resolver. Clears the cached TCP client AND drains the
+    /// H3 connection pool and any warmup state — same lifecycle as a pin
+    /// change — so no pooled connection resolved under the old resolver (or
+    /// no resolver) survives the switch.
+    ///
+    /// Precedence per lookup: `dns_overrides` (exact host match) → this
+    /// resolver → system; overrides are the more specific, deterministic
+    /// instruction and the resolver is never consulted for a host they name.
+    /// "Set it before the first request" is the documented fast path; setting
+    /// it later is correct, just costs the pools.
+    pub fn set_dns_resolver(&self, resolver: Option<Arc<dyn VaneDnsResolver>>) {
+        self.set_dns_resolver_internal(
+            resolver.map(|resolver| Arc::new(ClientDnsResolver::Foreign(resolver))),
+        );
+    }
 }
 
 // ---------- Helpers ----------
@@ -6408,32 +6552,230 @@ pub extern "C" fn vane_ffi_client_create(
 pub type VaneFfiDnsResolveCallback =
     extern "C" fn(request_id: u64, host: VaneFfiString, user_data: *mut std::ffi::c_void);
 
+/// Fixed rendezvous budget; make it a knob only if someone asks.
+const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cap on retained timed-out entries, drop-oldest like [`MAX_TLS_SESSIONS`].
+const MAX_DNS_TOMBSTONES: usize = 8;
+
+/// The rendezvous ledger: every in-flight (or timed-out, awaiting its late
+/// reply) resolution, keyed by request id. One process-wide table, because
+/// [`vane_ffi_dns_resolver_reply`] carries only the id; each entry is tagged
+/// with its client handle so a closing client can retire its own.
+struct DnsRendezvous {
+    pending: HashMap<u64, PendingResolve>,
+    /// Timed-out ids in timeout order, capped at [`MAX_DNS_TOMBSTONES`]
+    /// (drop-oldest) so ids whose reply never comes cannot accumulate.
+    tombstones: VecDeque<u64>,
+}
+
+struct PendingResolve {
+    /// The [`vane_ffi_client_create`] handle whose request is waiting.
+    client: u64,
+    /// Owns the buffer the callback's `host` parameter points into. Heap
+    /// storage, so the pointer survives map rehashes and stays valid until
+    /// the id retires.
+    host: String,
+    /// `Some` once replied (or the client closed): the newline-split IP
+    /// literals, or the Transport error message.
+    outcome: Option<Result<Vec<String>, String>>,
+    /// The waiter timed out and is gone; the entry only keeps the host
+    /// buffer alive for a late listener. The late reply — or client close —
+    /// frees it.
+    tombstoned: bool,
+}
+
+static FFI_DNS: LazyLock<Mutex<DnsRendezvous>> = LazyLock::new(|| {
+    Mutex::new(DnsRendezvous {
+        pending: HashMap::new(),
+        tombstones: VecDeque::new(),
+    })
+});
+static FFI_DNS_WAKE: Condvar = Condvar::new();
+
+/// The Dart-side resolver: no closure crosses the C ABI, so a resolve is a
+/// request-id rendezvous — invoke the callback with `(id, host)`, then park
+/// on [`FFI_DNS`] until [`vane_ffi_dns_resolver_reply`] fills the slot or
+/// [`DNS_RESOLVE_TIMEOUT`] runs out. On the TCP path this parking happens
+/// inside `spawn_blocking` (the reqwest resolver adapter in [`tcp`]), never
+/// on reqwest's runtime thread; on the H3 path it parks the request's own
+/// worker thread — the same thread the blocking system call it replaces
+/// would have parked.
+struct FfiDnsResolver {
+    callback: VaneFfiDnsResolveCallback,
+    user_data: *mut std::ffi::c_void,
+    /// The owning client's registry handle, so [`vane_ffi_client_close`] can
+    /// retire this resolver's in-flight ids.
+    client: u64,
+}
+
+// SAFETY: part of the `vane_ffi_set_dns_resolver` contract — the callback
+// must be callable from any thread (Vane invokes it from worker threads),
+// and `user_data` is an opaque token the callback owns.
+unsafe impl Send for FfiDnsResolver {}
+unsafe impl Sync for FfiDnsResolver {}
+
+impl FfiDnsResolver {
+    fn resolve(&self, host: &str) -> Result<Vec<String>, VaneError> {
+        // Shared with the client/stream handles, so an id is unique across
+        // everything that ever crosses this ABI.
+        let request_id = FFI_NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+        let host_ffi = {
+            let mut rendezvous = FFI_DNS.lock().unwrap_or_else(PoisonError::into_inner);
+            rendezvous.pending.insert(
+                request_id,
+                PendingResolve {
+                    client: self.client,
+                    host: host.to_string(),
+                    outcome: None,
+                    tombstoned: false,
+                },
+            );
+            let owned = rendezvous.pending[&request_id].host.as_str();
+            VaneFfiString {
+                data: owned.as_ptr(),
+                len: owned.len(),
+            }
+        };
+        // Invoked outside the lock: a listener that replies synchronously on
+        // this very thread re-enters the registry.
+        (self.callback)(request_id, host_ffi, self.user_data);
+
+        let deadline = Instant::now() + DNS_RESOLVE_TIMEOUT;
+        let mut rendezvous = FFI_DNS.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            match rendezvous.pending.get(&request_id) {
+                // Defensive: nothing removes a waiting entry today (close
+                // fills its outcome instead), but a missing id must not hang.
+                None => {
+                    return Err(VaneError::Transport(format!(
+                        "dns resolution for {host} was abandoned: the client was closed"
+                    )));
+                }
+                Some(entry) if entry.outcome.is_some() => {
+                    // A replied entry is safe to remove — the reply came FROM
+                    // the listener, so the listener is done with the host
+                    // pointer. A close-settled entry is not: the listener may
+                    // still be queued holding it, so it was tombstoned and
+                    // stays until the late reply (or the cap) retires it.
+                    let outcome = if entry.tombstoned {
+                        rendezvous
+                            .pending
+                            .get_mut(&request_id)
+                            .expect("entry was just seen under the lock")
+                            .outcome
+                            .take()
+                            .expect("outcome was just seen under the lock")
+                    } else {
+                        rendezvous
+                            .pending
+                            .remove(&request_id)
+                            .expect("entry was just seen under the lock")
+                            .outcome
+                            .expect("outcome was just seen under the lock")
+                    };
+                    return outcome.map_err(VaneError::Transport);
+                }
+                Some(_) => {}
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Tombstone, never free: the callback's listener may still
+                // hold the host pointer, so the entry lives until the late
+                // reply (or client close) retires it.
+                if let Some(entry) = rendezvous.pending.get_mut(&request_id) {
+                    entry.tombstoned = true;
+                }
+                rendezvous.tombstones.push_back(request_id);
+                while rendezvous.tombstones.len() > MAX_DNS_TOMBSTONES {
+                    if let Some(oldest) = rendezvous.tombstones.pop_front() {
+                        rendezvous.pending.remove(&oldest);
+                    }
+                }
+                return Err(VaneError::Transport(format!(
+                    "dns resolver timed out for {host}"
+                )));
+            }
+            rendezvous = FFI_DNS_WAKE
+                .wait_timeout(rendezvous, remaining)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
 /// Install/replace/clear (callback = None) the resolver for a client.
 ///
-/// Part of the v5 symbol inventory; a stub until the resolver batch wires the
-/// rendezvous — it always reports failure so a caller cannot believe a
-/// resolver is installed that no request will ever consult.
+/// The callback must be callable from any thread and stay valid until it is
+/// replaced, cleared, or the client is closed; `user_data` is passed back
+/// verbatim on every invocation. Installing (or clearing) drains the cached
+/// TCP client and the H3 pool exactly like [`VaneClient::set_dns_resolver`].
+/// Returns false for an unknown client handle.
 #[unsafe(no_mangle)]
 pub extern "C" fn vane_ffi_set_dns_resolver(
-    _client: u64,
-    _callback: Option<VaneFfiDnsResolveCallback>,
-    _user_data: *mut std::ffi::c_void,
+    client: u64,
+    callback: Option<VaneFfiDnsResolveCallback>,
+    user_data: *mut std::ffi::c_void,
 ) -> bool {
-    false
+    std::panic::catch_unwind(|| {
+        let Some(client_arc) = FFI_CLIENTS
+            .lock()
+            .ok()
+            .and_then(|clients| clients.get(&client).cloned())
+        else {
+            return false;
+        };
+        client_arc.set_dns_resolver_internal(callback.map(|callback| {
+            Arc::new(ClientDnsResolver::Ffi(FfiDnsResolver {
+                callback,
+                user_data,
+                client,
+            }))
+        }));
+        true
+    })
+    .unwrap_or(false)
 }
 
 /// Complete a resolution. `ips`: newline-separated IP literals, UTF-8;
 /// `is_error` true (or an empty list) fails the resolution loudly.
-/// Unknown/expired request ids are a safe no-op.
-///
-/// Part of the v5 symbol inventory; a no-op until the resolver batch wires
-/// the rendezvous (no resolver can be installed yet, so every id is unknown).
+/// Unknown/expired request ids are a safe no-op; a reply that lands after
+/// the rendezvous timed out retires the id (and the host memory the
+/// callback was handed) without waking anyone.
 #[unsafe(no_mangle)]
-pub extern "C" fn vane_ffi_dns_resolver_reply(
-    _request_id: u64,
-    _ips: VaneFfiString,
-    _is_error: bool,
-) {
+pub extern "C" fn vane_ffi_dns_resolver_reply(request_id: u64, ips: VaneFfiString, is_error: bool) {
+    let _ = std::panic::catch_unwind(|| {
+        let mut rendezvous = FFI_DNS.lock().unwrap_or_else(PoisonError::into_inner);
+        let (tombstoned, host) = match rendezvous.pending.get(&request_id) {
+            // Unknown or already-retired id: safe no-op.
+            None => return,
+            Some(entry) => (entry.tombstoned, entry.host.clone()),
+        };
+        if tombstoned {
+            rendezvous.pending.remove(&request_id);
+            rendezvous.tombstones.retain(|id| *id != request_id);
+            return;
+        }
+        // Copied out under the call: the caller's `ips` buffer is only valid
+        // for the duration of this function.
+        let outcome = if is_error {
+            Err(format!("dns resolver reported an error for {host}"))
+        } else {
+            match ffi_string(ips, "dns resolver reply") {
+                Ok(list) => Ok(list
+                    .split('\n')
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect()),
+                Err(message) => Err(message),
+            }
+        };
+        if let Some(entry) = rendezvous.pending.get_mut(&request_id) {
+            entry.outcome = Some(outcome);
+        }
+        FFI_DNS_WAKE.notify_all();
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -6444,6 +6786,38 @@ pub extern "C" fn vane_ffi_client_close(handle: u64) {
     if let Ok(mut clients) = FFI_CLIENTS.lock() {
         clients.remove(&handle);
     }
+    // Settle the client's rendezvous ids: wake every waiter with a terminal
+    // error. Nothing is freed here — the callback's listener may still be
+    // queued holding an entry's host pointer, so every settled entry is
+    // tombstoned and lives until its late reply (or the tombstone cap)
+    // retires it. That cap is the one deliberate ceiling: an entry evicted
+    // by 8 newer tombstones frees its host with a listener theoretically
+    // still queued — accepted, bounded, and the reason the cap is small.
+    let mut rendezvous = FFI_DNS.lock().unwrap_or_else(PoisonError::into_inner);
+    let ids: Vec<u64> = rendezvous
+        .pending
+        .iter()
+        .filter(|(_, entry)| entry.client == handle)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in ids {
+        if let Some(entry) = rendezvous.pending.get_mut(&id) {
+            entry.outcome = Some(Err(format!(
+                "dns resolution for {} was abandoned: the client was closed",
+                entry.host
+            )));
+            if !entry.tombstoned {
+                entry.tombstoned = true;
+                rendezvous.tombstones.push_back(id);
+            }
+        }
+    }
+    while rendezvous.tombstones.len() > MAX_DNS_TOMBSTONES {
+        if let Some(oldest) = rendezvous.tombstones.pop_front() {
+            rendezvous.pending.remove(&oldest);
+        }
+    }
+    FFI_DNS_WAKE.notify_all();
 }
 
 #[unsafe(no_mangle)]
@@ -8447,7 +8821,7 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert("api.example.com".to_string(), "203.0.113.10".to_string());
 
-        let addr = resolve_peer_addr("api.example.com", 443, &overrides).unwrap();
+        let addr = resolve_peer_addr("api.example.com", 443, &overrides, None).unwrap();
 
         assert_eq!(addr, SocketAddr::from(([203, 0, 113, 10], 443)));
     }
@@ -8457,9 +8831,96 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert("api.example.com".to_string(), "not-an-ip".to_string());
 
-        let err = resolve_peer_addr("api.example.com", 443, &overrides).unwrap_err();
+        let err = resolve_peer_addr("api.example.com", 443, &overrides, None).unwrap_err();
 
         assert!(err.to_string().contains("Invalid DNS override"));
+    }
+
+    /// A [`VaneDnsResolver`] fake that records every host it is asked about
+    /// and answers with a fixed list. Shared by the chain tests here and the
+    /// transport tests in `h3_offline` and `tcp::tests`.
+    pub(crate) struct RecordingResolver {
+        pub(crate) answers: Vec<String>,
+        pub(crate) calls: Mutex<Vec<String>>,
+    }
+
+    impl RecordingResolver {
+        pub(crate) fn answering(answers: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                answers: answers.iter().map(|s| s.to_string()).collect(),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        pub(crate) fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl VaneDnsResolver for RecordingResolver {
+        fn resolve(&self, host: String) -> Vec<String> {
+            self.calls.lock().unwrap().push(host);
+            self.answers.clone()
+        }
+    }
+
+    #[test]
+    fn dns_override_wins_and_the_resolver_is_never_consulted() {
+        let overrides =
+            HashMap::from([("api.example.com".to_string(), "203.0.113.10".to_string())]);
+        let recording = RecordingResolver::answering(&["198.51.100.1"]);
+        let resolver = ClientDnsResolver::Foreign(recording.clone());
+
+        let addr = resolve_peer_addr("api.example.com", 443, &overrides, Some(&resolver)).unwrap();
+
+        assert_eq!(addr, SocketAddr::from(([203, 0, 113, 10], 443)));
+        assert!(
+            recording.calls().is_empty(),
+            "override hit must not consult the resolver"
+        );
+    }
+
+    #[test]
+    fn resolver_is_consulted_when_no_override_matches() {
+        let recording = RecordingResolver::answering(&["203.0.113.7", "203.0.113.8"]);
+        let resolver = ClientDnsResolver::Foreign(recording.clone());
+
+        let addr =
+            resolve_peer_addr("api.example.com", 443, &HashMap::new(), Some(&resolver)).unwrap();
+
+        // First address wins, matching the system path's `.next()`.
+        assert_eq!(addr, SocketAddr::from(([203, 0, 113, 7], 443)));
+        assert_eq!(recording.calls(), vec!["api.example.com".to_string()]);
+    }
+
+    #[test]
+    fn resolver_garbage_address_is_a_hard_transport_error() {
+        // Garbage in ANY position fails — the winner parsing while a later
+        // entry rots is exactly the silent degradation this forbids.
+        let resolver =
+            ClientDnsResolver::Foreign(RecordingResolver::answering(&["203.0.113.7", "not-an-ip"]));
+
+        let err = resolve_peer_addr("api.example.com", 443, &HashMap::new(), Some(&resolver))
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(matches!(err, VaneError::Transport(_)), "got {message}");
+        assert!(message.contains("invalid address"), "got {message}");
+        assert!(
+            !message.contains("not-an-ip"),
+            "the message must not echo the value: {message}"
+        );
+    }
+
+    #[test]
+    fn resolver_empty_list_is_a_hard_transport_error() {
+        let resolver = ClientDnsResolver::Foreign(RecordingResolver::answering(&[]));
+
+        let err = resolve_peer_addr("api.example.com", 443, &HashMap::new(), Some(&resolver))
+            .unwrap_err();
+
+        assert!(matches!(err, VaneError::Transport(_)));
+        assert!(err.to_string().contains("no addresses"), "got {err}");
     }
 
     #[test]
