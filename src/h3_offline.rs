@@ -1975,5 +1975,44 @@ mod tests {
                 "the drain forces a fresh connection"
             );
         }
+
+        #[test]
+        fn a_pooled_h3_request_never_consults_the_resolver() {
+            let server = TestH3Server::start();
+            // Pooling ON (the default): the second request must ride the
+            // pooled connection, and a pooled request has no dial — so it
+            // has nothing to resolve.
+            let client = VaneClient::new(VaneClientConfig {
+                timeout_seconds: Some(10),
+                ..VaneClientConfig::default()
+            })
+            .unwrap();
+            let recording = RecordingResolver::answering(&["127.0.0.1"]);
+            client.set_dns_resolver(Some(recording.clone() as Arc<dyn VaneDnsResolver>));
+
+            assert!(
+                client
+                    .execute(test_request(&server.url("/get")))
+                    .unwrap()
+                    .is_success
+            );
+            assert!(
+                client
+                    .execute(test_request(&server.url("/get")))
+                    .unwrap()
+                    .is_success
+            );
+
+            assert_eq!(
+                server.handshakes().len(),
+                1,
+                "the second request must reuse the pool"
+            );
+            assert_eq!(
+                recording.calls(),
+                vec![TEST_HOST.to_string()],
+                "resolution belongs to the dial, not the request"
+            );
+        }
     }
 }

@@ -2039,12 +2039,7 @@ impl VaneClient {
         if let Some(proxy_url) = self.config.proxy_url.as_deref() {
             MasqueProxyConfig::parse(proxy_url)?;
         }
-        let peer_addr = resolve_peer_addr(
-            host,
-            url.port_or_known_default().unwrap_or(443),
-            &self.config.dns_overrides,
-            self.dns_resolver_snapshot().as_deref(),
-        )?;
+        let origin_port = url.port_or_known_default().unwrap_or(443);
         let cookie_header = if self.config.cookies_enabled {
             // Re-derived per hop: cookies are scoped by host and path, so the
             // header built for the first URL is wrong for a redirect target.
@@ -2087,8 +2082,19 @@ impl VaneClient {
             let reused = pooled.is_some();
             let mut transport = match pooled {
                 Some(connection) => connection,
-                None => self
-                    .connect_http3(
+                None => {
+                    // Resolved here, not at hop entry: a pooled request has
+                    // no dial and must not pay (or consult) the resolver —
+                    // remote_ip reports the connection's own peer and the
+                    // session key needs only the URL port. Measured at
+                    // 0.8–1.6 ms per pooled request on the host getaddrinfo.
+                    let peer_addr = resolve_peer_addr(
+                        host,
+                        origin_port,
+                        &self.config.dns_overrides,
+                        self.dns_resolver_snapshot().as_deref(),
+                    )?;
+                    self.connect_http3(
                         host,
                         peer_addr,
                         hop.timeouts,
@@ -2097,7 +2103,8 @@ impl VaneClient {
                     )
                     .inspect_err(|_| {
                         self.drop_closed_connections();
-                    })?,
+                    })?
+                }
             };
 
             let mut response_started = false;
@@ -2161,7 +2168,7 @@ impl VaneClient {
                     store_tls_session(
                         &self.tls_sessions,
                         &transport.conn,
-                        &TlsSessionKey::origin(host, peer_addr.port()),
+                        &TlsSessionKey::origin(host, origin_port),
                         certificate_pins,
                     );
 
