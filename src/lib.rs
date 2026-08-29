@@ -908,6 +908,31 @@ pub struct VaneClientConfig {
     /// Client certificate (mTLS) presented to the origin on both stacks.
     #[uniffi(default = None)]
     pub client_certificate: Option<VaneClientCertificate>,
+    /// Seconds of no forward progress after which an HTTP/3 request fails,
+    /// instead of `timeout_seconds` bounding the request as a whole.
+    ///
+    /// `None` (the default) keeps the historical behaviour exactly:
+    /// `timeout_seconds` is an absolute deadline covering handshake, upload
+    /// and download together, so a body larger than the link can move in that
+    /// window fails however healthy the connection is.
+    ///
+    /// `Some(n)` trades that bound for a progress-based one: the request may
+    /// run as long as it keeps moving, and fails after `n` seconds in which
+    /// nothing was uploaded, nothing was downloaded and no state advanced.
+    /// It is opt-in because it is a real loosening — nothing then caps a
+    /// request's total duration, and a peer willing to dribble one byte per
+    /// interval can hold it open. The transport-level backstop still applies:
+    /// QUIC's idle timeout is armed from the same value, so a peer that goes
+    /// entirely silent still kills the connection.
+    ///
+    /// HTTP/3 only. reqwest wraps body-send and header-send in one call, so
+    /// the TCP path cannot observe upload progress to reset anything against;
+    /// it stays on the absolute deadline. Documented rather than rejected, on
+    /// the `tls_min_version` precedent — a knob that one transport enforces
+    /// and the other cannot is a fact about the transports, not a caller
+    /// error.
+    #[uniffi(default = None)]
+    pub inactivity_timeout_seconds: Option<u64>,
 }
 
 impl Default for VaneClientConfig {
@@ -943,6 +968,7 @@ impl Default for VaneClientConfig {
             tls_max_version: None,
             custom_root_certificates: vec![],
             client_certificate: None,
+            inactivity_timeout_seconds: None,
         }
     }
 }
@@ -1660,6 +1686,10 @@ impl VaneClient {
                 // timeout, and the retry loop multiplies that again.
                 deadline: Instant::now() + timeout,
                 idle: timeout,
+                inactivity: self
+                    .config
+                    .inactivity_timeout_seconds
+                    .map(Duration::from_secs),
             },
             max_redirects: self.config.max_redirects,
         }
@@ -1723,6 +1753,10 @@ impl VaneClient {
                 // timeout as its inactivity budget instead.
                 deadline: Instant::now() + timeout,
                 idle: timeout,
+                inactivity: this
+                    .config
+                    .inactivity_timeout_seconds
+                    .map(Duration::from_secs),
             },
             max_redirects: this.config.max_redirects,
         }
@@ -1910,6 +1944,10 @@ impl VaneClient {
         let timeouts = HopTimeouts {
             deadline: Instant::now() + timeout,
             idle: timeout,
+            inactivity: self
+                .config
+                .inactivity_timeout_seconds
+                .map(Duration::from_secs),
         };
         let connection = self.connect_http3(host, peer_addr, timeouts, key, &certificate_pins)?;
         self.return_pooled_connection(connection)
@@ -2063,11 +2101,7 @@ impl VaneClient {
             hop.origin,
             cookie_header.as_deref(),
             hop.body_dropped,
-            // A streamed body of known length declares it; RESERVED_HEADERS
-            // keeps callers from setting a conflicting one. (The buffered H3
-            // path historically sends no content-length — FIN delimits — and
-            // this change leaves that as it was.)
-            hop.body_stream.and_then(|stream| stream.content_length),
+            h3_content_length(hop.body, hop.body_stream),
         )?;
         let pool_key = PoolKey::new(
             url,
@@ -2117,6 +2151,7 @@ impl VaneClient {
 
             let mut response_started = false;
             let options = H3RequestOptions {
+                inactivity: hop.timeouts.inactivity,
                 headers: &headers,
                 request_body,
                 body_stream: hop.body_stream,
@@ -2182,7 +2217,15 @@ impl VaneClient {
 
                     return match mode {
                         H3HopMode::Buffered => {
-                            self.park_or_close_h3(transport)?;
+                            self.park_or_close_h3(
+                                transport,
+                                unfinished_request_stream(
+                                    exchange.stream_id,
+                                    exchange.body_offset,
+                                    request_body.len(),
+                                    exchange.upload.as_ref(),
+                                ),
+                            )?;
                             Ok(H3HopOutcome::Response(Http3ResponseParts {
                                 body_len: exchange.response.body_len as u64,
                                 status_code: exchange.response.status_code,
@@ -2209,7 +2252,15 @@ impl VaneClient {
                                 // nothing will consume the upload stream
                                 // again, so a still-pushing writer is released
                                 // here rather than left parked.
-                                self.park_or_close_h3(transport)?;
+                                self.park_or_close_h3(
+                                    transport,
+                                    unfinished_request_stream(
+                                        exchange.stream_id,
+                                        exchange.body_offset,
+                                        request_body.len(),
+                                        exchange.upload.as_ref(),
+                                    ),
+                                )?;
                                 if let Some(upload) = &exchange.upload {
                                     upload.source.release();
                                 }
@@ -2240,7 +2291,12 @@ impl VaneClient {
                                     // stream ends in any way.
                                     upload: exchange.upload.take(),
                                     report_upload: hop.report_upload,
-                                    idle: hop.timeouts.idle,
+                                    // The download pull was already an
+                                    // inactivity budget; the knob just names
+                                    // it, so a caller who set one gets the
+                                    // same bound on both halves of the
+                                    // exchange instead of two different ones.
+                                    idle: hop.timeouts.inactivity.unwrap_or(hop.timeouts.idle),
                                 }))
                             };
                             Ok(H3HopOutcome::Stream {
@@ -2287,8 +2343,29 @@ impl VaneClient {
     /// Returns a connection whose response was fully read to the pool, or
     /// closes it when pooling is off. Shared by the buffered hop and the
     /// streaming completion so the two can never disagree on reusability.
-    fn park_or_close_h3(&self, mut transport: PooledHttp3Connection) -> Result<(), VaneError> {
+    ///
+    /// `unfinished_request_stream` carries the id of a request stream whose
+    /// body was abandoned — see [`unfinished_request_stream`]. RFC 9114 §4.1
+    /// has the client reset such a stream rather than leave it dangling; doing
+    /// it here, at the one place a connection is handed back, is what keeps the
+    /// buffered and streaming paths from disagreeing about it. Only on the
+    /// parking branch: the closing branch sends CONNECTION_CLOSE, which ends
+    /// every stream on the connection anyway.
+    fn park_or_close_h3(
+        &self,
+        mut transport: PooledHttp3Connection,
+        unfinished_request_stream: Option<u64>,
+    ) -> Result<(), VaneError> {
         if self.config.connection_pool_enabled && !transport.conn.is_closed() {
+            if let Some(stream_id) = unfinished_request_stream {
+                // Best-effort: quiche refuses this on a stream it has already
+                // torn down, which is exactly the case where nothing is owed.
+                transport
+                    .conn
+                    .stream_shutdown(stream_id, quiche::Shutdown::Write, H3_NO_ERROR)
+                    .ok();
+                transport.flush_packets().ok();
+            }
             self.return_pooled_connection(transport)
         } else {
             transport.conn.close(true, 0x00, b"done").ok();
@@ -2730,6 +2807,11 @@ struct HopTimeouts {
     /// the platform roots — and evict the cache on every hop. It is also a
     /// property of the connection, which outlives the request in the pool.
     idle: Duration,
+    /// `Some` when the caller set `inactivity_timeout_seconds`, which trades
+    /// `deadline` for a bound on time without forward progress. The two are
+    /// alternatives, not layers: leaving `deadline` in force would cap the
+    /// request anyway and the knob would do nothing.
+    inactivity: Option<Duration>,
 }
 
 impl HopTimeouts {
@@ -2737,6 +2819,13 @@ impl HopTimeouts {
     /// Every stage that arms a socket or starts a loop asks for this rather than
     /// carrying a budget of its own.
     fn remaining(&self, what: &str) -> Result<Duration, VaneError> {
+        // In inactivity mode there is no absolute bound to be out of. Callers
+        // here are arming a socket or entering a loop and want a finite value;
+        // the inactivity budget is the right one, since it is what will
+        // actually end a stalled request.
+        if let Some(inactivity) = self.inactivity {
+            return Ok(inactivity);
+        }
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(VaneError::Timeout(format!("HTTP/3 {what} timed out")));
@@ -3587,7 +3676,15 @@ impl H3BodyStream {
             upload.source.release();
         }
         if let Some(transport) = self.transport.take() {
-            self.client.park_or_close_h3(transport)?;
+            self.client.park_or_close_h3(
+                transport,
+                unfinished_request_stream(
+                    self.stream_id,
+                    self.body_offset,
+                    self.request_body.len(),
+                    self.upload.as_ref(),
+                ),
+            )?;
         }
         progress_download(
             progress,
@@ -4059,8 +4156,16 @@ fn connect_quic_h3(
     let mut send_buf = vec![0; MAX_DATAGRAM_SIZE];
     flush_quic_packets(&socket, &mut send_buf, &mut conn)?;
     let deadline = timeouts.deadline;
+    // The per-handshake half of `inactivity_timeout_seconds`. A handshake that
+    // is exchanging packets is making progress even on a slow or lossy link,
+    // and it shares one deadline with the upload and the download, so on the
+    // absolute bound a long handshake eats the body's budget. Received packets
+    // are the signal: quiche counts them, and unlike the exchange loop there is
+    // no application-level byte to watch yet.
+    let mut stall_deadline = timeouts.inactivity.map(|budget| Instant::now() + budget);
+    let mut last_recv = conn.stats().recv;
 
-    while Instant::now() < deadline {
+    while Instant::now() < stall_deadline.unwrap_or(deadline) {
         read_quic_packets(
             &socket,
             &mut last_read_timeout,
@@ -4069,6 +4174,12 @@ fn connect_quic_h3(
             local_addr,
             peer_addr,
         )?;
+
+        let recv = conn.stats().recv;
+        if recv != last_recv {
+            last_recv = recv;
+            stall_deadline = timeouts.inactivity.map(|budget| Instant::now() + budget);
+        }
 
         if conn.is_established() {
             verify_certificate_pins(host, conn.peer_cert(), certificate_pins)?;
@@ -4408,7 +4519,10 @@ struct H3RequestOptions<'a> {
     /// [`RequestBodyStream::try_pull`].
     max_request_body_bytes: u64,
     /// Shared with every other stage of the request; see [`HopTimeouts`].
+    /// Ignored while `inactivity` is `Some`.
     deadline: Instant,
+    /// See [`HopTimeouts::inactivity`].
+    inactivity: Option<Duration>,
     url: &'a Url,
     max_response_body_bytes: u64,
     response_body_path: Option<&'a str>,
@@ -4429,6 +4543,38 @@ struct H3ExchangeState {
     /// body. Lives here so a streaming-response caller that stops at the
     /// headers can keep pumping the upload from `H3BodyStream::next`.
     upload: Option<StreamedUpload>,
+}
+
+/// RFC 9114 §8.1 `H3_NO_ERROR`: "no error", the code to use when a stream is
+/// being closed and nothing went wrong.
+const H3_NO_ERROR: u64 = 0x0100;
+
+/// The request stream's id when its write side was never FINed, or `None` when
+/// the body was fully sent.
+///
+/// A server is allowed to answer before it has read the whole request body, and
+/// Vane stops pushing once it has the response. That leaves the request stream
+/// open for writing with the peer still entitled to more bytes. Parking such a
+/// connection is the problem: the stream stays half-open for the life of the
+/// pooled connection, holding its slot against `max_streams_bidi`, so a client
+/// that keeps hitting an endpoint which answers early runs the connection out
+/// of stream credit and stalls on a connection that looks perfectly healthy.
+///
+/// Covers both shapes of body, since either can be left short: a buffered body
+/// by `body_offset` never reaching the end, a streamed one by the pump never
+/// getting its FIN accepted.
+fn unfinished_request_stream(
+    stream_id: Option<u64>,
+    body_offset: usize,
+    request_body_len: usize,
+    upload: Option<&StreamedUpload>,
+) -> Option<u64> {
+    let finned = match upload {
+        Some(upload) => upload.finished,
+        // Also the empty-body case, where the FIN rode out on the headers.
+        None => body_offset >= request_body_len,
+    };
+    if finned { None } else { stream_id }
 }
 
 /// Feeds a [`RequestBodyStream`] into one HTTP/3 request stream, as far as
@@ -4545,6 +4691,37 @@ impl StreamedUpload {
     }
 }
 
+/// Everything an in-flight exchange can advance, sampled once per drive pass.
+///
+/// "No forward progress" has to mean the same thing for an upload and a
+/// download, and neither side reports bytes up to the loop: quiche accepts
+/// request bytes inside `advance_request_body` and delivers response bytes
+/// inside `process_h3_events`. Comparing a snapshot before and after a pass
+/// gets the answer without threading a counter through either. `uploaded`
+/// covers both body shapes, since a streamed body leaves `body_offset` at
+/// zero forever.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct H3Progress {
+    stream_open: bool,
+    uploaded: u64,
+    downloaded: usize,
+    headers_complete: bool,
+}
+
+impl H3Progress {
+    fn of(exchange: &H3ExchangeState) -> Self {
+        Self {
+            stream_open: exchange.stream_id.is_some(),
+            uploaded: match &exchange.upload {
+                Some(upload) => upload.sent(),
+                None => exchange.body_offset as u64,
+            },
+            downloaded: exchange.response.body_len,
+            headers_complete: exchange.response.headers_complete,
+        }
+    }
+}
+
 /// How far [`drive_h3_exchange`] runs before returning control.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum H3DriveUntil {
@@ -4624,7 +4801,28 @@ fn drive_h3_exchange(
     until: H3DriveUntil,
 ) -> Result<(), VaneError> {
     let deadline = options.deadline;
-    while Instant::now() < deadline {
+    // In inactivity mode `deadline` is not consulted at all: the bound is
+    // `stall_deadline`, pushed forward by every pass that moved something.
+    let mut stall_deadline = options.inactivity.map(|budget| Instant::now() + budget);
+    let mut last_progress = H3Progress::of(exchange);
+    loop {
+        let now = Instant::now();
+        if now >= stall_deadline.unwrap_or(deadline) {
+            return Err(VaneError::Timeout(match options.inactivity {
+                // Named differently on purpose: "stalled" is a different
+                // diagnosis from "took too long", and the caller who opted
+                // into this mode is the one who most needs to tell them apart.
+                Some(budget) => format!(
+                    "HTTP/3 request to {} stalled with no progress for {}s",
+                    redact_url_userinfo(&options.url.to_string()),
+                    budget.as_secs()
+                ),
+                None => format!(
+                    "HTTP/3 request to {} timed out",
+                    redact_url_userinfo(&options.url.to_string())
+                ),
+            }));
+        }
         check_cancelled(options.cancel_token)?;
         transport.read_packets()?;
 
@@ -4649,6 +4847,12 @@ fn drive_h3_exchange(
 
         transport.flush_packets()?;
 
+        let progress = H3Progress::of(exchange);
+        if progress != last_progress {
+            last_progress = progress;
+            stall_deadline = options.inactivity.map(|budget| Instant::now() + budget);
+        }
+
         if exchange.response.finished {
             return Ok(());
         }
@@ -4672,11 +4876,6 @@ fn drive_h3_exchange(
             });
         }
     }
-
-    Err(VaneError::Timeout(format!(
-        "HTTP/3 request to {} timed out",
-        redact_url_userinfo(&options.url.to_string())
-    )))
 }
 
 /// Returns `None` when quiche asked us to retry the whole call later. Both
@@ -5533,6 +5732,34 @@ fn sleep_before_retry(attempt: u64, config: &VaneClientConfig) {
     }
 }
 
+/// The `content-length` an HTTP/3 request declares, or `None` to send none.
+///
+/// A streamed body declares whatever length it was created with. A buffered
+/// body declares its own length whenever there is one — which is the rule the
+/// TCP path already follows, where `!body.is_empty()` decides whether reqwest
+/// is handed a body at all.
+///
+/// The buffered path sent no `content-length` for most of this project's life,
+/// on the reasoning that the stream's FIN already delimits the body. It does,
+/// and that is why nothing broke; but RFC 9114 §4.1.2 says a `content-length`
+/// SHOULD be sent when the length is known, and a receiver may reject or
+/// mishandle a body without one — some API gateways demand it outright, and a
+/// server cannot pre-size a buffer or bound a request without it. The two
+/// transports also disagreed on the wire for the same call, which is the kind
+/// of difference that surfaces as "works on TCP, fails on HTTP/3" in someone
+/// else's stack.
+///
+/// An emptied body declares nothing: a rewrite to GET clears `body` (and
+/// `body_stream`) before this is reached, so a dropped body cannot leave a
+/// `content-length: 0` describing a payload that is no longer being sent.
+fn h3_content_length(body: &[u8], body_stream: Option<&Arc<RequestBodyStream>>) -> Option<u64> {
+    match body_stream {
+        Some(stream) => stream.content_length,
+        None if !body.is_empty() => Some(body.len() as u64),
+        None => None,
+    }
+}
+
 /// Builds the header list for one hop. `origin` is the origin the caller
 /// addressed; once a redirect has moved us to a different one, caller-supplied
 /// headers are cut down to [`CROSS_ORIGIN_SAFE_HEADERS`]. `method` is passed in
@@ -5546,7 +5773,7 @@ fn build_h3_headers(
     origin: (&str, u16),
     cookie_header: Option<&str>,
     body_dropped: bool,
-    stream_content_length: Option<u64>,
+    declared_content_length: Option<u64>,
 ) -> Result<Vec<quiche::h3::Header>, VaneError> {
     // Port is part of the origin: app.example.com and app.example.com:8443 are
     // different security origins on multi-tenant and dev/staging hosts.
@@ -5605,10 +5832,10 @@ fn build_h3_headers(
         headers.push(quiche::h3::Header::new(b"cookie", cookie_header.as_bytes()));
     }
 
-    // A streamed body with a declared length says so, exactly like the TCP
-    // path's sized body does. `content-length` is in RESERVED_HEADERS, so no
-    // caller value can conflict with it.
-    if let Some(declared) = stream_content_length {
+    // Says the length exactly like the TCP path's sized body does.
+    // `content-length` is in RESERVED_HEADERS, so no caller value can conflict
+    // with it. See [`h3_content_length`] for which bodies declare one.
+    if let Some(declared) = declared_content_length {
         headers.push(quiche::h3::Header::new(
             b"content-length",
             declared.to_string().as_bytes(),
@@ -6437,6 +6664,13 @@ pub struct VaneFfiClientConfig {
     /// PEM leaf-first chain; empty = none. Must be set together with the key.
     pub client_certificate_pem: VaneFfiString,
     pub client_private_key_pem: VaneFfiString,
+    // -------- appended in ABI v6; order is offset --------
+    /// Seconds of no forward progress after which an HTTP/3 request fails,
+    /// in place of `timeout_seconds` bounding the request as a whole.
+    /// Negative = unset, the same negative-means-none dialect as
+    /// `timeout_seconds`. An i64 cannot ride the struct's existing padding,
+    /// which is why this is a bump and not a free append.
+    pub inactivity_timeout_seconds: i64,
 }
 
 #[repr(C)]
@@ -6587,9 +6821,16 @@ static FFI_NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 /// in arrival order, duplicates preserved, `set-cookie` in positional order
 /// (previously re-expanded at the tail); consumers must not assume unique
 /// keys — already the documented rule on `vane_ffi_execute`.
+///
+/// v6: `VaneFfiClientConfig` GREW: `inactivity_timeout_seconds` appended
+/// after `client_private_key_pem`. An i64, so it cannot ride the struct's
+/// existing tail padding — the same reason v4 had to bump for
+/// `body_stream_id`. Nothing else moved: no signature changed and no symbol
+/// was added, so a v5 caller's only incompatibility is the struct size, which
+/// is exactly what this guard refuses.
 #[unsafe(no_mangle)]
 pub extern "C" fn vane_ffi_abi_version() -> u32 {
-    5
+    6
 }
 
 /// v5: `out_error_kind` (nullable; ignored when null) receives the
@@ -7476,6 +7717,7 @@ fn ffi_config(config: *const VaneFfiClientConfig) -> Result<VaneClientConfig, St
                 }
             }
         },
+        inactivity_timeout_seconds: u64::try_from(config.inactivity_timeout_seconds).ok(),
     })
 }
 
@@ -9507,6 +9749,7 @@ mod tests {
             timeouts: HopTimeouts {
                 deadline,
                 idle: Duration::from_secs(30),
+                inactivity: None,
             },
             max_redirects: VaneClientConfig::default().max_redirects,
         }
@@ -9968,6 +10211,157 @@ mod tests {
     }
 
     #[test]
+    fn a_buffered_h3_body_declares_its_length() {
+        // The regression this exists for: the buffered path sent no
+        // content-length at all, so these three cases were previously
+        // indistinguishable on the wire.
+        assert_eq!(h3_content_length(b"hello", None), Some(5));
+        assert_eq!(h3_content_length(b"", None), None);
+
+        let headers = build_h3_headers(
+            &Url::parse("https://example.com/items").unwrap(),
+            &post_request("https://example.com/items"),
+            &VaneClientConfig::default(),
+            "POST",
+            ("example.com", 443),
+            None,
+            false,
+            h3_content_length(b"hello", None),
+        )
+        .unwrap();
+
+        let declared: Vec<String> = headers
+            .iter()
+            .filter(|h| h.name() == b"content-length")
+            .map(|h| String::from_utf8_lossy(h.value()).to_string())
+            .collect();
+        assert_eq!(
+            declared,
+            vec!["5".to_string()],
+            "exactly one content-length"
+        );
+    }
+
+    /// The paired control. A GET carries no body, and a rewrite to GET clears
+    /// one, so neither may declare a length — a `content-length: 0` on a hop
+    /// whose body was dropped would describe a payload that is not being sent.
+    #[test]
+    fn a_body_that_is_not_being_sent_declares_no_length() {
+        let headers = build_h3_headers(
+            &Url::parse("https://example.com/items").unwrap(),
+            &request("https://example.com/items"),
+            &VaneClientConfig::default(),
+            "GET",
+            ("example.com", 443),
+            None,
+            true,
+            h3_content_length(b"", None),
+        )
+        .unwrap();
+
+        assert!(headers.iter().all(|h| h.name() != b"content-length"));
+    }
+
+    /// The condition that decides whether a parked connection carries a
+    /// half-open request stream. Both body shapes, because either can be left
+    /// short when the server answers early.
+    #[test]
+    fn an_abandoned_request_body_leaves_its_stream_to_be_reset() {
+        // Buffered: short is abandoned, complete is not.
+        assert_eq!(unfinished_request_stream(Some(4), 3, 10, None), Some(4));
+        assert_eq!(unfinished_request_stream(Some(4), 10, 10, None), None);
+        // An empty body FINs on the headers, so it is complete at offset zero.
+        assert_eq!(unfinished_request_stream(Some(4), 0, 0, None), None);
+        // No stream id yet — quiche asked for `send_request` to be retried, so
+        // there is nothing on the wire to reset.
+        assert_eq!(unfinished_request_stream(None, 3, 10, None), None);
+
+        // Streamed: the pump's own FIN flag decides, not the buffered offsets,
+        // which stay zero for a streamed body and would otherwise read as
+        // "complete".
+        let id = create_body_stream(Some(10));
+        let source = body_stream_handle(id).unwrap();
+        let mut upload = StreamedUpload::new(&source, u64::MAX);
+        assert_eq!(
+            unfinished_request_stream(Some(7), 0, 0, Some(&upload)),
+            Some(7),
+            "a streamed upload that never got its FIN accepted is abandoned"
+        );
+        upload.finished = true;
+        assert_eq!(
+            unfinished_request_stream(Some(7), 0, 0, Some(&upload)),
+            None
+        );
+        free_body_stream(id);
+    }
+
+    /// The knob's whole point: with it set, an elapsed absolute deadline is
+    /// not an expiry. Without it, the historical behaviour is untouched.
+    #[test]
+    fn an_inactivity_budget_replaces_the_absolute_deadline() {
+        let expired = Instant::now() - Duration::from_secs(60);
+
+        let absolute = HopTimeouts {
+            deadline: expired,
+            idle: Duration::from_secs(30),
+            inactivity: None,
+        };
+        assert!(
+            absolute.remaining("request").is_err(),
+            "an elapsed deadline must still expire when no budget was set"
+        );
+
+        let sliding = HopTimeouts {
+            deadline: expired,
+            idle: Duration::from_secs(30),
+            inactivity: Some(Duration::from_secs(5)),
+        };
+        assert_eq!(
+            sliding.remaining("request").unwrap(),
+            Duration::from_secs(5)
+        );
+    }
+
+    /// What "forward progress" counts as. The streamed case is the one worth
+    /// pinning: `body_offset` stays at zero for a streamed body forever, so a
+    /// snapshot that only watched it would call a healthy upload stalled.
+    #[test]
+    fn upload_and_download_both_count_as_forward_progress() {
+        let mut exchange = H3ExchangeState {
+            response: ResponseState::new(DEFAULT_MAX_RESPONSE_BODY_BYTES, None).unwrap(),
+            stream_id: Some(4),
+            body_offset: 0,
+            upload: None,
+        };
+        let start = H3Progress::of(&exchange);
+
+        exchange.body_offset = 512;
+        let uploaded = H3Progress::of(&exchange);
+        assert_ne!(start, uploaded, "buffered upload bytes are progress");
+
+        exchange.response.body_len = 1024;
+        assert_ne!(
+            uploaded,
+            H3Progress::of(&exchange),
+            "body bytes are progress"
+        );
+
+        // A streamed body reports through the pump, not through body_offset.
+        let id = create_body_stream(Some(64));
+        let source = body_stream_handle(id).unwrap();
+        exchange.upload = Some(StreamedUpload::new(&source, u64::MAX));
+        let before = H3Progress::of(&exchange);
+        write_body_stream_chunk(id, vec![7u8; 32]).unwrap();
+        exchange.upload.as_mut().unwrap().source.try_pull(u64::MAX);
+        assert_ne!(
+            before,
+            H3Progress::of(&exchange),
+            "a streamed upload that moved bytes is progress even though body_offset never changes"
+        );
+        free_body_stream(id);
+    }
+
+    #[test]
     fn request_body_limit_rejects_oversized_body() {
         let err = validate_request_body_limit(4, 3).unwrap_err();
 
@@ -10231,11 +10625,13 @@ mod tests {
     /// cannot land without the author reading that contract.
     #[test]
     fn c_abi_version_is_the_one_the_dart_bindings_expect() {
-        // v5: the config-knobs layout + `vane_ffi_client_create` signature
-        // change. `_expectedAbiVersion` in `vane_flutter_ffi.dart` moves to 5
-        // in the same change-set — lockstep is load-bearing this time, not
-        // just convention (a stale side corrupts the create call frame).
-        assert_eq!(vane_ffi_abi_version(), 5);
+        // v6: `VaneFfiClientConfig` grew `inactivity_timeout_seconds`, an i64
+        // that cannot ride the struct's tail padding. `_expectedAbiVersion` in
+        // `vane_flutter_ffi.dart` moves to 6 in the same change-set. Nothing
+        // else moved this time — no signature change, no new symbol — so the
+        // only skew a stale side can produce is reading one field past its own
+        // struct, which is what the load-time check refuses.
+        assert_eq!(vane_ffi_abi_version(), 6);
     }
 
     /// `VaneFfiRequest` layout, pinned since v4 grew it. `body_stream_id` is
@@ -10318,6 +10714,7 @@ mod tests {
             custom_root_ca_pem: null_string(),
             client_certificate_pem: null_string(),
             client_private_key_pem: null_string(),
+            inactivity_timeout_seconds: -1,
         }
     }
 
@@ -10379,6 +10776,7 @@ mod tests {
             custom_root_ca_pem: s(root_pem),
             client_certificate_pem: s("client-cert-pem"),
             client_private_key_pem: s("client-key-pem"),
+            inactivity_timeout_seconds: -1,
         };
 
         let parsed = ffi_config(&config).unwrap();
