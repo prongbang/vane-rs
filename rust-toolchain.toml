@@ -1,0 +1,36 @@
+# Pinned so the artifact staleness gate can pass.
+#
+# CI rebuilds the tracked XCFrameworks and jniLibs and then runs
+# `git diff --exit-code` over them. That compares *compiled binaries*, so it
+# only means anything if every machine compiles with the same compiler. It did
+# not: this pin was added when a developer on rustc 1.93.1 and a macos-15
+# runner defaulting to rustc 1.98.0 produced different object bytes from the
+# same source, and the gate failed on a tree where nothing was stale.
+#
+# Xcode has the same problem and is pinned alongside this, in
+# .github/workflows/release.yml -- clang and the linker decide the object bytes
+# just as much as rustc does. Android's NDK was already pinned, which is
+# exactly why jniLibs rebuilt byte-identical throughout and the Kotlin half of
+# the gate never complained.
+#
+# Moving this version is a deliberate act with two obligations: rebuild and
+# commit every artifact in the same change (see TODO.md, "Before you touch the
+# build"), and move the Xcode pin in the workflow if the new toolchain needs
+# it. A clippy bump can also introduce new denials -- 1.93 was where
+# `not_unsafe_ptr_arg_deref` started failing this repo's own CI script.
+#
+# `targets` lives here rather than in a `rustup target add` step so the
+# cross-compilation targets attach to *this* toolchain. Adding them from a
+# directory outside this crate would install them for whatever the default
+# toolchain happens to be, which is how a pin silently stops applying.
+[toolchain]
+channel = "1.93.1"
+components = ["rustfmt", "clippy"]
+targets = [
+    "aarch64-apple-ios",
+    "x86_64-apple-ios",
+    "aarch64-apple-ios-sim",
+    "aarch64-linux-android",
+    "armv7-linux-androideabi",
+    "x86_64-linux-android",
+]
