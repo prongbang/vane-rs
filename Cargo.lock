@@ -2177,6 +2177,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-platform-verifier",
+ "security-framework",
  "sha2",
  "thiserror",
  "tokio",

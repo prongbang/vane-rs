@@ -861,6 +861,52 @@ mod tests {
         );
     }
 
+    /// Hostname verification, which the Apple path now owns outright.
+    ///
+    /// `SSL_CTX_set_custom_verify` takes over from BoringSSL wholesale, name
+    /// checking included, so on Apple this is `SecPolicyCreateSSL`'s hostname
+    /// argument doing the work rather than BoringSSL's built-in check. A
+    /// callback that evaluated trust without a hostname -- or that could not
+    /// read the SNI and carried on anyway -- would accept any valid
+    /// certificate for any name, and every other test here would still pass,
+    /// because they all ask for the name the certificate is actually for.
+    ///
+    /// The server's certificate is issued for `TEST_HOST` and for nothing
+    /// else. Asking for a different name at the same address must fail.
+    #[test]
+    fn a_certificate_valid_for_another_name_is_refused() {
+        let server = TestH3Server::start();
+        let other_name = "not-the-test-host.invalid";
+
+        // Control, same process and same server: the name on the certificate
+        // works. Without this the assertion below could pass for any reason at
+        // all -- a dead port, a bad override -- and prove nothing about names.
+        let client = offline_client(VaneClientConfig::default());
+        assert!(
+            client
+                .execute(test_request(&server.url("/get")))
+                .unwrap()
+                .is_success
+        );
+
+        // Same socket, same certificate, different name asked for.
+        let mismatched = VaneClient::new(VaneClientConfig {
+            dns_overrides: HashMap::from([(other_name.to_string(), "127.0.0.1".to_string())]),
+            timeout_seconds: Some(10),
+            ..VaneClientConfig::default()
+        })
+        .unwrap();
+        let err = mismatched
+            .execute(test_request(&format!(
+                "https://{other_name}:{}/get",
+                server.url("/").rsplit(':').next().unwrap().trim_end_matches('/')
+            )))
+            .expect_err("a certificate issued for another name must not validate");
+        // The message differs per platform (SecTrust vs BoringSSL), so this
+        // pins the outcome, not the wording.
+        let _ = err;
+    }
+
     /// The batch-3 flagship, HTTP/3 twin: the fresh CA reaches the client
     /// only through `custom_root_certificates` — the production ctx-builder
     /// path — never the `#[cfg(test)]` seam, which has never seen this CA.

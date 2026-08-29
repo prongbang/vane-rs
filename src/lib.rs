@@ -8,6 +8,11 @@ mod tcp;
 #[cfg(test)]
 mod h3_offline;
 
+/// Apple platform trust for the HTTP/3 path: iOS has no filesystem CA
+/// bundle inside the app sandbox, so verification is delegated to SecTrust.
+#[cfg(target_vendor = "apple")]
+mod apple_trust;
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -1124,6 +1129,9 @@ impl H3TlsMaterial {
     }
 
     /// `true` keeps today's `quiche::Config::new` path byte-for-byte.
+    /// Apple never takes that path -- it always needs the ctx builder to carry
+    /// the SecTrust verify callback -- so this is dead code there.
+    #[cfg(not(target_vendor = "apple"))]
     fn is_empty(&self) -> bool {
         self.custom_roots_pem.is_none() && self.client_identity.is_none()
     }
@@ -4751,6 +4759,10 @@ fn create_quiche_config(
         .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
         .map_err(|e| VaneError::Generic(format!("Failed to configure HTTP/3 ALPN: {e:?}")))?;
     config.verify_peer(true);
+    // Apple gets its roots from SecTrust in the verify callback installed
+    // above; the filesystem bundle this looks for does not exist inside an iOS
+    // app sandbox at all. See `apple_trust`.
+    #[cfg(not(target_vendor = "apple"))]
     load_platform_roots(&mut config)?;
     // Test-only twin of the TCP path's `TEST_ROOT`: trust the in-process
     // HTTP/3 test server's CA. Strictly additive — `verify_peer(true)` above
@@ -4789,6 +4801,11 @@ fn create_quiche_config(
 fn h3_ssl_ctx_builder(
     tls: &H3TlsMaterial,
 ) -> Result<Option<boring::ssl::SslContextBuilder>, VaneError> {
+    // Apple always needs the builder: platform trust arrives as a custom
+    // verify callback (see `apple_trust`), which can only be installed on an
+    // `SslContextBuilder`. Elsewhere an empty knob set keeps the historical
+    // `quiche::Config::new` path byte-for-byte.
+    #[cfg(not(target_vendor = "apple"))]
     if tls.is_empty() {
         return Ok(None);
     }
@@ -4841,6 +4858,53 @@ fn h3_ssl_ctx_builder(
             )
         })?;
     }
+    // Apple: hand verification to SecTrust. This must come after the custom
+    // roots above, because the callback supersedes the certificate store they
+    // were just added to -- it re-reads them as SecTrust anchors instead, so
+    // they keep working and keep being additive.
+    #[cfg(target_vendor = "apple")]
+    {
+        // `mut` is used only by the `#[cfg(test)]` seam below, which
+        // appends the in-process test CA; release builds never rebind it.
+        #[allow(unused_mut)]
+        let mut roots_der = match &tls.custom_roots_pem {
+            Some(pem) => X509::stack_from_pem(pem.as_bytes())
+                .map_err(|_| {
+                    VaneError::InvalidRequest(
+                        "customRootCertificates is not valid PEM certificate data".to_string(),
+                    )
+                })?
+                .into_iter()
+                .map(|cert| {
+                    cert.to_der().map_err(|_| {
+                        VaneError::InvalidRequest(
+                            "customRootCertificates is not valid PEM certificate data".to_string(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            None => Vec::new(),
+        };
+        // Apple twin of the store-based test seam in `create_quiche_config`:
+        // the custom verify callback supersedes BoringSSL's store, so loading
+        // the in-process test server's CA there would have no effect. It rides
+        // in as an extra SecTrust anchor instead -- additive exactly like a
+        // caller's custom root, and compiled out of every non-test build.
+        #[cfg(test)]
+        if let Some(test_ca) = crate::h3_offline::test_ca_pem_path() {
+            let pem = std::fs::read(test_ca)
+                .map_err(|e| VaneError::Generic(format!("Failed to read test CA: {e}")))?;
+            for cert in X509::stack_from_pem(&pem)
+                .map_err(|e| VaneError::Generic(format!("Failed to parse test CA: {e}")))?
+            {
+                roots_der.push(
+                    cert.to_der()
+                        .map_err(|e| VaneError::Generic(format!("Failed to encode test CA: {e}")))?,
+                );
+            }
+        }
+        crate::apple_trust::install_platform_verify(&mut builder, roots_der);
+    }
     Ok(Some(builder))
 }
 
@@ -4863,6 +4927,7 @@ fn create_h3_config() -> Result<quiche::h3::Config, VaneError> {
 /// a chain, with nothing pointing at the trust store. An existence check is
 /// therefore not enough: a present but cert-less directory has to count as a
 /// miss so the next candidate still gets its turn.
+#[cfg(not(target_vendor = "apple"))]
 fn directory_has_certs(path: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(path) else {
         // Covers "does not exist" too, so this subsumes the old exists() check.
@@ -4880,6 +4945,7 @@ fn directory_has_certs(path: &str) -> bool {
     })
 }
 
+#[cfg(not(target_vendor = "apple"))]
 fn load_platform_roots(config: &mut quiche::Config) -> Result<(), VaneError> {
     let cert_files = [
         "/etc/ssl/cert.pem",

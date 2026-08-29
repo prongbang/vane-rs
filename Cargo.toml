@@ -5,6 +5,15 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/inteniquetic/vane"
 
+# Apple platform trust for the HTTP/3 path. iOS has no filesystem CA bundle
+# inside the app sandbox and no public API to enumerate the system trust store
+# (SecTrustCopyAnchorCertificates is macOS-only), so verification is delegated
+# to SecTrustEvaluateWithError -- the same thing rustls-platform-verifier does
+# for the TCP path. Unconditional rather than feature-gated: without it the
+# HTTP/3-only small profile has no way to verify a certificate on Apple at all.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+security-framework = "3.7"
+
 [target.'cfg(unix)'.dependencies]
 # One setsockopt call (SO_RCVBUF); already in the tree transitively.
 libc = "0.2"
