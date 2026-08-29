@@ -1,2 +1,10 @@
 [bindings.kotlin]
 package_name = "com.inteniquetic.vanekotlin"
+# Without this the Kotlin cleaner is generated from the JVM template, which
+# calls `java.lang.ref.Cleaner.create()` unguarded — an API 33 symbol, so lint
+# pins minSdk at 33 and locks out Android 10-12. The Android template picks
+# `android.system.SystemCleaner` behind an SDK_INT check on 34+ and falls back
+# to the JNA cleaner below it. Note the guard is 34, not 33: some API 33 images
+# ship SystemCleaner but cannot use it, which the JVM template walks straight
+# into today. Costs an `androidx.annotation` dependency for `@RequiresApi`.
+android_cleaner = true
