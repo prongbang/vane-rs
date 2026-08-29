@@ -63,7 +63,10 @@ use security_framework::trust::SecTrust;
 /// closure is plainly `Send + Sync` without leaning on the framework types'
 /// thread-safety; rebuilding them per handshake is a few microseconds against a
 /// QUIC handshake's network round trip.
-pub(crate) fn install_platform_verify(builder: &mut SslContextBuilder, custom_roots_der: Vec<Vec<u8>>) {
+pub(crate) fn install_platform_verify(
+    builder: &mut SslContextBuilder,
+    custom_roots_der: Vec<Vec<u8>>,
+) {
     builder.set_custom_verify_callback(SslVerifyMode::PEER, move |ssl| {
         // Fail closed on every path below: an unreadable chain, an absent
         // hostname, or a Security-framework error is a rejected connection,

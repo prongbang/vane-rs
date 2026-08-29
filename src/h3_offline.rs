@@ -899,7 +899,12 @@ mod tests {
         let err = mismatched
             .execute(test_request(&format!(
                 "https://{other_name}:{}/get",
-                server.url("/").rsplit(':').next().unwrap().trim_end_matches('/')
+                server
+                    .url("/")
+                    .rsplit(':')
+                    .next()
+                    .unwrap()
+                    .trim_end_matches('/')
             )))
             .expect_err("a certificate issued for another name must not validate");
         // The message differs per platform (SecTrust vs BoringSSL), so this

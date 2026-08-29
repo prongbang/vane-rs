@@ -4898,8 +4898,9 @@ fn h3_ssl_ctx_builder(
                 .map_err(|e| VaneError::Generic(format!("Failed to parse test CA: {e}")))?
             {
                 roots_der.push(
-                    cert.to_der()
-                        .map_err(|e| VaneError::Generic(format!("Failed to encode test CA: {e}")))?,
+                    cert.to_der().map_err(|e| {
+                        VaneError::Generic(format!("Failed to encode test CA: {e}"))
+                    })?,
                 );
             }
         }
@@ -6595,8 +6596,17 @@ pub extern "C" fn vane_ffi_abi_version() -> u32 {
 /// `VaneError::ffi_kind` code on failure — the SAME code table the response
 /// path already uses and Dart's `_errorKind` already decodes
 /// (InvalidRequest = 1). Written only when creation fails.
+/// # Safety
+///
+/// C ABI: `config` must point at a valid `VaneFfiClientConfig`, and
+/// `out_error` / `out_error_kind` must each be either null or point at a
+/// writable value of their type. Marked `unsafe` because the body writes
+/// through `out_error_kind` directly -- the same reason
+/// `vane_ffi_response_free` carries it. This is a Rust-side annotation only:
+/// the symbol, the calling convention and the struct layouts are unchanged,
+/// so no `vane_ffi_abi_version` bump and no binding change follow from it.
 #[unsafe(no_mangle)]
-pub extern "C" fn vane_ffi_client_create(
+pub unsafe extern "C" fn vane_ffi_client_create(
     config: *const VaneFfiClientConfig,
     out_error: *mut VaneFfiBuffer,
     out_error_kind: *mut u32,
@@ -10463,7 +10473,7 @@ mod tests {
         config.max_redirects = 65;
         let mut error = empty_buffer();
         let mut kind: u32 = 0;
-        let handle = vane_ffi_client_create(&config, &mut error, &mut kind);
+        let handle = unsafe { vane_ffi_client_create(&config, &mut error, &mut kind) };
         assert_eq!(handle, 0);
         assert!(error.len > 0, "expected a non-empty error buffer");
         assert_eq!(kind, VaneError::InvalidRequest(String::new()).ffi_kind());
@@ -10471,7 +10481,7 @@ mod tests {
 
         // A null `out_error_kind` is explicitly allowed ("ignored when null").
         let mut error = empty_buffer();
-        let handle = vane_ffi_client_create(&config, &mut error, ptr::null_mut());
+        let handle = unsafe { vane_ffi_client_create(&config, &mut error, ptr::null_mut()) };
         assert_eq!(handle, 0);
         assert!(error.len > 0);
         vane_ffi_buffer_free(error);
@@ -10479,7 +10489,8 @@ mod tests {
         // Written only when creation fails: success keeps the sentinel.
         let mut error = empty_buffer();
         let mut kind: u32 = 77;
-        let handle = vane_ffi_client_create(&test_ffi_client_config(), &mut error, &mut kind);
+        let handle =
+            unsafe { vane_ffi_client_create(&test_ffi_client_config(), &mut error, &mut kind) };
         assert_ne!(handle, 0);
         assert_eq!(error.len, 0);
         assert_eq!(kind, 77, "out_error_kind must only be written on failure");
@@ -10565,7 +10576,8 @@ mod tests {
             len: 0,
             cap: 0,
         };
-        let client = vane_ffi_client_create(ptr::null(), &mut create_error, ptr::null_mut());
+        let client =
+            unsafe { vane_ffi_client_create(ptr::null(), &mut create_error, ptr::null_mut()) };
         assert_ne!(client, 0);
         assert_eq!(create_error.len, 0);
 
