@@ -2,6 +2,8 @@
 name = "vane"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/inteniquetic/vane"
 
 [target.'cfg(unix)'.dependencies]
 # One setsockopt call (SO_RCVBUF); already in the tree transitively.
